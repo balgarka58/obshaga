@@ -1,19 +1,23 @@
 """
-Telegram Bot для изучения терминов обществознания (Версия 3 — Исправленная)
+Telegram Bot для изучения терминов обществознания (Версия 4.0 — Финальная)
 =============================================================================
 Архитектура:
 1. Термины загружаются из terms.json (при его отсутствии — резервная автозагрузка из social_bot.db).
-2. В Neon (PostgreSQL) или SQLite сохраняются user_id и логированная строка ответа:
-   f"{code};{delta_answer};{delta_time};{time_seconds}".
+2. В Neon (PostgreSQL) или SQLite сохраняются user_id, username и строка ответа:
+   f"{code};{delta_answer};{delta_time};{time_seconds};{mode}".
 3. Двойной режим базы:
    - Если задана переменная DATABASE_URL -> прямое подключение к Neon (PostgreSQL).
    - Если DATABASE_URL не задана -> локальный резерв SQLite (social_bot.db).
-4. Алгоритм интервального повторения:
+4. Алгоритм интервального повторения для КАРТОЧЕК:
+   - Вероятностная выборка (Weighted Random / Roulette Selection): вес определяет шанс выпадения.
+   - Сложные термины выпадают часто, новые имеют высокий приоритет, выученные периодически всплывают.
    - Кулдаун карточек: карточка не повторяется минимум 10 шагов.
-   - Приоритет непросмотренным терминам (эффективный вес 6.5 vs базовый 5.0).
-   - 2 веса: ответ (-1.0 / +0.5 / +2.0) и время реакции (бонус -1.0 только при верных ответах).
-5. 5 сбалансированных типов тестов с уникальными дистракторами и защитой от дублирования вариантов.
-6. Встроенный лёгкий веб-сервер для бесплатного деплоя на Render Web Service ($0/мес).
+5. Режим ТЕСТЫ:
+   - Честный экзаменационный рандом (True Random) без повторов за сессию.
+   - Защита от мискликов: ответы быстрее 3 секунд не записываются в общую базу.
+   - Экран завершения теста при прохождении всех терминов темы: разбор ошибок, рестарт и выход.
+6. Раздельная статистика для карточек и тестов в боте и дашборде.
+7. Встроенный лёгкий веб-сервер для бесплатного деплоя на Render Web Service ($0/мес).
 """
 
 import os
@@ -35,7 +39,7 @@ except ImportError:
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -63,7 +67,7 @@ logging.basicConfig(
 logger = logging.getLogger("social_bot")
 
 # =====================================================================
-# 2. АЛГОРИТМ ИНТЕРВАЛЬНОГО ПОВТОРЕНИЯ
+# 2. АЛГОРИТМ ИНТЕРВАЛЬНОГО ПОВТОРЕНИЯ ДЛЯ КАРТОЧЕК
 # =====================================================================
 
 class SpacedRepetitionAlgorithm:
@@ -79,20 +83,15 @@ class SpacedRepetitionAlgorithm:
     SLOW_THRESHOLD = 40.0   # > 40с -> долгие раздумья (+1.0)
 
     DELTA_ANSWER_MAP = {
-        "know_well": -1.0,   # «Знаю хорошо»
+        "know_well": -1.0,   # «Знаю»
         "correct": -1.0,     # Верный ответ в тесте
-        "know_poorly": 0.5,  # «Знаю плохо»
-        "dont_know": 2.0,    # «Не знаю»
+        "know_poorly": 0.5,  # «Неуверенно»
+        "dont_know": 2.0,    # «Забыл»
         "incorrect": 2.0,    # Ошибка в тесте
     }
 
     @classmethod
     def calculate_time_delta(cls, response_time_seconds: Optional[float], is_correct: bool = True) -> float:
-        """
-        Учитывает время реакции:
-        - Бонус за скорость (-1.0) начисляется ТОЛЬКО при правильном/уверенном ответе.
-        - Быстрый неверный ответ или быстрый клик 'Не знаю' не должны уменьшать вес карточки.
-        """
         if response_time_seconds is None or not is_correct:
             return 0.0
         if response_time_seconds < cls.MIN_TIME_WINDOW or response_time_seconds > cls.MAX_TIME_WINDOW:
@@ -174,14 +173,6 @@ class TermsCatalog:
 
                     self._populate_terms(db_terms)
                     logger.info(f"Резервная загрузка: успешно получено {len(self.all_terms)} терминов из {self.sqlite_path}.")
-
-                    # Создаем terms.json для последующих быстрых запусков
-                    try:
-                        with open(self.json_path, "w", encoding="utf-8") as f:
-                            json.dump(db_terms, f, ensure_ascii=False, indent=2)
-                        logger.info(f"Автоматически сгенерирован файл {self.json_path}.")
-                    except Exception:
-                        pass
                     return
             except Exception as e:
                 logger.error(f"Не удалось прочитать термины из SQLite: {e}")
@@ -235,8 +226,8 @@ catalog = TermsCatalog()
 
 class Database:
     """
-    В базе данных сохраняются user_id и сериализованные логи ответов.
-    Формат записи entry: "{code};{delta_answer};{delta_time};{time_seconds}"
+    В базе данных сохраняются user_id, username и сериализованные логи ответов.
+    Формат записи entry: "{code};{delta_answer};{delta_time};{time_seconds};{mode}"
     """
     def __init__(self, db_url: Optional[str] = DATABASE_URL, sqlite_path: str = DB_PATH):
         self.db_url = db_url
@@ -261,9 +252,11 @@ class Database:
             CREATE TABLE IF NOT EXISTS user_answers (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
+                username TEXT,
                 entry TEXT NOT NULL,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
+            ALTER TABLE user_answers ADD COLUMN IF NOT EXISTS username TEXT;
             CREATE INDEX IF NOT EXISTS idx_user_answers_user ON user_answers(user_id);
             """)
         else:
@@ -271,11 +264,16 @@ class Database:
             CREATE TABLE IF NOT EXISTS user_answers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
+                username TEXT,
                 entry TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_user_answers_user ON user_answers(user_id);
             """)
+            try:
+                cursor.execute("ALTER TABLE user_answers ADD COLUMN username TEXT;")
+            except Exception:
+                pass
 
         conn.commit()
         cursor.close()
@@ -283,24 +281,28 @@ class Database:
         mode_str = "Neon PostgreSQL" if self.is_postgres else f"SQLite ({self.sqlite_path})"
         logger.info(f"База данных успешно инициализирована в режиме: {mode_str}.")
 
-    def save_answer_entry(self, user_id: int, entry_str: str):
+    def save_answer_entry(self, user_id: int, username: Optional[str], entry_str: str):
         conn = self.get_connection()
         cursor = conn.cursor()
         if self.is_postgres:
             cursor.execute(
-                "INSERT INTO user_answers (user_id, entry) VALUES (%s, %s);",
-                (user_id, entry_str)
+                "INSERT INTO user_answers (user_id, username, entry) VALUES (%s, %s, %s);",
+                (user_id, username, entry_str)
             )
         else:
             cursor.execute(
-                "INSERT INTO user_answers (user_id, entry) VALUES (?, ?);",
-                (user_id, entry_str)
+                "INSERT INTO user_answers (user_id, username, entry) VALUES (?, ?, ?);",
+                (user_id, username, entry_str)
             )
         conn.commit()
         cursor.close()
         conn.close()
 
     def get_user_progress_map(self, user_id: int) -> Dict[str, Dict[str, Any]]:
+        """
+        Вычисляет интервальные веса карточек ТОЛЬКО по режиму карточек (mode != 'test'),
+        чтобы результаты экзаменационных тестов не сбивали обучение в карточках.
+        """
         conn = self.get_connection()
         cursor = conn.cursor()
         if self.is_postgres:
@@ -317,6 +319,11 @@ class Database:
             entry_str = row[0] if self.is_postgres else row["entry"]
             parts = str(entry_str).split(";")
             if len(parts) >= 4:
+                # Если указан режим 'test', пропускаем его при расчете веса карточек
+                mode = parts[4].strip() if len(parts) >= 5 else "card"
+                if mode == "test":
+                    continue
+
                 code = parts[0].strip()
                 try:
                     d_ans = float(parts[1])
@@ -337,6 +344,7 @@ class Database:
         return progress
 
     def get_user_stats(self, user_id: int) -> Dict[str, Any]:
+        """Возвращает раздельные метрики для карточек и тестов."""
         progress_map = self.get_user_progress_map(user_id)
         
         conn = self.get_connection()
@@ -349,38 +357,59 @@ class Database:
         cursor.close()
         conn.close()
 
-        total_answers = len(rows)
-        valid_times = []
+        cards_count = 0
+        tests_count = 0
+        tests_correct = 0
+        tests_errors = 0
+        test_times = []
+
         for r in rows:
             entry_str = r[0] if self.is_postgres else r["entry"]
             parts = str(entry_str).split(";")
             if len(parts) >= 4:
                 try:
+                    d_ans = float(parts[1])
                     sec = float(parts[3])
-                    if 3.0 <= sec <= 180.0:
-                        valid_times.append(sec)
                 except ValueError:
-                    pass
+                    continue
 
-        avg_time = round(sum(valid_times) / len(valid_times), 1) if valid_times else 0.0
+                mode = parts[4].strip() if len(parts) >= 5 else "card"
+                if mode == "test":
+                    if sec >= 3.0:
+                        tests_count += 1
+                        if d_ans <= 0:
+                            tests_correct += 1
+                        else:
+                            tests_errors += 1
+                        if 3.0 <= sec <= 180.0:
+                            test_times.append(sec)
+                else:
+                    cards_count += 1
+
+        tests_accuracy = round(tests_correct / tests_count * 100, 1) if tests_count > 0 else 0.0
+        tests_avg_time = round(sum(test_times) / len(test_times), 1) if test_times else 0.0
 
         learned = sum(1 for p in progress_map.values() if p["total_weight"] <= 3.0)
         in_progress = sum(1 for p in progress_map.values() if 3.0 < p["total_weight"] <= 7.0)
         needs_review = sum(1 for p in progress_map.values() if p["total_weight"] > 7.0)
 
         return {
-            "total_answers": total_answers,
-            "avg_time": avg_time,
+            "cards_count": cards_count,
             "learned": learned,
             "in_progress": in_progress,
             "needs_review": needs_review,
+            "tests_count": tests_count,
+            "tests_correct": tests_correct,
+            "tests_errors": tests_errors,
+            "tests_accuracy": tests_accuracy,
+            "tests_avg_time": tests_avg_time,
         }
 
 
 db = Database()
 
 # =====================================================================
-# 5. СЕССИОННЫЙ МЕНЕДЖЕР
+# 5. СЕССИОННЫЙ МЕНЕДЖЕР И ВЫБОРКА КАРТОЧЕК
 # =====================================================================
 
 class SessionTracker:
@@ -403,6 +432,12 @@ session_tracker = SessionTracker()
 
 
 def select_next_card(user_id: int, module_filter: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """
+    Вероятностный алгоритм (Weighted Random / Roulette Selection):
+    Карточки не идут по скучной очереди. Вес определяет шанс выпадения:
+    трудные (вес 8-10) выпадают часто, новые (6.5) — в приоритете,
+    а выученные (1.0) время от времени неожиданно всплывают для проверки.
+    """
     available_terms = catalog.get_terms(module_filter)
     if not available_terms:
         return None
@@ -410,23 +445,21 @@ def select_next_card(user_id: int, module_filter: Optional[int] = None) -> Optio
     progress_map = db.get_user_progress_map(user_id)
     recent_codes = set(session_tracker.get_recent(user_id))
 
+    # Исключаем последние 10 показанных терминов (кулдаун)
     candidates = [t for t in available_terms if t["code"] not in recent_codes]
     if not candidates:
         candidates = available_terms
 
-    def get_sort_weight(term_dict: Dict[str, Any]) -> float:
+    def get_effective_weight(term_dict: Dict[str, Any]) -> float:
         code = term_dict["code"]
         if code not in progress_map or progress_map[code]["review_count"] == 0:
-            return SpacedRepetitionAlgorithm.UNREVIEWED_PRIORITY_WEIGHT
+            return SpacedRepetitionAlgorithm.UNREVIEWED_PRIORITY_WEIGHT  # 6.5
         return progress_map[code]["total_weight"]
 
-    sorted_candidates = sorted(
-        candidates,
-        key=lambda t: get_sort_weight(t) + random.uniform(-0.1, 0.1),
-        reverse=True
-    )
+    weights = [get_effective_weight(t) for t in candidates]
 
-    chosen = sorted_candidates[0]
+    # Вероятностный выбор по весам
+    chosen = random.choices(candidates, weights=weights, k=1)[0]
     session_tracker.push(user_id, chosen["code"])
     return chosen
 
@@ -473,7 +506,7 @@ class TestGenerator:
                 {"id": "D", "code": picked[2]["code"], "text": picked[2]["term"], "is_correct": False},
             ]
 
-        # ТИП 2: По термину выбрать определение / родовую характеристику (исключаем одинаковые genus)
+        # ТИП 2: По термину выбрать родовую характеристику (уникальные genus)
         elif chosen_type == 2:
             question_text = f"Выбери верную родовую характеристику термина *{correct_term['term'].upper()}*:"
             
@@ -574,7 +607,7 @@ class Keyboards:
     def main_menu() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🗂 Карточки (Интервальные)", callback_data="menu:cards")],
-            [InlineKeyboardButton(text="🎯 Тесты (Проверка знаний)", callback_data="menu:tests")],
+            [InlineKeyboardButton(text="🎯 Тесты (Контрольный срез)", callback_data="menu:tests")],
             [InlineKeyboardButton(text="📊 Моя статистика", callback_data="menu:stats")],
         ])
 
@@ -593,24 +626,25 @@ class Keyboards:
     @staticmethod
     def flashcard_front(code: str) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔍 Показать определение и признаки", callback_data=f"card:reveal:{code}")],
-            [InlineKeyboardButton(text="🚪 Завершить тренировку", callback_data="back_to_main")]
+            [InlineKeyboardButton(text="🔍 Перевернуть карточку", callback_data=f"card:reveal:{code}")],
+            [InlineKeyboardButton(text="🚪 В главное меню", callback_data="back_to_main")]
         ])
 
     @staticmethod
-    def flashcard_back(code: str) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup(inline_keyboard=[
+    def flashcard_back(code: str, has_detail: bool = False) -> InlineKeyboardMarkup:
+        buttons = [
             [
-                InlineKeyboardButton(text="✅ Знаю хорошо", callback_data=f"card:ans:{code}:know_well"),
-                InlineKeyboardButton(text="⚠️ Знаю плохо", callback_data=f"card:ans:{code}:know_poorly"),
-            ],
-            [
-                InlineKeyboardButton(text="❌ Не знаю", callback_data=f"card:ans:{code}:dont_know")
-            ],
-            [
-                InlineKeyboardButton(text="🚪 Завершить тренировку", callback_data="back_to_main")
+                InlineKeyboardButton(text="🟢 Знаю", callback_data=f"card:ans:{code}:know_well"),
+                InlineKeyboardButton(text="🟡 Неуверенно", callback_data=f"card:ans:{code}:know_poorly"),
+                InlineKeyboardButton(text="🔴 Забыл", callback_data=f"card:ans:{code}:dont_know"),
             ]
-        ])
+        ]
+        second_row = []
+        if not has_detail:
+            second_row.append(InlineKeyboardButton(text="💡 Пояснение", callback_data=f"card:detail:{code}"))
+        second_row.append(InlineKeyboardButton(text="🚪 Меню", callback_data="back_to_main"))
+        buttons.append(second_row)
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
 
     @staticmethod
     def test_options(code: str, options: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
@@ -633,6 +667,15 @@ class Keyboards:
         ])
 
     @staticmethod
+    def test_finish(has_errors: bool = True) -> InlineKeyboardMarkup:
+        buttons = []
+        if has_errors:
+            buttons.append([InlineKeyboardButton(text="❌ Просмотреть ошибки", callback_data="test:show_errors")])
+        buttons.append([InlineKeyboardButton(text="🔄 Начать заново", callback_data="test:restart")])
+        buttons.append([InlineKeyboardButton(text="🚪 В главное меню", callback_data="back_to_main")])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    @staticmethod
     def back_to_menu() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="back_to_main")]
@@ -649,15 +692,30 @@ router = Router()
 async def handle_start(message: Message, state: FSMContext):
     await state.clear()
     text = (
-        "👋 *Добро пожаловать в тренажер терминов по обществознанию!*\n\n"
-        "Здесь ты сможешь эффективно выучить понятия кодификатора ЕГЭ/ОГЭ "
-        "с помощью *интервального повторения*.\n\n"
-        "Алгоритм подстраивается под твой прогресс:\n"
-        "• Карточки с ошибками появляются чаще, а надежно выученные уходят в редкий показ;\n"
-        "• Учитывается не только правильность ответа, но и уверенность (скорость реакции).\n\n"
+        "👋 *Добро пожаловать в тренажер терминов ЕГЭ по обществознанию!*\n\n"
+        "Здесь ты сможешь выучить все ключевые понятия кодификатора без зубрёжки:\n\n"
+        "• 🗂 *Карточки* — умное интервальное повторение. Трудные термины выпадают чаще, "
+        "а выученные периодически всплывают для проверки памяти.\n"
+        "• 🎯 *Тесты* — честный случайный экзамен без подсказок. Решай задания и разбирай ошибки.\n\n"
         "Выбери формат тренировки:"
     )
     await message.answer(text, reply_markup=Keyboards.main_menu(), parse_mode=ParseMode.MARKDOWN)
+
+
+@router.message(Command("help"))
+async def handle_help(message: Message):
+    text = (
+        "📖 *Как устроен тренажер:*\n\n"
+        "1. *Карточки (Интервальное повторение):*\n"
+        "• Карточки не идут по скучной очереди. Алгоритм рассчитывает вес каждого термина.\n"
+        "• Если жмёшь `🟢 Знаю`, карточка отдаляется. Если `🔴 Забыл` — сразу летит в приоритет.\n"
+        "• Есть защита от повторений: один и тот же термин не выпадает 10 шагов подряд.\n\n"
+        "2. *Тесты (Экзаменационный срез):*\n"
+        "• Случайная выборка вопросов по выбранной теме.\n"
+        "• Ответы быстрее 3 секунд не считаются в общую статистику (защита от случайных мискликов).\n"
+        "• В конце теста ты увидишь процент точности и сможешь разобрать ошибки."
+    )
+    await message.answer(text, reply_markup=Keyboards.back_to_menu(), parse_mode=ParseMode.MARKDOWN)
 
 
 @router.callback_query(F.data == "back_to_main")
@@ -676,12 +734,15 @@ async def handle_show_stats(callback: CallbackQuery):
 
     text = (
         "📊 *Твоя статистика изучения*\n\n"
-        f"• Всего ответов дано: *{stats['total_answers']}*\n"
-        f"• Среднее время ответа: *{stats['avg_time']} сек*\n\n"
-        "📈 *Статус терминов:*\n"
-        f"• 🟢 Выучено надежно: *{stats['learned']}*\n"
+        "🗂 *Карточки (Интервальное повторение):*\n"
+        f"• Всего ответов: *{stats['cards_count']}*\n"
+        f"• 🟢 Выучено надёжно: *{stats['learned']}*\n"
         f"• 🟡 В процессе: *{stats['in_progress']}*\n"
-        f"• 🔴 Требуют повторения: *{stats['needs_review']}*"
+        f"• 🔴 Требуют повторения: *{stats['needs_review']}*\n\n"
+        "🎯 *Тесты (Контрольный срез):*\n"
+        f"• Вопросов решено: *{stats['tests_count']}*\n"
+        f"• Точность: *{stats['tests_accuracy']}%* ({stats['tests_correct']} верно / {stats['tests_errors']} ошибок)\n"
+        f"• Среднее время: *{stats['tests_avg_time']} сек*"
     )
     if callback.message:
         await callback.message.edit_text(text, reply_markup=Keyboards.back_to_menu(), parse_mode=ParseMode.MARKDOWN)
@@ -720,6 +781,25 @@ async def handle_topic_selection(callback: CallbackQuery, state: FSMContext):
         await send_next_flashcard(callback, state)
     else:
         await state.set_state(UserFlow.in_tests)
+        # Инициализируем экзаменационный пул без повторений
+        available = catalog.get_terms(module_filter)
+        if not available:
+            empty_text = "❌ В выбранном модуле пока недостаточно терминов."
+            if callback.message:
+                await callback.message.edit_text(empty_text, reply_markup=Keyboards.back_to_menu())
+            await callback.answer()
+            return
+
+        pool = [t["code"] for t in available]
+        random.shuffle(pool)
+
+        await state.update_data(
+            test_pool=pool,
+            test_total_in_session=len(pool),
+            test_session_correct=0,
+            test_session_errors=[],
+            test_session_times=[]
+        )
         await send_next_test(callback, state)
 
     await callback.answer()
@@ -729,7 +809,22 @@ async def handle_topic_selection(callback: CallbackQuery, state: FSMContext):
 # КАРТОЧКИ
 # ---------------------------------------------------------------------
 
-async def send_next_flashcard(callback: CallbackQuery, state: FSMContext, feedback_header: str = ""):
+def format_card_back(card: Dict[str, Any], show_detail: bool = False) -> str:
+    traits = card.get("traits", [])
+    traits_formatted = "\n".join([f"• {t}" for t in traits]) if traits else "• Признаки уточняются"
+
+    text = (
+        f"🏷 *{card['module_title']}* · _№18 ЕГЭ_\n\n"
+        f"🎓 *{card['term'].upper()}*\n\n"
+        f"🏛 *Родовое понятие:*\n_{card['genus']}_\n\n"
+        f"📌 *Ключевые признаки:*\n{traits_formatted}"
+    )
+    if show_detail and card.get("concept_explanation"):
+        text += f"\n\n💡 *Развёрнутое пояснение:*\n_{card['concept_explanation']}_"
+    return text
+
+
+async def send_next_flashcard(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     module_filter = data.get("module_filter")
     user_id = callback.from_user.id
@@ -744,14 +839,10 @@ async def send_next_flashcard(callback: CallbackQuery, state: FSMContext, feedba
     shown_at = time.time()
     await state.update_data(current_card_code=card["code"], shown_at=shown_at)
 
-    prefix = f"{feedback_header}\n\n" if feedback_header else ""
     text = (
-        f"{prefix}"
-        f"📚 *{card['module_title']}*\n\n"
-        f"Термин:\n"
-        f"👉 *{card['term'].upper()}*\n\n"
-        f"_Вспомни родовое понятие и не менее 3 признаков понятия. "
-        f"Затем нажми кнопку ниже, чтобы проверить себя._"
+        f"🏷 *{card['module_title']}*\n\n"
+        f"✨ *{card['term'].upper()}*\n\n"
+        f"💭 _Вспомни род и ключевые признаки понятия для №18 ЕГЭ._"
     )
 
     if callback.message:
@@ -771,24 +862,35 @@ async def handle_card_reveal(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Термин не найден.")
         return
 
-    traits = card.get("traits", [])
-    traits_formatted = "\n".join([f"• {t}" for t in traits]) if traits else "• Признаки уточняются"
-
-    text = (
-        f"📚 *{card['term'].upper()}*\n\n"
-        f"🔹 *Родовое понятие:*\n_{card['genus']}_\n\n"
-        f"🔹 *Ключевые признаки:*\n{traits_formatted}\n\n"
-        f"💡 *Определение:*\n{card['concept_explanation']}\n\n"
-        "Честно оцени, насколько хорошо ты помнил этот термин:"
-    )
+    text = format_card_back(card, show_detail=False)
 
     if callback.message:
         await callback.message.edit_text(
             text,
-            reply_markup=Keyboards.flashcard_back(code),
+            reply_markup=Keyboards.flashcard_back(code, has_detail=False),
             parse_mode=ParseMode.MARKDOWN
         )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("card:detail:"))
+async def handle_card_detail(callback: CallbackQuery, state: FSMContext):
+    code = callback.data.split(":")[2]
+    card = catalog.get_by_code(code)
+
+    if not card:
+        await callback.answer("Термин не найден.")
+        return
+
+    text = format_card_back(card, show_detail=True)
+
+    if callback.message:
+        await callback.message.edit_text(
+            text,
+            reply_markup=Keyboards.flashcard_back(code, has_detail=True),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    await callback.answer("Подробный разбор открыт!")
 
 
 @router.callback_query(F.data.startswith("card:ans:"))
@@ -805,42 +907,73 @@ async def handle_card_answer(callback: CallbackQuery, state: FSMContext):
     delta_ans = SpacedRepetitionAlgorithm.calculate_answer_delta(answer_type)
     delta_tm = SpacedRepetitionAlgorithm.calculate_time_delta(elapsed, is_correct=is_positive)
 
-    entry_str = f"{code};{delta_ans};{delta_tm};{elapsed}"
-    db.save_answer_entry(callback.from_user.id, entry_str)
+    # Сохраняем с меткой 'card'
+    entry_str = f"{code};{delta_ans};{delta_tm};{elapsed};card"
+    user = callback.from_user
+    username = f"@{user.username}" if user.username else (user.full_name or f"ID_{user.id}")
+    db.save_answer_entry(user.id, username, entry_str)
 
     if answer_type == "know_well":
-        feedback = "✅ *Отлично!* Термин надежно закреплен."
+        feedback_toast = "🟢 Отлично! Закреплено."
     elif answer_type == "know_poorly":
-        feedback = "⚠️ *Понятно.* Мы повторим этот термин в ближайшее время."
+        feedback_toast = "🟡 Повторим в ближайшее время."
     else:
-        feedback = "❌ *Ничего страшного!* Мы добавили термин в частый цикл повторений."
+        feedback_toast = "🔴 Добавлено в частый цикл."
 
-    await send_next_flashcard(callback, state, feedback_header=feedback)
-    await callback.answer()
+    await callback.answer(feedback_toast, show_alert=False)
+    await send_next_flashcard(callback, state)
 
 
 # ---------------------------------------------------------------------
-# ТЕСТЫ
+# ТЕСТЫ (СЛУЧАЙНАЯ СЕССИЯ БЕЗ ПОВТОРОВ И ЭКРАНОМ ЗАВЕРШЕНИЯ)
 # ---------------------------------------------------------------------
 
 async def send_next_test(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
+    pool = data.get("test_pool", [])
     module_filter = data.get("module_filter")
-    user_id = callback.from_user.id
 
-    card = select_next_card(user_id=user_id, module_filter=module_filter)
-    if not card:
-        empty_text = "❌ В выбранном модуле пока недостаточно терминов."
+    # Если пул терминов пуст — тест завершён!
+    if not pool:
+        total = data.get("test_total_in_session", 0)
+        correct = data.get("test_session_correct", 0)
+        errors = data.get("test_session_errors", [])
+        err_count = len(errors)
+        times = data.get("test_session_times", [])
+        avg_t = round(sum(times) / len(times), 1) if times else 0.0
+        pct = round(correct / total * 100, 1) if total > 0 else 0.0
+
+        text = (
+            f"🏆 *Тестирование завершено!*\n\n"
+            f"Ты прошёл все термины темы ({total} из {total}).\n\n"
+            f"🎯 *Результат:* {correct} верно / {err_count} ошибок (*{pct}%*)\n"
+            f"⏱ *Среднее время:* {avg_t} сек"
+        )
         if callback.message:
-            await callback.message.edit_text(empty_text, reply_markup=Keyboards.back_to_menu())
+            await callback.message.edit_text(
+                text,
+                reply_markup=Keyboards.test_finish(has_errors=bool(errors)),
+                parse_mode=ParseMode.MARKDOWN
+            )
         return
+
+    # Берём следующий случайный термин из пула
+    next_code = pool.pop()
+    await state.update_data(test_pool=pool)
+
+    card = catalog.get_by_code(next_code)
+    if not card:
+        card = catalog.all_terms[0]
 
     test_data = TestGenerator.generate(card, module_filter)
     shown_at = time.time()
     await state.update_data(current_test_data=test_data, test_shown_at=shown_at)
 
+    total_num = data.get("test_total_in_session", len(pool) + 1)
+    curr_num = total_num - len(pool)
+
     text = (
-        f"🎯 *Тест: {card['module_title']}*\n\n"
+        f"🎯 *Тест: {card['module_title']}* `[{curr_num}/{total_num}]`\n\n"
         f"{test_data['question_text']}"
     )
 
@@ -872,27 +1005,62 @@ async def handle_test_answer(callback: CallbackQuery, state: FSMContext):
 
     chosen_option = test_data["options"][option_idx]
     is_correct = chosen_option["is_correct"]
-    answer_type = "correct" if is_correct else "incorrect"
-
-    delta_ans = SpacedRepetitionAlgorithm.calculate_answer_delta(answer_type)
-    delta_tm = SpacedRepetitionAlgorithm.calculate_time_delta(elapsed, is_correct=is_correct)
-
-    entry_str = f"{code};{delta_ans};{delta_tm};{elapsed}"
-    db.save_answer_entry(callback.from_user.id, entry_str)
-
     correct_term = test_data["correct_term"]
+
+    # Обновляем локальную статистику сессии
+    correct_count = data.get("test_session_correct", 0)
+    session_errors = data.get("test_session_errors", [])
+    session_times = data.get("test_session_times", [])
+
+    if is_correct:
+        correct_count += 1
+    else:
+        session_errors.append({
+            "term": correct_term["term"],
+            "genus": correct_term["genus"],
+            "traits": correct_term.get("traits", []),
+            "explanation": test_data.get("explanation_note", "") or f"Правильный ответ: {correct_term['term']}"
+        })
+
+    session_times.append(elapsed)
+
+    await state.update_data(
+        test_session_correct=correct_count,
+        test_session_errors=session_errors,
+        test_session_times=session_times
+    )
+
+    # Защита от мискликов: если ответ быстрее 3 секунд, в базу НЕ пишем!
+    if elapsed >= 3.0:
+        answer_type = "correct" if is_correct else "incorrect"
+        delta_ans = SpacedRepetitionAlgorithm.calculate_answer_delta(answer_type)
+        delta_tm = SpacedRepetitionAlgorithm.calculate_time_delta(elapsed, is_correct=is_correct)
+        entry_str = f"{code};{delta_ans};{delta_tm};{elapsed};test"
+
+        user = callback.from_user
+        username = f"@{user.username}" if user.username else (user.full_name or f"ID_{user.id}")
+        db.save_answer_entry(user.id, username, entry_str)
+
+    # Формируем компактный понятный разбор
     if is_correct:
         status_text = "🎉 *Верно!* Отличная работа."
     else:
         if test_data.get("explanation_note"):
             status_text = f"❌ *Неверно.*\n💡 {test_data['explanation_note']}"
         else:
-            status_text = f"❌ *Неверно.* Правильный ответ относится к термину: *{correct_term['term']}*."
+            status_text = f"❌ *Неверно.* Правильный термин: *{correct_term['term']}*."
 
+    traits = correct_term.get("traits", [])
+    traits_hint = f"• {traits[0]}" if traits else f"• {correct_term['genus']}"
     text = (
         f"{status_text}\n\n"
-        f"💡 *Определение {correct_term['term']}:*\n{correct_term['concept_explanation']}"
+        f"🎓 *{correct_term['term'].upper()}*\n"
+        f"🏛 _{correct_term['genus']}_\n"
+        f"📌 {traits_hint}"
     )
+
+    if elapsed < 3.0:
+        text += "\n\n⚡️ _Ответ < 3 сек (мисклик) — не учтён в общей статистике._"
 
     if callback.message:
         await callback.message.edit_text(text, reply_markup=Keyboards.test_next(), parse_mode=ParseMode.MARKDOWN)
@@ -901,6 +1069,54 @@ async def handle_test_answer(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "test:next")
 async def handle_test_next(callback: CallbackQuery, state: FSMContext):
+    await send_next_test(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "test:show_errors")
+async def handle_test_show_errors(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    errors = data.get("test_session_errors", [])
+    if not errors:
+        await callback.answer("🎉 Ошибок нет — 100% результат!", show_alert=True)
+        return
+
+    lines = ["📝 *Разбор твоих ошибок в этом тесте:*\n"]
+    for idx, err in enumerate(errors[:8], start=1):
+        lines.append(f"*{idx}. {err['term'].upper()}*")
+        lines.append(f"🏛 Род: _{err['genus']}_")
+        if err.get("traits"):
+            lines.append(f"📌 Признак: _{err['traits'][0]}_")
+        lines.append("")
+
+    if len(errors) > 8:
+        lines.append(f"_...и ещё {len(errors) - 8} ошибок._")
+
+    text = "\n".join(lines)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Начать заново", callback_data="test:restart")],
+        [InlineKeyboardButton(text="🚪 В главное меню", callback_data="back_to_main")],
+    ])
+    if callback.message:
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "test:restart")
+async def handle_test_restart(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    module_filter = data.get("module_filter")
+    available = catalog.get_terms(module_filter)
+    pool = [t["code"] for t in available]
+    random.shuffle(pool)
+
+    await state.update_data(
+        test_pool=pool,
+        test_total_in_session=len(pool),
+        test_session_correct=0,
+        test_session_errors=[],
+        test_session_times=[]
+    )
     await send_next_test(callback, state)
     await callback.answer()
 
@@ -956,7 +1172,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("Бот версии 3 успешно запущен.")
+    logger.info("Бот версии 4.0 успешно запущен.")
     await dp.start_polling(bot)
 
 
