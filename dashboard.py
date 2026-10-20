@@ -1,3 +1,4 @@
+import io
 import os
 import json
 import sqlite3
@@ -16,7 +17,7 @@ except ImportError:
 # =====================================================================
 
 st.set_page_config(
-    page_title="Аналитика терминов ЕГЭ",
+    page_title="Аналитика терминов по обществознанию",
     page_icon="📊",
     layout="wide"
 )
@@ -40,7 +41,6 @@ def load_terms_metadata():
     }
     terms_dict = {}
 
-    # Способ А: Загрузка из terms.json
     if os.path.exists(TERMS_JSON_PATH):
         try:
             with open(TERMS_JSON_PATH, "r", encoding="utf-8") as f:
@@ -61,7 +61,6 @@ def load_terms_metadata():
         except Exception:
             pass
 
-    # Способ Б: Резервная загрузка напрямую из SQLite social_bot.db
     if os.path.exists(DB_PATH):
         try:
             conn = sqlite3.connect(DB_PATH)
@@ -99,45 +98,60 @@ def get_db_connection():
         conn = sqlite3.connect(sqlite_path)
         return conn, False
 
-@st.cache_data(ttl=30)
-def fetch_data():
+@st.cache_data(ttl=15)
+def fetch_all_data():
+    """Загружает логи ответов, список учителей и связи ученик-учитель."""
     try:
         conn, is_postgres = get_db_connection()
     except Exception as e:
         st.error(f"Не удалось подключиться к базе данных: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    answers_df = pd.DataFrame()
+    teachers_df = pd.DataFrame()
+    st_teachers_df = pd.DataFrame()
 
     try:
-        query = """
-            SELECT user_id, username, entry, created_at 
-            FROM user_answers 
-            ORDER BY created_at DESC;
-        """
-        df = pd.read_sql(query, conn)
-    except Exception:
-        # Резервный запрос, если колонка username еще не создана в БД
+        # 1. Загружаем ответы
         try:
-            query = """
-                SELECT user_id, entry, created_at 
-                FROM user_answers 
-                ORDER BY created_at DESC;
-            """
-            df = pd.read_sql(query, conn)
-            df["username"] = None
+            query_answers = "SELECT user_id, username, full_name, entry, created_at FROM user_answers ORDER BY created_at DESC;"
+            answers_df = pd.read_sql(query_answers, conn)
         except Exception:
-            df = pd.DataFrame()
+            try:
+                query_answers_legacy = "SELECT user_id, username, entry, created_at FROM user_answers ORDER BY created_at DESC;"
+                answers_df = pd.read_sql(query_answers_legacy, conn)
+                answers_df["full_name"] = None
+            except Exception:
+                answers_df = pd.DataFrame()
+
+        # 2. Загружаем учителей
+        try:
+            query_teachers = "SELECT teacher_code, user_id, full_name, created_at FROM teachers;"
+            teachers_df = pd.read_sql(query_teachers, conn)
+        except Exception:
+            teachers_df = pd.DataFrame()
+
+        # 3. Загружаем связи учеников и учителей
+        try:
+            query_st = "SELECT student_id, teacher_code, joined_at FROM student_teachers;"
+            st_teachers_df = pd.read_sql(query_st, conn)
+        except Exception:
+            st_teachers_df = pd.DataFrame()
+
     finally:
         conn.close()
 
-    if df.empty:
-        return pd.DataFrame()
+    if answers_df.empty:
+        return pd.DataFrame(), teachers_df, st_teachers_df
 
-    if "username" not in df.columns:
-        df["username"] = None
+    if "username" not in answers_df.columns:
+        answers_df["username"] = None
+    if "full_name" not in answers_df.columns:
+        answers_df["full_name"] = None
 
-    # Парсим строку формата "code;delta_answer;delta_time;time_seconds;mode"
+    # Парсим записи ответов
     parsed_rows = []
-    for _, row in df.iterrows():
+    for _, row in answers_df.iterrows():
         entry_str = str(row["entry"])
         parts = entry_str.split(";")
         if len(parts) >= 4:
@@ -149,7 +163,6 @@ def fetch_data():
             except ValueError:
                 continue
 
-            # Режим: 'card' (карточка) или 'test' (тест)
             raw_mode = parts[4].strip() if len(parts) >= 5 else "card"
             mode_display = "Тесты" if raw_mode == "test" else "Карточки"
 
@@ -158,7 +171,6 @@ def fetch_data():
                 "module": f"Модуль {code.split('.')[0] if '.' in code else '?'}"
             })
 
-            # Статус ответа:
             if d_ans <= 0:
                 result_status = "Верно / Знаю"
                 is_problem = False
@@ -174,9 +186,15 @@ def fetch_data():
             if username_val in ["None", "nan", ""]:
                 username_val = None
 
+            raw_fname = row.get("full_name")
+            fname_val = str(raw_fname).strip() if pd.notna(raw_fname) and raw_fname is not None else ""
+            if fname_val in ["None", "nan", ""]:
+                fname_val = username_val or f"ID: {row['user_id']}"
+
             parsed_rows.append({
                 "user_id": str(row["user_id"]),
                 "username": username_val,
+                "full_name": fname_val,
                 "mode": mode_display,
                 "code": code,
                 "term": term_info["term"],
@@ -189,155 +207,485 @@ def fetch_data():
                 "created_at": row["created_at"]
             })
 
-    return pd.DataFrame(parsed_rows)
+    return pd.DataFrame(parsed_rows), teachers_df, st_teachers_df
+
+
+def render_user_avatar_badge(full_name: str, username: Optional[str], user_id: str):
+    """Отображает компактный аватар из Telegram CDN с fallback на инициалы."""
+    clean_uname = str(username).replace("@", "").strip() if username else ""
+    avatar_url = f"https://t.me/i/userpic/320/{clean_uname}.jpg" if clean_uname else ""
+    initials = "".join([p[0].upper() for p in full_name.split()[:2]]) if full_name else "УЧ"
+
+    html_code = f"""
+    <div style="display: flex; align-items: center; gap: 14px; margin-bottom: 20px; padding: 12px 16px; background: rgba(255, 255, 255, 0.04); border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.1);">
+        <img src="{avatar_url}" 
+             onerror="this.onerror=null; this.src='https://ui-avatars.com/api/?name={initials}&background=4f46e5&color=fff&size=128';"
+             style="width: 48px; height: 48px; border-radius: 50%; object-fit: cover; border: 2px solid #6366f1;" />
+        <div>
+            <div style="font-size: 1.15rem; font-weight: 600; line-height: 1.2;">{full_name}</div>
+            <div style="font-size: 0.88rem; color: #94a3b8;">{'@' + clean_uname if clean_uname else 'ID: ' + str(user_id)}</div>
+        </div>
+    </div>
+    """
+    st.markdown(html_code, unsafe_allow_html=True)
+
 
 # =====================================================================
-# 4. ИНТЕРФЕЙС АНАЛИТИЧЕСКОЙ ПАНЕЛИ
+# 4. ИНТЕРФЕЙС И РОУТИНГ ПО РОЛЯМ
 # =====================================================================
 
-st.title("📊 Аналитическая панель тренажера ЕГЭ")
+raw_df, teachers_df, st_teachers_df = fetch_all_data()
 
-raw_df = fetch_data()
+# Считываем параметры из адресной строки
+query_params = st.query_params
+student_param = query_params.get("student")
+teacher_param = query_params.get("teacher")
 
-if raw_df.empty:
-    st.info("ℹ️ В базе данных пока нет ответов. Запусти бота и пройди несколько карточек или тестов!")
-    st.stop()
+# ---------------------------------------------------------------------
+# СЦЕНАРИЙ 1: ПЕРСОНАЛЬНЫЙ КАБИНЕТ УЧЕНИКА (?student=...)
+# ---------------------------------------------------------------------
+if student_param:
+    st.title("🎓 Личный кабинет ученика")
 
-# Боковая панель: фильтры
-st.sidebar.header("Фильтры")
+    if raw_df.empty:
+        st.info("ℹ️ В базе пока нет данных об ответах. Запусти бота и пройди несколько карточек или тестов!")
+        st.stop()
 
-# 1. Фильтр по ученикам с отображением юзернеймов
-user_labels_map = {}
-for uid in raw_df["user_id"].unique():
-    sub_df = raw_df[raw_df["user_id"] == uid]
-    valid_names = [n for n in sub_df["username"].dropna().unique() if str(n).strip() and str(n) not in ["None", "nan"]]
-    if valid_names:
-        label = f"{valid_names[0]} (ID: {uid})"
+    student_df = raw_df[raw_df["user_id"] == str(student_param)]
+    if student_df.empty:
+        st.warning(f"Ученик с ID `{student_param}` пока не совершил ни одного действия в тренажере.")
+        st.stop()
+
+    # Извлекаем метаданные ученика
+    sample_row = student_df.iloc[0]
+    full_name = sample_row["full_name"]
+    username = sample_row["username"]
+    render_user_avatar_badge(full_name, username, str(student_param))
+
+    # Фильтр по режимам для ученика
+    mode_options = ["Все режимы", "Только карточки", "Только тесты"]
+    selected_mode = st.sidebar.selectbox("Режим тренировки:", mode_options)
+    if selected_mode == "Только карточки":
+        df = student_df[student_df["mode"] == "Карточки"]
+    elif selected_mode == "Только тесты":
+        df = student_df[student_df["mode"] == "Тесты"]
     else:
-        label = f"ID: {uid}"
-    user_labels_map[label] = uid
+        df = student_df
 
-users_options = ["Все пользователи"] + sorted(list(user_labels_map.keys()))
-selected_option = st.sidebar.selectbox("Выбери пользователя:", users_options)
+    if df.empty:
+        st.warning(f"По режиму «{selected_mode}» у тебя пока нет ответов.")
+        st.stop()
 
-if selected_option == "Все пользователи":
-    df = raw_df
-    st.sidebar.write(f"👥 Всего учеников в базе: **{raw_df['user_id'].nunique()}**")
-else:
-    chosen_uid = user_labels_map[selected_option]
-    df = raw_df[raw_df["user_id"] == chosen_uid]
-    st.sidebar.write(f"👤 Карточка ученика: **{selected_option}**")
+    # KPI метрики ученика
+    c1, c2, c3, c4 = st.columns(4)
+    total_answers = len(df)
+    avg_time = round(df["time_sec"].mean(), 1) if total_answers > 0 else 0.0
+    errors_count = int(df["is_problem"].sum())
+    accuracy = round((1 - (errors_count / total_answers)) * 100, 1) if total_answers > 0 else 0.0
 
-# 2. Фильтр по режиму (Раздельная аналитика: Карточки / Тесты)
-mode_options = ["Все режимы", "Только карточки", "Только тесты"]
-selected_mode = st.sidebar.selectbox("Режим тренировки:", mode_options)
+    c1.metric("Всего ответов", total_answers)
+    c2.metric("Успешность / Точность", f"{accuracy}%")
+    c3.metric("Среднее время", f"{avg_time} сек")
+    c4.metric("Ошибок / Затруднений", errors_count)
 
-if selected_mode == "Только карточки":
-    df = df[df["mode"] == "Карточки"]
-elif selected_mode == "Только тесты":
-    df = df[df["mode"] == "Тесты"]
+    st.divider()
 
-if df.empty:
-    st.warning(f"По выбранному режиму ({selected_mode}) пока нет данных.")
-    st.stop()
-
-# =====================================================================
-# 5. КЛЮЧЕВЫЕ МЕТРИКИ (KPI)
-# =====================================================================
-
-c1, c2, c3, c4 = st.columns(4)
-total_answers = len(df)
-avg_time = round(df["time_sec"].mean(), 1) if total_answers > 0 else 0.0
-errors_count = int(df["is_problem"].sum())
-accuracy = round((1 - (errors_count / total_answers)) * 100, 1) if total_answers > 0 else 0.0
-
-c1.metric("Всего ответов", total_answers)
-c2.metric("Успешность / Точность", f"{accuracy}%")
-c3.metric("Среднее время", f"{avg_time} сек")
-c4.metric("Ошибок / Затруднений", errors_count)
-
-st.divider()
-
-# =====================================================================
-# 6. КРУГОВЫЕ ДИАГРАММЫ
-# =====================================================================
-
-col_pie1, col_pie2 = st.columns(2)
-
-with col_pie1:
-    st.subheader("🥧 Качество ответов")
-    fig_status = px.pie(
-        df,
-        names="status",
-        color="status",
-        color_discrete_map={
-            "Верно / Знаю": "#2ecc71",
-            "Неуверенно": "#f1c40f",
-            "Ошибка / Не знаю": "#e74c3c"
-        },
-        hole=0.4
-    )
-    st.plotly_chart(fig_status, use_container_width=True)
-
-with col_pie2:
-    st.subheader("🥧 Распределение затруднений по блокам")
-    problem_df = df[df["is_problem"]]
-    if not problem_df.empty:
-        fig_modules = px.pie(
-            problem_df,
-            names="module",
-            title="Ошибки по модулям кодификатора",
+    col_pie1, col_pie2 = st.columns(2)
+    with col_pie1:
+        st.subheader("🥧 Качество твоих ответов")
+        fig_status = px.pie(
+            df,
+            names="status",
+            color="status",
+            color_discrete_map={
+                "Верно / Знаю": "#2ecc71",
+                "Неуверенно": "#f1c40f",
+                "Ошибка / Не знаю": "#e74c3c"
+            },
             hole=0.4
         )
-        st.plotly_chart(fig_modules, use_container_width=True)
+        st.plotly_chart(fig_status, use_container_width=True)
+
+    with col_pie2:
+        st.subheader("🥧 Твои ошибки по блокам")
+        problem_df = df[df["is_problem"]]
+        if not problem_df.empty:
+            fig_modules = px.pie(
+                problem_df,
+                names="module",
+                hole=0.4
+            )
+            st.plotly_chart(fig_modules, use_container_width=True)
+        else:
+            st.success("🎉 Затруднений и ошибок пока нет — все ответы уверенные!")
+
+    st.divider()
+
+    col_bar1, col_bar2 = st.columns(2)
+    with col_bar1:
+        st.subheader("⚠️ Твои трудные термины")
+        term_problems = df.groupby(["code", "term", "module"]).agg(
+            total_tries=("status", "count"),
+            errors=("is_problem", "sum"),
+            avg_seconds=("time_sec", "mean")
+        ).reset_index()
+        term_problems["error_rate"] = (term_problems["errors"] / term_problems["total_tries"] * 100).round(1)
+        term_problems["avg_seconds"] = term_problems["avg_seconds"].round(1)
+        top_problematic = term_problems.sort_values(by=["errors", "error_rate"], ascending=False).head(10)
+
+        st.dataframe(
+            top_problematic[["code", "term", "module", "errors", "total_tries", "error_rate", "avg_seconds"]].rename(
+                columns={
+                    "code": "Код",
+                    "term": "Термин",
+                    "module": "Модуль",
+                    "errors": "Ошибок",
+                    "total_tries": "Попыток",
+                    "error_rate": "% ошибок",
+                    "avg_seconds": "Ср. время (с)"
+                }
+            ),
+            use_container_width=True,
+            hide_index=True
+        )
+
+    with col_bar2:
+        st.subheader("⏱ Скорость ответа по блокам")
+        module_time = df.groupby("module")["time_sec"].mean().round(1).reset_index()
+        fig_time = px.bar(
+            module_time,
+            x="module",
+            y="time_sec",
+            labels={"module": "Модуль", "time_sec": "Секунды"},
+            color="time_sec",
+            color_continuous_scale="Blues"
+        )
+        st.plotly_chart(fig_time, use_container_width=True)
+
+    # Список подключенных преподавателей
+    if not st_teachers_df.empty and not teachers_df.empty:
+        my_t_codes = st_teachers_df[st_teachers_df["student_id"] == int(student_param)]["teacher_code"].tolist()
+        if my_t_codes:
+            st.divider()
+            st.subheader("👨‍🏫 Твои преподаватели")
+            my_teachers = teachers_df[teachers_df["teacher_code"].isin(my_t_codes)]
+            for _, tr in my_teachers.iterrows():
+                st.write(f"• **{tr['full_name']}** (Код класса: `{tr['teacher_code']}`)")
+
+    st.stop()
+
+
+# ---------------------------------------------------------------------
+# СЦЕНАРИЙ 2: КАБИНЕТ ПРЕПОДАВАТЕЛЯ (?teacher=...)
+# ---------------------------------------------------------------------
+elif teacher_param:
+    teacher_code = str(teacher_param).strip()
+    st.title("👨‍🏫 Кабинет преподавателя")
+
+    teacher_name = f"Код класса: {teacher_code}"
+    if not teachers_df.empty:
+        t_match = teachers_df[teachers_df["teacher_code"] == teacher_code]
+        if not t_match.empty:
+            teacher_name = f"{t_match.iloc[0]['full_name']} (Класс `{teacher_code}`)"
+
+    st.caption(f"Просмотр успеваемости класса: **{teacher_name}**")
+
+    # Ищем учеников этого класса
+    if st_teachers_df.empty:
+        st.info(f"ℹ️ К классу `{teacher_code}` пока не прикрепился ни один ученик. Отправьте ученикам ссылку-приглашение из бота!")
+        st.stop()
+
+    class_student_ids = st_teachers_df[st_teachers_df["teacher_code"] == teacher_code]["student_id"].astype(str).unique().tolist()
+    if not class_student_ids:
+        st.info(f"ℹ️ К классу `{teacher_code}` пока не прикрепился ни один ученик. Отправьте ученикам ссылку-приглашение из бота!")
+        st.stop()
+
+    class_df = raw_df[raw_df["user_id"].isin(class_student_ids)]
+    if class_df.empty:
+        st.info("ℹ️ Ученики вашего класса пока не начали решать карточки и тесты в боте.")
+        st.stop()
+
+    # Боковая панель учителя: выбор ученика и режима
+    st.sidebar.header("Фильтры класса")
+    student_labels = {"👥 Весь класс (Сводка)": "ALL"}
+    for uid in class_student_ids:
+        sub = class_df[class_df["user_id"] == uid]
+        if not sub.empty:
+            row_s = sub.iloc[0]
+            label = f"{row_s['full_name']} ({'@' + row_s['username'] if row_s['username'] else 'ID: ' + uid})"
+            student_labels[label] = uid
+
+    selected_student_label = st.sidebar.selectbox("Выбери ученика:", list(student_labels.keys()))
+    selected_uid = student_labels[selected_student_label]
+
+    if selected_uid == "ALL":
+        active_df = class_df
+        st.sidebar.write(f"👥 Всего учеников в классе: **{len(class_student_ids)}**")
     else:
-        st.success("🎉 Затруднений и ошибок пока нет — все ответы уверенные!")
+        active_df = class_df[class_df["user_id"] == selected_uid]
+        s_row = active_df.iloc[0]
+        render_user_avatar_badge(s_row["full_name"], s_row["username"], selected_uid)
 
-st.divider()
+    mode_options = ["Все режимы", "Только карточки", "Только тесты"]
+    selected_mode = st.sidebar.selectbox("Режим тренировки:", mode_options)
+    if selected_mode == "Только карточки":
+        active_df = active_df[active_df["mode"] == "Карточки"]
+    elif selected_mode == "Только тесты":
+        active_df = active_df[active_df["mode"] == "Тесты"]
 
-# =====================================================================
-# 7. ДЕТАЛЬНЫЙ РАЗБОР: ПРОБЛЕМНЫЕ ТЕРМИНЫ И СКОРОСТЬ
-# =====================================================================
+    if active_df.empty:
+        st.warning(f"По выбранному режиму ({selected_mode}) пока нет данных.")
+        st.stop()
 
-col_bar1, col_bar2 = st.columns(2)
+    # Кнопка скачивания ведомости в Excel
+    st.sidebar.divider()
+    if not class_df.empty:
+        summary_rows = []
+        for uid in class_student_ids:
+            u_df = class_df[class_df["user_id"] == uid]
+            if not u_df.empty:
+                r0 = u_df.iloc[0]
+                u_total = len(u_df)
+                u_err = int(u_df["is_problem"].sum())
+                u_acc = round((1 - (u_err / u_total)) * 100, 1) if u_total > 0 else 0.0
+                u_time = round(u_df["time_sec"].mean(), 1) if u_total > 0 else 0.0
+                summary_rows.append({
+                    "Ученик": r0["full_name"],
+                    "Юзернейм": f"@{r0['username']}" if r0["username"] else "—",
+                    "ID Telegram": uid,
+                    "Всего ответов": u_total,
+                    "Точность (%)": u_acc,
+                    "Ошибок": u_err,
+                    "Ср. время (сек)": u_time
+                })
+        if summary_rows:
+            report_df = pd.DataFrame(summary_rows)
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                report_df.to_excel(writer, index=False, sheet_name="Ведомость класса")
+            st.sidebar.download_button(
+                label="📥 Скачать ведомость класса (.xlsx)",
+                data=buffer.getvalue(),
+                file_name=f"Класс_{teacher_code}_ведомость.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
-with col_bar1:
-    st.subheader("⚠️ Топ-10 трудных терминов")
-    term_problems = df.groupby(["code", "term", "module"]).agg(
-        total_tries=("status", "count"),
-        errors=("is_problem", "sum"),
-        avg_seconds=("time_sec", "mean")
-    ).reset_index()
-    term_problems["error_rate"] = (term_problems["errors"] / term_problems["total_tries"] * 100).round(1)
-    term_problems["avg_seconds"] = term_problems["avg_seconds"].round(1)
+    # KPI класса
+    c1, c2, c3, c4 = st.columns(4)
+    total_answers = len(active_df)
+    avg_time = round(active_df["time_sec"].mean(), 1) if total_answers > 0 else 0.0
+    errors_count = int(active_df["is_problem"].sum())
+    accuracy = round((1 - (errors_count / total_answers)) * 100, 1) if total_answers > 0 else 0.0
 
-    top_problematic = term_problems.sort_values(by=["errors", "error_rate"], ascending=False).head(10)
+    c1.metric("Всего ответов", total_answers)
+    c2.metric("Успешность / Точность", f"{accuracy}%")
+    c3.metric("Среднее время", f"{avg_time} сек")
+    c4.metric("Ошибок / Затруднений", errors_count)
 
-    st.dataframe(
-        top_problematic[["code", "term", "module", "errors", "total_tries", "error_rate", "avg_seconds"]].rename(
-            columns={
-                "code": "Код",
-                "term": "Термин",
-                "module": "Модуль",
-                "errors": "Ошибок",
-                "total_tries": "Попыток",
-                "error_rate": "% ошибок",
-                "avg_seconds": "Ср. время (с)"
-            }
-        ),
-        use_container_width=True,
-        hide_index=True
-    )
+    st.divider()
 
-with col_bar2:
-    st.subheader("⏱ Скорость ответа по блокам кодификатора")
-    module_time = df.groupby("module")["time_sec"].mean().round(1).reset_index()
-    fig_time = px.bar(
-        module_time,
-        x="module",
-        y="time_sec",
-        labels={"module": "Модуль", "time_sec": "Секунды"},
-        color="time_sec",
-        color_continuous_scale="Blues"
-    )
-    st.plotly_chart(fig_time, use_container_width=True)
+    col_pie1, col_pie2 = st.columns(2)
+    with col_pie1:
+        st.subheader("🥧 Качество ответов")
+        fig_status = px.pie(
+            active_df,
+            names="status",
+            color="status",
+            color_discrete_map={
+                "Верно / Знаю": "#2ecc71",
+                "Неуверенно": "#f1c40f",
+                "Ошибка / Не знаю": "#e74c3c"
+            },
+            hole=0.4
+        )
+        st.plotly_chart(fig_status, use_container_width=True)
+
+    with col_pie2:
+        st.subheader("🥧 Ошибки по блокам кодификатора")
+        problem_df = active_df[active_df["is_problem"]]
+        if not problem_df.empty:
+            fig_modules = px.pie(problem_df, names="module", hole=0.4)
+            st.plotly_chart(fig_modules, use_container_width=True)
+        else:
+            st.success("🎉 Затруднений и ошибок пока нет — все ответы уверенные!")
+
+    st.divider()
+
+    col_bar1, col_bar2 = st.columns(2)
+    with col_bar1:
+        st.subheader("⚠️ Топ-10 трудных терминов для класса")
+        term_problems = active_df.groupby(["code", "term", "module"]).agg(
+            total_tries=("status", "count"),
+            errors=("is_problem", "sum"),
+            avg_seconds=("time_sec", "mean")
+        ).reset_index()
+        term_problems["error_rate"] = (term_problems["errors"] / term_problems["total_tries"] * 100).round(1)
+        term_problems["avg_seconds"] = term_problems["avg_seconds"].round(1)
+        top_problematic = term_problems.sort_values(by=["errors", "error_rate"], ascending=False).head(10)
+
+        st.dataframe(
+            top_problematic[["code", "term", "module", "errors", "total_tries", "error_rate", "avg_seconds"]].rename(
+                columns={
+                    "code": "Код",
+                    "term": "Термин",
+                    "module": "Модуль",
+                    "errors": "Ошибок",
+                    "total_tries": "Попыток",
+                    "error_rate": "% ошибок",
+                    "avg_seconds": "Ср. время (с)"
+                }
+            ),
+            use_container_width=True,
+            hide_index=True
+        )
+
+    with col_bar2:
+        st.subheader("⏱ Скорость ответа по блокам")
+        module_time = active_df.groupby("module")["time_sec"].mean().round(1).reset_index()
+        fig_time = px.bar(
+            module_time,
+            x="module",
+            y="time_sec",
+            labels={"module": "Модуль", "time_sec": "Секунды"},
+            color="time_sec",
+            color_continuous_scale="Blues"
+        )
+        st.plotly_chart(fig_time, use_container_width=True)
+
+    st.stop()
+
+
+# ---------------------------------------------------------------------
+# СЦЕНАРИЙ 3: ГЛОБАЛЬНАЯ АДМИНИСТРАТИВНАЯ ПАНЕЛЬ (БЕЗ ПАРАМЕТРОВ)
+# ---------------------------------------------------------------------
+else:
+    st.title("📊 Глобальная аналитическая панель тренажера")
+
+    if raw_df.empty:
+        st.info("ℹ️ В базе данных пока нет ответов. Запусти бота и пройди несколько карточек или тестов!")
+        st.stop()
+
+    st.sidebar.header("Фильтры")
+
+    # 1. Фильтр по ученикам с отображением аватаров и юзернеймов
+    user_labels_map = {}
+    for uid in raw_df["user_id"].unique():
+        sub_df = raw_df[raw_df["user_id"] == uid]
+        r0 = sub_df.iloc[0]
+        fname = r0["full_name"]
+        uname = f"@{r0['username']}" if r0["username"] else f"ID: {uid}"
+        label = f"{fname} ({uname})"
+        user_labels_map[label] = uid
+
+    users_options = ["Все пользователи"] + sorted(list(user_labels_map.keys()))
+    selected_option = st.sidebar.selectbox("Выбери пользователя:", users_options)
+
+    if selected_option == "Все пользователи":
+        df = raw_df
+        st.sidebar.write(f"👥 Всего учеников в базе: **{raw_df['user_id'].nunique()}**")
+    else:
+        chosen_uid = user_labels_map[selected_option]
+        df = raw_df[raw_df["user_id"] == chosen_uid]
+        s_row = df.iloc[0]
+        render_user_avatar_badge(s_row["full_name"], s_row["username"], chosen_uid)
+
+    # 2. Фильтр по режиму
+    mode_options = ["Все режимы", "Только карточки", "Только тесты"]
+    selected_mode = st.sidebar.selectbox("Режим тренировки:", mode_options)
+
+    if selected_mode == "Только карточки":
+        df = df[df["mode"] == "Карточки"]
+    elif selected_mode == "Только тесты":
+        df = df[df["mode"] == "Тесты"]
+
+    if df.empty:
+        st.warning(f"По выбранному режиму ({selected_mode}) пока нет данных.")
+        st.stop()
+
+    # KPI метрики
+    c1, c2, c3, c4 = st.columns(4)
+    total_answers = len(df)
+    avg_time = round(df["time_sec"].mean(), 1) if total_answers > 0 else 0.0
+    errors_count = int(df["is_problem"].sum())
+    accuracy = round((1 - (errors_count / total_answers)) * 100, 1) if total_answers > 0 else 0.0
+
+    c1.metric("Всего ответов", total_answers)
+    c2.metric("Успешность / Точность", f"{accuracy}%")
+    c3.metric("Среднее время", f"{avg_time} сек")
+    c4.metric("Ошибок / Затруднений", errors_count)
+
+    st.divider()
+
+    col_pie1, col_pie2 = st.columns(2)
+    with col_pie1:
+        st.subheader("🥧 Качество ответов")
+        fig_status = px.pie(
+            df,
+            names="status",
+            color="status",
+            color_discrete_map={
+                "Верно / Знаю": "#2ecc71",
+                "Неуверенно": "#f1c40f",
+                "Ошибка / Не знаю": "#e74c3c"
+            },
+            hole=0.4
+        )
+        st.plotly_chart(fig_status, use_container_width=True)
+
+    with col_pie2:
+        st.subheader("🥧 Распределение затруднений по блокам")
+        problem_df = df[df["is_problem"]]
+        if not problem_df.empty:
+            fig_modules = px.pie(
+                problem_df,
+                names="module",
+                title="Ошибки по модулям кодификатора",
+                hole=0.4
+            )
+            st.plotly_chart(fig_modules, use_container_width=True)
+        else:
+            st.success("🎉 Затруднений и ошибок пока нет — все ответы уверенные!")
+
+    st.divider()
+
+    col_bar1, col_bar2 = st.columns(2)
+    with col_bar1:
+        st.subheader("⚠️ Топ-10 трудных терминов")
+        term_problems = df.groupby(["code", "term", "module"]).agg(
+            total_tries=("status", "count"),
+            errors=("is_problem", "sum"),
+            avg_seconds=("time_sec", "mean")
+        ).reset_index()
+        term_problems["error_rate"] = (term_problems["errors"] / term_problems["total_tries"] * 100).round(1)
+        term_problems["avg_seconds"] = term_problems["avg_seconds"].round(1)
+
+        top_problematic = term_problems.sort_values(by=["errors", "error_rate"], ascending=False).head(10)
+
+        st.dataframe(
+            top_problematic[["code", "term", "module", "errors", "total_tries", "error_rate", "avg_seconds"]].rename(
+                columns={
+                    "code": "Код",
+                    "term": "Термин",
+                    "module": "Модуль",
+                    "errors": "Ошибок",
+                    "total_tries": "Попыток",
+                    "error_rate": "% ошибок",
+                    "avg_seconds": "Ср. время (с)"
+                }
+            ),
+            use_container_width=True,
+            hide_index=True
+        )
+
+    with col_bar2:
+        st.subheader("⏱ Скорость ответа по блокам кодификатора")
+        module_time = df.groupby("module")["time_sec"].mean().round(1).reset_index()
+        fig_time = px.bar(
+            module_time,
+            x="module",
+            y="time_sec",
+            labels={"module": "Модуль", "time_sec": "Секунды"},
+            color="time_sec",
+            color_continuous_scale="Blues"
+        )
+        st.plotly_chart(fig_time, use_container_width=True)
