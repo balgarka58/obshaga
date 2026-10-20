@@ -13,7 +13,7 @@ Telegram Bot для изучения терминов обществознани
    - Приоритет непросмотренным терминам (эффективный вес 6.5 vs базовый 5.0).
    - 2 веса: ответ (-1.0 / +0.5 / +2.0) и время реакции (бонус -1.0 только при верных ответах).
 5. 5 сбалансированных типов тестов с уникальными дистракторами и защитой от дублирования вариантов.
-6. Чистый пользовательский интерфейс.
+6. Встроенный лёгкий веб-сервер для бесплатного деплоя на Render Web Service ($0/мес).
 """
 
 import os
@@ -23,6 +23,7 @@ import time
 import random
 import logging
 import sqlite3
+import asyncio
 from typing import Optional, Dict, Any, List, Tuple
 from collections import deque
 
@@ -476,7 +477,6 @@ class TestGenerator:
         elif chosen_type == 2:
             question_text = f"Выбери верную родовую характеристику термина *{correct_term['term'].upper()}*:"
             
-            # Собираем дистракторы с уникальными родовыми понятиями
             target_genus = correct_term.get("genus", "").strip()
             seen_genera = {target_genus}
             valid_distractors = []
@@ -490,7 +490,6 @@ class TestGenerator:
                 if len(valid_distractors) == 3:
                     break
 
-            # Fallback
             while len(valid_distractors) < 3:
                 valid_distractors.append(random.choice(distractors))
 
@@ -907,8 +906,35 @@ async def handle_test_next(callback: CallbackQuery, state: FSMContext):
 
 
 # =====================================================================
-# 9. ТОЧКА ВХОДА
+# 9. ТОЧКА ВХОДА (С ПОДДЕРЖКОЙ RENDER FREE WEB SERVICE)
 # =====================================================================
+
+async def start_dummy_web_server(port: int = 10000):
+    """
+    Легковесный фоновый веб-сервер на чистом asyncio.
+    Отвечает 200 OK на проверки работоспособности Render,
+    чтобы бот мог работать на бесплатном тарифе Web Service ($0/мес).
+    """
+    async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            await reader.read(1024)
+            response = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n"
+                b"Content-Length: 2\r\n"
+                b"Connection: close\r\n\r\nOK"
+            )
+            writer.write(response)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    server = await asyncio.start_server(handle_client, "0.0.0.0", port)
+    logger.info(f"Фоновый веб-сервер успешно запущен на порту {port} для Render.")
+    return server
+
 
 async def main():
     if not BOT_TOKEN:
@@ -919,6 +945,13 @@ async def main():
     catalog.load()
     db.init_db()
 
+    # Запускаем мини веб-сервер для бесплатного тарифа Render Web Service ($0)
+    port = int(os.getenv("PORT", "10000"))
+    try:
+        await start_dummy_web_server(port)
+    except Exception as e:
+        logger.warning(f"Не удалось запустить фоновый веб-сервер на порту {port}: {e}")
+
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
@@ -928,7 +961,6 @@ async def main():
 
 
 if __name__ == "__main__":
-    import asyncio
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
