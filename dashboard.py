@@ -3,6 +3,7 @@ import os
 import json
 import hashlib
 import sqlite3
+from typing import Optional, Dict, Any, List, Tuple
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -104,11 +105,17 @@ def get_db_connection():
 @st.cache_data(ttl=15)
 def fetch_all_data():
     """Загружает логи ответов, список учителей и связи ученик-учитель."""
+    COLUMNS = [
+        "user_id", "username", "full_name", "mode", "code", "term",
+        "module", "delta_ans", "delta_time", "time_sec", "status",
+        "is_problem", "created_at"
+    ]
+
     try:
         conn, is_postgres = get_db_connection()
     except Exception as e:
         st.error(f"Не удалось подключиться к базе данных: {e}")
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(columns=COLUMNS), pd.DataFrame(), pd.DataFrame()
 
     answers_df = pd.DataFrame()
     teachers_df = pd.DataFrame()
@@ -142,7 +149,7 @@ def fetch_all_data():
         conn.close()
 
     if answers_df.empty:
-        return pd.DataFrame(), teachers_df, st_teachers_df
+        return pd.DataFrame(columns=COLUMNS), teachers_df, st_teachers_df
 
     if "username" not in answers_df.columns:
         answers_df["username"] = None
@@ -205,6 +212,9 @@ def fetch_all_data():
                 "is_problem": is_problem,
                 "created_at": row["created_at"]
             })
+
+    if not parsed_rows:
+        return pd.DataFrame(columns=COLUMNS), teachers_df, st_teachers_df
 
     return pd.DataFrame(parsed_rows), teachers_df, st_teachers_df
 
@@ -554,13 +564,11 @@ elif teacher_param:
 # СЦЕНАРИЙ 3: ВХОД БЕЗ ПАРАМЕТРОВ (ПРИВЕТСТВИЕ + ЗАЩИТА АДМИНИСТРАТОРА)
 # ---------------------------------------------------------------------
 else:
-    # Проверяем авторизацию администратора
     is_admin_authed = False
     if admin_param and admin_param == ADMIN_PASSWORD:
         is_admin_authed = True
 
     if not is_admin_authed:
-        # Проверяем пароль в сайдбаре
         st.sidebar.header("🔒 Вход администратора")
         admin_input = st.sidebar.text_input("Пароль главного администратора:", type="password")
         if admin_input:
@@ -570,7 +578,6 @@ else:
                 st.sidebar.error("Неверный пароль администратора.")
 
     if not is_admin_authed:
-        # Защитная приветственная страница (данные учеников НЕ раскрываются посторонним!)
         st.title("📊 Аналитический портал тренажера по обществознанию")
         st.write(
             "Добро пожаловать в веб-аналитику тренажера понятий кодификатора!\n\n"
@@ -596,7 +603,6 @@ else:
         st.caption("🔒 Если вы главный администратор проекта — введите пароль в левой боковой панели для просмотра общей базы.")
         st.stop()
 
-    # Если администратор успешно авторизовался:
     st.title("🛡 Глобальная панель администратора")
     st.success("Авторизован как главный администратор проекта.")
 
