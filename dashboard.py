@@ -1,6 +1,7 @@
 import io
 import os
 import json
+import html
 import hashlib
 import sqlite3
 from typing import Optional, Dict, Any, List, Tuple
@@ -240,19 +241,25 @@ def fetch_all_data():
 # =====================================================================
 
 def render_user_avatar_badge(full_name: str, username: Optional[str], user_id: str):
-    """Отображает компактный аватар из Telegram CDN с fallback на инициалы."""
+    """Отображает компактный аватар из Telegram CDN с fallback на инициалы (защищено от XSS)."""
+    safe_name = html.escape(str(full_name or ""))
+    safe_uid = html.escape(str(user_id or ""))
     clean_uname = str(username).replace("@", "").strip() if username else ""
-    avatar_url = f"https://t.me/i/userpic/320/{clean_uname}.jpg" if clean_uname else ""
-    initials = "".join([p[0].upper() for p in full_name.split()[:2]]) if full_name else "УЧ"
+    safe_uname = html.escape(clean_uname)
+    avatar_url = f"https://t.me/i/userpic/320/{safe_uname}.jpg" if safe_uname else ""
+    
+    name_parts = str(full_name or "").split()
+    initials = "".join([p[0].upper() for p in name_parts[:2] if p]) if name_parts else "УЧ"
+    safe_initials = html.escape(initials)
 
     html_code = f"""
     <div style="display: flex; align-items: center; gap: 14px; margin-bottom: 20px; padding: 12px 16px; background: rgba(255, 255, 255, 0.04); border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.1);">
         <img src="{avatar_url}" 
-             onerror="this.onerror=null; this.src='https://ui-avatars.com/api/?name={initials}&background=4f46e5&color=fff&size=128';"
+             onerror="this.onerror=null; this.src='https://ui-avatars.com/api/?name={safe_initials}&background=4f46e5&color=fff&size=128';"
              style="width: 48px; height: 48px; border-radius: 50%; object-fit: cover; border: 2px solid #6366f1;" />
         <div>
-            <div style="font-size: 1.15rem; font-weight: 600; line-height: 1.2;">{full_name}</div>
-            <div style="font-size: 0.88rem; color: #94a3b8;">{'@' + clean_uname if clean_uname else 'ID: ' + str(user_id)}</div>
+            <div style="font-size: 1.15rem; font-weight: 600; line-height: 1.2;">{safe_name}</div>
+            <div style="font-size: 0.88rem; color: #94a3b8;">{'@' + safe_uname if safe_uname else 'ID: ' + safe_uid}</div>
         </div>
     </div>
     """
@@ -262,7 +269,7 @@ def render_user_avatar_badge(full_name: str, username: Optional[str], user_id: s
 def render_analytics_dashboard(df: pd.DataFrame, is_class_view: bool = False):
     """
     Единый визуальный модуль аналитики:
-    1. 4 ключевые KPI-метрики (Ответы, Точность, Время, Ошибки)
+    1. 4 ключевые KPI-метрики (Ответы, Точность, Время, Ошибки) с защитой от выбросов
     2. Круговая диаграмма качества ответов
     3. Круговая диаграмма распределения ошибок по 5 блокам
     4. Топ-10 трудных терминов (с процентом брака и средним временем)
@@ -270,7 +277,11 @@ def render_analytics_dashboard(df: pd.DataFrame, is_class_view: bool = False):
     """
     c1, c2, c3, c4 = st.columns(4)
     total_answers = len(df)
-    avg_time = round(df["time_sec"].mean(), 1) if total_answers > 0 else 0.0
+    
+    # Защита от аномальных выбросов: исключаем время более 180с (когда ученик отвлекся)
+    valid_times = df[(df["time_sec"] >= 0) & (df["time_sec"] <= 180.0)]["time_sec"]
+    avg_time = round(valid_times.mean(), 1) if not valid_times.empty else 0.0
+    
     errors_count = int(df["is_problem"].sum())
     accuracy = round((1 - (errors_count / total_answers)) * 100, 1) if total_answers > 0 else 0.0
 
@@ -310,13 +321,18 @@ def render_analytics_dashboard(df: pd.DataFrame, is_class_view: bool = False):
     st.divider()
 
     col_bar1, col_bar2 = st.columns(2)
+    
+    # Клампим время до 180с для честного отображения в графиках без искажения масштаба
+    df_calc = df.copy()
+    df_calc["time_sec_clamped"] = df_calc["time_sec"].clip(0, 180)
+
     with col_bar1:
         table_title = "⚠️ Топ-10 трудных терминов для класса" if is_class_view else "⚠️ Твои трудные термины"
         st.subheader(table_title)
-        term_problems = df.groupby(["code", "term", "module"]).agg(
+        term_problems = df_calc.groupby(["code", "term", "module"]).agg(
             total_tries=("status", "count"),
             errors=("is_problem", "sum"),
-            avg_seconds=("time_sec", "mean")
+            avg_seconds=("time_sec_clamped", "mean")
         ).reset_index()
         term_problems["error_rate"] = (term_problems["errors"] / term_problems["total_tries"] * 100).round(1)
         term_problems["avg_seconds"] = term_problems["avg_seconds"].round(1)
@@ -340,13 +356,13 @@ def render_analytics_dashboard(df: pd.DataFrame, is_class_view: bool = False):
 
     with col_bar2:
         st.subheader("⏱ Скорость ответа по блокам")
-        module_time = df.groupby("module")["time_sec"].mean().round(1).reset_index()
+        module_time = df_calc.groupby("module")["time_sec_clamped"].mean().round(1).reset_index()
         fig_time = px.bar(
             module_time,
             x="module",
-            y="time_sec",
-            labels={"module": "Модуль", "time_sec": "Секунды"},
-            color="time_sec",
+            y="time_sec_clamped",
+            labels={"module": "Модуль", "time_sec_clamped": "Секунды"},
+            color="time_sec_clamped",
             color_continuous_scale="Blues"
         )
         st.plotly_chart(fig_time, use_container_width=True)
@@ -405,7 +421,8 @@ if student_param:
     render_analytics_dashboard(df, is_class_view=False)
 
     if not st_teachers_df.empty and not teachers_df.empty:
-        my_t_codes = st_teachers_df[st_teachers_df["student_id"] == int(student_param)]["teacher_code"].tolist()
+        # Безопасное сравнение student_id как строк исключает ValueError при нечисловом значении
+        my_t_codes = st_teachers_df[st_teachers_df["student_id"].astype(str) == str(student_param)]["teacher_code"].tolist()
         if my_t_codes:
             st.divider()
             st.subheader("👨‍🏫 Твои преподаватели")
@@ -441,29 +458,60 @@ elif teacher_param:
         st.stop()
 
     class_df = raw_df[raw_df["user_id"].isin(class_student_ids)]
+    st.sidebar.header("Фильтры класса")
+    st.sidebar.write(f"👥 Всего учеников в классе: **{len(class_student_ids)}**")
+
+    # Обработка случая, когда ученики прикрепились, но ещё не успели дать ни одного ответа
     if class_df.empty:
-        st.info("ℹ️ Ученики вашего класса пока не начали решать карточки и тесты в боте.")
+        st.info("ℹ️ Ученики вашего класса уже прикрепились к вам, но пока не начали решать карточки и тесты в боте.")
+        summary_rows = []
+        for uid in class_student_ids:
+            summary_rows.append({
+                "Ученик": f"ID: {uid}",
+                "Юзернейм": "—",
+                "ID Telegram": uid,
+                "Всего ответов": 0,
+                "Точность (%)": 0.0,
+                "Ошибок": 0,
+                "Ср. время (сек)": 0.0
+            })
+        report_df = pd.DataFrame(summary_rows)
+        st.dataframe(report_df, use_container_width=True, hide_index=True)
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            report_df.to_excel(writer, index=False, sheet_name="Ведомость класса")
+        st.sidebar.download_button(
+            label="📥 Скачать ведомость класса (.xlsx)",
+            data=buffer.getvalue(),
+            file_name=f"Класс_{teacher_code}_ведомость.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
         st.stop()
 
-    st.sidebar.header("Фильтры класса")
+    # Формируем список учеников с включением учеников с 0 ответов
     student_labels = {"👥 Весь класс (Сводка)": "ALL"}
     for uid in class_student_ids:
         sub = class_df[class_df["user_id"] == uid]
         if not sub.empty:
             row_s = sub.iloc[0]
             label = f"{row_s['full_name']} ({'@' + row_s['username'] if row_s['username'] else 'ID: ' + uid})"
-            student_labels[label] = uid
+        else:
+            label = f"ID: {uid} (0 ответов)"
+        student_labels[label] = uid
 
     selected_student_label = st.sidebar.selectbox("Выбери ученика:", list(student_labels.keys()))
     selected_uid = student_labels[selected_student_label]
 
     if selected_uid == "ALL":
         active_df = class_df
-        st.sidebar.write(f"👥 Всего учеников в классе: **{len(class_student_ids)}**")
     else:
         active_df = class_df[class_df["user_id"] == selected_uid]
-        s_row = active_df.iloc[0]
-        render_user_avatar_badge(s_row["full_name"], s_row["username"], selected_uid)
+        if not active_df.empty:
+            s_row = active_df.iloc[0]
+            render_user_avatar_badge(s_row["full_name"], s_row["username"], selected_uid)
+        else:
+            st.info(f"Ученик с ID `{selected_uid}` пока не дал ни одного ответа в тренажере.")
+            st.stop()
 
     mode_options = ["Все режимы", "Только карточки", "Только тесты"]
     selected_mode = st.sidebar.selectbox("Режим тренировки:", mode_options)
@@ -477,36 +525,47 @@ elif teacher_param:
         st.stop()
 
     st.sidebar.divider()
-    if not class_df.empty:
-        summary_rows = []
-        for uid in class_student_ids:
-            u_df = class_df[class_df["user_id"] == uid]
-            if not u_df.empty:
-                r0 = u_df.iloc[0]
-                u_total = len(u_df)
-                u_err = int(u_df["is_problem"].sum())
-                u_acc = round((1 - (u_err / u_total)) * 100, 1) if u_total > 0 else 0.0
-                u_time = round(u_df["time_sec"].mean(), 1) if u_total > 0 else 0.0
-                summary_rows.append({
-                    "Ученик": r0["full_name"],
-                    "Юзернейм": f"@{r0['username']}" if r0["username"] else "—",
-                    "ID Telegram": uid,
-                    "Всего ответов": u_total,
-                    "Точность (%)": u_acc,
-                    "Ошибок": u_err,
-                    "Ср. время (сек)": u_time
-                })
-        if summary_rows:
-            report_df = pd.DataFrame(summary_rows)
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                report_df.to_excel(writer, index=False, sheet_name="Ведомость класса")
-            st.sidebar.download_button(
-                label="📥 Скачать ведомость класса (.xlsx)",
-                data=buffer.getvalue(),
-                file_name=f"Класс_{teacher_code}_ведомость.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+    summary_rows = []
+    for uid in class_student_ids:
+        u_df = class_df[class_df["user_id"] == uid]
+        if not u_df.empty:
+            r0 = u_df.iloc[0]
+            u_total = len(u_df)
+            u_err = int(u_df["is_problem"].sum())
+            u_acc = round((1 - (u_err / u_total)) * 100, 1) if u_total > 0 else 0.0
+            u_valid_time = u_df[(u_df["time_sec"] >= 0) & (u_df["time_sec"] <= 180.0)]["time_sec"]
+            u_time = round(u_valid_time.mean(), 1) if not u_valid_time.empty else 0.0
+            summary_rows.append({
+                "Ученик": r0["full_name"],
+                "Юзернейм": f"@{r0['username']}" if r0["username"] else "—",
+                "ID Telegram": uid,
+                "Всего ответов": u_total,
+                "Точность (%)": u_acc,
+                "Ошибок": u_err,
+                "Ср. время (сек)": u_time
+            })
+        else:
+            summary_rows.append({
+                "Ученик": f"ID: {uid}",
+                "Юзернейм": "—",
+                "ID Telegram": uid,
+                "Всего ответов": 0,
+                "Точность (%)": 0.0,
+                "Ошибок": 0,
+                "Ср. время (сек)": 0.0
+            })
+
+    if summary_rows:
+        report_df = pd.DataFrame(summary_rows)
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            report_df.to_excel(writer, index=False, sheet_name="Ведомость класса")
+        st.sidebar.download_button(
+            label="📥 Скачать ведомость класса (.xlsx)",
+            data=buffer.getvalue(),
+            file_name=f"Класс_{teacher_code}_ведомость.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
     # Отрисовка унифицированного визуального блока аналитики
     render_analytics_dashboard(active_df, is_class_view=True)
