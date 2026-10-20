@@ -1,5 +1,5 @@
 """
-Telegram Bot для изучения терминов обществознания (Версия 5.0 — Полная экосистема)
+Telegram Bot для изучения терминов обществознания (Версия 5.1 — Стабильная экосистема)
 =============================================================================
 Архитектура и возможности:
 1. Термины загружаются из terms.json (при его отсутствии — резервная автозагрузка из social_bot.db).
@@ -9,28 +9,32 @@ Telegram Bot для изучения терминов обществознани
    - Функции в обществе (functions_or_goals)
    - Примеры из реалий РФ (illustration_rf)
    - Ловушки и типичные ошибки на экзамене (common_pitfalls)
+   - Защита от превышения лимита сообщения Telegram (4096 символов).
 3. Универсальный интерфейс:
-   - Удалены все жесткие метки «№18 ЕГЭ» — формулировки подходят как для ОГЭ (9 класс),
-     так и для фундаментальной подготовки к ЕГЭ (10–11 класс).
+   - Формулировки подходят как для ОГЭ (9 класс), так и для ЕГЭ (10–11 класс).
 4. Алгоритм интервального повторения для КАРТОЧЕК:
    - Вероятностная выборка (Weighted Random / Roulette Selection): вес определяет шанс выпадения.
    - Трудные термины выпадают часто, новые имеют высокий приоритет, выученные периодически всплывают.
    - Кулдаун карточек: карточка не повторяется минимум 10 шагов.
+   - Защита от дублирующих записей при быстром двойном клике (race condition).
 5. Режим ТЕСТЫ:
    - Честный экзаменационный рандом (True Random) без повторов за сессию.
    - Защита от мискликов: ответы быстрее 3 секунд не записываются в общую базу.
+   - Защита от кликов по старым вопросам в истории переписки.
    - Экран завершения теста: разбор ошибок, рестарт и выход.
 6. Учительская система с 8-значными кодами и мульти-привязкой:
-   - Любой желающий может стать преподавателем по команде /teacher.
-   - Генерация случайного 8-значного кода (например, 83910245).
-   - Автоматическая очистка: если за 7 дней к учителю не подключился ни один ученик — профиль удаляется.
-   - Ученик может подключиться по ссылке (?start=t_83910245) или просто отправив 8-значный код сообщением.
-   - Мульти-учителя: ученик может быть одновременно подключён и к репетитору, и к школьному учителю.
+   - Регистрация по команде /teacher с генерацией 8-значного кода.
+   - Защита от самопривязки учителя в качестве ученика к самому себе.
+   - Информирование ученика при недействительном коде в реферальной ссылке.
+   - Автоматическая очистка неактивных учителей (раз в 24 часа в фоне).
+   - Мульти-учителя: ученик может быть одновременно подключён к нескольким учителям.
    - Управление учителями: команда /teachers с кнопками быстрого отключения.
 7. Персональная веб-аналитика для учеников:
-   - В /menu:stats формируется безопасная ссылка с токеном на персональный кабинет в онлайн-дашборде.
-8. Сохранение имени и юзернейма пользователя (full_name + @username).
-9. Встроенный фоновый веб-сервер для бесплатного деплоя на Render Web Service ($0/мес).
+   - В /menu:stats формируется безопасная ссылка с токеном на персональный кабинет.
+8. Безопасность и стабильность:
+   - Экранирование спецсимволов Markdown для исключения сбоев парсинга Telegram.
+   - Безопасное закрытие соединений БД в блоках finally (защита от утечек пула).
+   - Таймауты для сокетов Render keep-alive (3.0с).
 """
 
 import os
@@ -81,6 +85,17 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("social_bot")
+
+
+def escape_md(text: Any) -> str:
+    """Экранирует спецсимволы Markdown v1 для безопасного вывода в Telegram."""
+    if text is None:
+        return ""
+    s = str(text)
+    for ch in ["_", "*", "`", "["]:
+        s = s.replace(ch, f"\\{ch}")
+    return s
+
 
 # =====================================================================
 # 2. АЛГОРИТМ ИНТЕРВАЛЬНОГО ПОВТОРЕНИЯ ДЛЯ КАРТОЧЕК
@@ -237,7 +252,7 @@ class TermsCatalog:
 catalog = TermsCatalog()
 
 # =====================================================================
-# 4. ХРАНИЛИЩЕ ДАННЫХ (NEON POSTGRESQL / SQLITE FALLBACK)
+# 4. ХРАНИЛИЩЕ ДАННЫХ (БЕЗОПАСНАЯ РАБОТА С СОЕДИНЕНИЯМИ)
 # =====================================================================
 
 class Database:
@@ -246,6 +261,7 @@ class Database:
     1. Ответы учеников: user_id, username, full_name, строка entry.
     2. Таблица учителей: teacher_code (8-значное число), user_id, full_name, created_at.
     3. Связующая таблица student_teachers (student_id, teacher_code, joined_at).
+    Все методы обёрнуты в try-finally для гарантии закрытия курсоров и соединений.
     """
     def __init__(self, db_url: Optional[str] = DATABASE_URL, sqlite_path: str = DB_PATH):
         self.db_url = db_url
@@ -264,79 +280,80 @@ class Database:
     def init_db(self):
         conn = self.get_connection()
         cursor = conn.cursor()
-        
-        if self.is_postgres:
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS user_answers (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                username TEXT,
-                full_name TEXT,
-                entry TEXT NOT NULL,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            );
-            ALTER TABLE user_answers ADD COLUMN IF NOT EXISTS username TEXT;
-            ALTER TABLE user_answers ADD COLUMN IF NOT EXISTS full_name TEXT;
-            CREATE INDEX IF NOT EXISTS idx_user_answers_user ON user_answers(user_id);
+        try:
+            if self.is_postgres:
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_answers (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    username TEXT,
+                    full_name TEXT,
+                    entry TEXT NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+                ALTER TABLE user_answers ADD COLUMN IF NOT EXISTS username TEXT;
+                ALTER TABLE user_answers ADD COLUMN IF NOT EXISTS full_name TEXT;
+                CREATE INDEX IF NOT EXISTS idx_user_answers_user ON user_answers(user_id);
 
-            CREATE TABLE IF NOT EXISTS teachers (
-                teacher_code VARCHAR(8) PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                full_name TEXT,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_teachers_user ON teachers(user_id);
+                CREATE TABLE IF NOT EXISTS teachers (
+                    teacher_code VARCHAR(8) PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    full_name TEXT,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_teachers_user ON teachers(user_id);
 
-            CREATE TABLE IF NOT EXISTS student_teachers (
-                student_id BIGINT NOT NULL,
-                teacher_code VARCHAR(8) NOT NULL,
-                joined_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (student_id, teacher_code)
-            );
-            CREATE INDEX IF NOT EXISTS idx_student_teachers_teacher ON student_teachers(teacher_code);
-            CREATE INDEX IF NOT EXISTS idx_student_teachers_student ON student_teachers(student_id);
-            """)
-        else:
-            cursor.executescript("""
-            CREATE TABLE IF NOT EXISTS user_answers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                username TEXT,
-                full_name TEXT,
-                entry TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_user_answers_user ON user_answers(user_id);
+                CREATE TABLE IF NOT EXISTS student_teachers (
+                    student_id BIGINT NOT NULL,
+                    teacher_code VARCHAR(8) NOT NULL,
+                    joined_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (student_id, teacher_code)
+                );
+                CREATE INDEX IF NOT EXISTS idx_student_teachers_teacher ON student_teachers(teacher_code);
+                CREATE INDEX IF NOT EXISTS idx_student_teachers_student ON student_teachers(student_id);
+                """)
+            else:
+                cursor.executescript("""
+                CREATE TABLE IF NOT EXISTS user_answers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    full_name TEXT,
+                    entry TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_user_answers_user ON user_answers(user_id);
 
-            CREATE TABLE IF NOT EXISTS teachers (
-                teacher_code TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                full_name TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_teachers_user ON teachers(user_id);
+                CREATE TABLE IF NOT EXISTS teachers (
+                    teacher_code TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    full_name TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_teachers_user ON teachers(user_id);
 
-            CREATE TABLE IF NOT EXISTS student_teachers (
-                student_id INTEGER NOT NULL,
-                teacher_code TEXT NOT NULL,
-                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (student_id, teacher_code)
-            );
-            CREATE INDEX IF NOT EXISTS idx_student_teachers_teacher ON student_teachers(teacher_code);
-            CREATE INDEX IF NOT EXISTS idx_student_teachers_student ON student_teachers(student_id);
-            """)
-            try:
-                cursor.execute("ALTER TABLE user_answers ADD COLUMN username TEXT;")
-            except Exception:
-                pass
-            try:
-                cursor.execute("ALTER TABLE user_answers ADD COLUMN full_name TEXT;")
-            except Exception:
-                pass
+                CREATE TABLE IF NOT EXISTS student_teachers (
+                    student_id INTEGER NOT NULL,
+                    teacher_code TEXT NOT NULL,
+                    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (student_id, teacher_code)
+                );
+                CREATE INDEX IF NOT EXISTS idx_student_teachers_teacher ON student_teachers(teacher_code);
+                CREATE INDEX IF NOT EXISTS idx_student_teachers_student ON student_teachers(student_id);
+                """)
+                try:
+                    cursor.execute("ALTER TABLE user_answers ADD COLUMN username TEXT;")
+                except Exception:
+                    pass
+                try:
+                    cursor.execute("ALTER TABLE user_answers ADD COLUMN full_name TEXT;")
+                except Exception:
+                    pass
 
-        conn.commit()
-        cursor.close()
-        conn.close()
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
 
         # Запускаем автоочистку учителей без учеников старше 7 дней
         self.cleanup_inactive_teachers()
@@ -347,19 +364,21 @@ class Database:
     def save_answer_entry(self, user_id: int, username: Optional[str], full_name: Optional[str], entry_str: str):
         conn = self.get_connection()
         cursor = conn.cursor()
-        if self.is_postgres:
-            cursor.execute(
-                "INSERT INTO user_answers (user_id, username, full_name, entry) VALUES (%s, %s, %s, %s);",
-                (user_id, username, full_name, entry_str)
-            )
-        else:
-            cursor.execute(
-                "INSERT INTO user_answers (user_id, username, full_name, entry) VALUES (?, ?, ?, ?);",
-                (user_id, username, full_name, entry_str)
-            )
-        conn.commit()
-        cursor.close()
-        conn.close()
+        try:
+            if self.is_postgres:
+                cursor.execute(
+                    "INSERT INTO user_answers (user_id, username, full_name, entry) VALUES (%s, %s, %s, %s);",
+                    (user_id, username, full_name, entry_str)
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO user_answers (user_id, username, full_name, entry) VALUES (?, ?, ?, ?);",
+                    (user_id, username, full_name, entry_str)
+                )
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
 
     def get_user_progress_map(self, user_id: int) -> Dict[str, Dict[str, Any]]:
         """
@@ -368,14 +387,15 @@ class Database:
         """
         conn = self.get_connection()
         cursor = conn.cursor()
-        if self.is_postgres:
-            cursor.execute("SELECT entry FROM user_answers WHERE user_id = %s ORDER BY id ASC;", (user_id,))
-        else:
-            cursor.execute("SELECT entry FROM user_answers WHERE user_id = ? ORDER BY id ASC;", (user_id,))
-        
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
+        try:
+            if self.is_postgres:
+                cursor.execute("SELECT entry FROM user_answers WHERE user_id = %s ORDER BY id ASC;", (user_id,))
+            else:
+                cursor.execute("SELECT entry FROM user_answers WHERE user_id = ? ORDER BY id ASC;", (user_id,))
+            rows = cursor.fetchall()
+        finally:
+            cursor.close()
+            conn.close()
 
         progress: Dict[str, Dict[str, Any]] = {}
         for row in rows:
@@ -411,13 +431,15 @@ class Database:
         
         conn = self.get_connection()
         cursor = conn.cursor()
-        if self.is_postgres:
-            cursor.execute("SELECT entry FROM user_answers WHERE user_id = %s;", (user_id,))
-        else:
-            cursor.execute("SELECT entry FROM user_answers WHERE user_id = ?;", (user_id,))
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
+        try:
+            if self.is_postgres:
+                cursor.execute("SELECT entry FROM user_answers WHERE user_id = %s;", (user_id,))
+            else:
+                cursor.execute("SELECT entry FROM user_answers WHERE user_id = ?;", (user_id,))
+            rows = cursor.fetchall()
+        finally:
+            cursor.close()
+            conn.close()
 
         cards_count = 0
         tests_count = 0
@@ -477,34 +499,39 @@ class Database:
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
-            if self.is_postgres:
-                cursor.execute("""
-                    DELETE FROM teachers 
-                    WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '7 days'
-                      AND teacher_code NOT IN (SELECT DISTINCT teacher_code FROM student_teachers);
-                """)
-            else:
-                cursor.execute("""
-                    DELETE FROM teachers 
-                    WHERE created_at < datetime('now', '-7 days')
-                      AND teacher_code NOT IN (SELECT DISTINCT teacher_code FROM student_teachers);
-                """)
-            conn.commit()
-            cursor.close()
-            conn.close()
+            try:
+                if self.is_postgres:
+                    cursor.execute("""
+                        DELETE FROM teachers 
+                        WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '7 days'
+                          AND teacher_code NOT IN (SELECT DISTINCT teacher_code FROM student_teachers);
+                    """)
+                else:
+                    cursor.execute("""
+                        DELETE FROM teachers 
+                        WHERE created_at < datetime('now', '-7 days')
+                          AND teacher_code NOT IN (SELECT DISTINCT teacher_code FROM student_teachers);
+                    """)
+                conn.commit()
+            finally:
+                cursor.close()
+                conn.close()
         except Exception as e:
             logger.warning(f"Ошибка при очистке неактивных учителей: {e}")
 
     def get_teacher(self, teacher_code: str) -> Optional[Dict[str, Any]]:
         conn = self.get_connection()
         cursor = conn.cursor()
-        if self.is_postgres:
-            cursor.execute("SELECT teacher_code, user_id, full_name, created_at FROM teachers WHERE teacher_code = %s;", (teacher_code,))
-        else:
-            cursor.execute("SELECT teacher_code, user_id, full_name, created_at FROM teachers WHERE teacher_code = ?;", (teacher_code,))
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
+        try:
+            if self.is_postgres:
+                cursor.execute("SELECT teacher_code, user_id, full_name, created_at FROM teachers WHERE teacher_code = %s;", (teacher_code,))
+            else:
+                cursor.execute("SELECT teacher_code, user_id, full_name, created_at FROM teachers WHERE teacher_code = ?;", (teacher_code,))
+            row = cursor.fetchone()
+        finally:
+            cursor.close()
+            conn.close()
+
         if row:
             return {
                 "teacher_code": str(row[0]),
@@ -517,13 +544,16 @@ class Database:
     def get_teacher_by_user_id(self, user_id: int) -> Optional[Dict[str, Any]]:
         conn = self.get_connection()
         cursor = conn.cursor()
-        if self.is_postgres:
-            cursor.execute("SELECT teacher_code, user_id, full_name, created_at FROM teachers WHERE user_id = %s;", (user_id,))
-        else:
-            cursor.execute("SELECT teacher_code, user_id, full_name, created_at FROM teachers WHERE user_id = ?;", (user_id,))
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
+        try:
+            if self.is_postgres:
+                cursor.execute("SELECT teacher_code, user_id, full_name, created_at FROM teachers WHERE user_id = %s;", (user_id,))
+            else:
+                cursor.execute("SELECT teacher_code, user_id, full_name, created_at FROM teachers WHERE user_id = ?;", (user_id,))
+            row = cursor.fetchone()
+        finally:
+            cursor.close()
+            conn.close()
+
         if row:
             return {
                 "teacher_code": str(row[0]),
@@ -537,92 +567,105 @@ class Database:
         """Генерирует уникальный случайный 8-значный код и регистрирует преподавателя."""
         conn = self.get_connection()
         cursor = conn.cursor()
-        while True:
-            code = str(random.randint(10000000, 99999999))
-            if self.is_postgres:
-                cursor.execute("SELECT 1 FROM teachers WHERE teacher_code = %s;", (code,))
-            else:
-                cursor.execute("SELECT 1 FROM teachers WHERE teacher_code = ?;", (code,))
-            if not cursor.fetchone():
-                break
+        try:
+            while True:
+                code = str(random.randint(10000000, 99999999))
+                if self.is_postgres:
+                    cursor.execute("SELECT 1 FROM teachers WHERE teacher_code = %s;", (code,))
+                else:
+                    cursor.execute("SELECT 1 FROM teachers WHERE teacher_code = ?;", (code,))
+                if not cursor.fetchone():
+                    break
 
-        if self.is_postgres:
-            cursor.execute(
-                "INSERT INTO teachers (teacher_code, user_id, full_name) VALUES (%s, %s, %s);",
-                (code, user_id, full_name)
-            )
-        else:
-            cursor.execute(
-                "INSERT INTO teachers (teacher_code, user_id, full_name) VALUES (?, ?, ?);",
-                (code, user_id, full_name)
-            )
-        conn.commit()
-        cursor.close()
-        conn.close()
+            if self.is_postgres:
+                cursor.execute(
+                    "INSERT INTO teachers (teacher_code, user_id, full_name) VALUES (%s, %s, %s);",
+                    (code, user_id, full_name)
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO teachers (teacher_code, user_id, full_name) VALUES (?, ?, ?);",
+                    (code, user_id, full_name)
+                )
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
         logger.info(f"Зарегистрирован новый преподаватель {full_name} с кодом {code}.")
         return code
 
     def is_student_connected(self, student_id: int, teacher_code: str) -> bool:
         conn = self.get_connection()
         cursor = conn.cursor()
-        if self.is_postgres:
-            cursor.execute("SELECT 1 FROM student_teachers WHERE student_id = %s AND teacher_code = %s;", (student_id, teacher_code))
-        else:
-            cursor.execute("SELECT 1 FROM student_teachers WHERE student_id = ? AND teacher_code = ?;", (student_id, teacher_code))
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
+        try:
+            if self.is_postgres:
+                cursor.execute("SELECT 1 FROM student_teachers WHERE student_id = %s AND teacher_code = %s;", (student_id, teacher_code))
+            else:
+                cursor.execute("SELECT 1 FROM student_teachers WHERE student_id = ? AND teacher_code = ?;", (student_id, teacher_code))
+            row = cursor.fetchone()
+        finally:
+            cursor.close()
+            conn.close()
+
         return bool(row)
 
     def connect_student_to_teacher(self, student_id: int, teacher_code: str):
         conn = self.get_connection()
         cursor = conn.cursor()
-        if self.is_postgres:
-            cursor.execute("""
-                INSERT INTO student_teachers (student_id, teacher_code) 
-                VALUES (%s, %s) 
-                ON CONFLICT (student_id, teacher_code) DO NOTHING;
-            """, (student_id, teacher_code))
-        else:
-            cursor.execute("""
-                INSERT OR IGNORE INTO student_teachers (student_id, teacher_code) 
-                VALUES (?, ?);
-            """, (student_id, teacher_code))
-        conn.commit()
-        cursor.close()
-        conn.close()
+        try:
+            if self.is_postgres:
+                cursor.execute("""
+                    INSERT INTO student_teachers (student_id, teacher_code) 
+                    VALUES (%s, %s) 
+                    ON CONFLICT (student_id, teacher_code) DO NOTHING;
+                """, (student_id, teacher_code))
+            else:
+                cursor.execute("""
+                    INSERT OR IGNORE INTO student_teachers (student_id, teacher_code) 
+                    VALUES (?, ?);
+                """, (student_id, teacher_code))
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
 
     def disconnect_student_from_teacher(self, student_id: int, teacher_code: str):
         conn = self.get_connection()
         cursor = conn.cursor()
-        if self.is_postgres:
-            cursor.execute("DELETE FROM student_teachers WHERE student_id = %s AND teacher_code = %s;", (student_id, teacher_code))
-        else:
-            cursor.execute("DELETE FROM student_teachers WHERE student_id = ? AND teacher_code = ?;", (student_id, teacher_code))
-        conn.commit()
-        cursor.close()
-        conn.close()
+        try:
+            if self.is_postgres:
+                cursor.execute("DELETE FROM student_teachers WHERE student_id = %s AND teacher_code = %s;", (student_id, teacher_code))
+            else:
+                cursor.execute("DELETE FROM student_teachers WHERE student_id = ? AND teacher_code = ?;", (student_id, teacher_code))
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
 
     def get_student_teachers(self, student_id: int) -> List[Dict[str, Any]]:
         conn = self.get_connection()
         cursor = conn.cursor()
-        query = """
-            SELECT t.teacher_code, t.full_name, st.joined_at 
-            FROM student_teachers st
-            JOIN teachers t ON st.teacher_code = t.teacher_code
-            WHERE st.student_id = %s
-            ORDER BY st.joined_at DESC;
-        """ if self.is_postgres else """
-            SELECT t.teacher_code, t.full_name, st.joined_at 
-            FROM student_teachers st
-            JOIN teachers t ON st.teacher_code = t.teacher_code
-            WHERE st.student_id = ?
-            ORDER BY st.joined_at DESC;
-        """
-        cursor.execute(query, (student_id,))
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
+        try:
+            query = """
+                SELECT t.teacher_code, t.full_name, st.joined_at 
+                FROM student_teachers st
+                JOIN teachers t ON st.teacher_code = t.teacher_code
+                WHERE st.student_id = %s
+                ORDER BY st.joined_at DESC;
+            """ if self.is_postgres else """
+                SELECT t.teacher_code, t.full_name, st.joined_at 
+                FROM student_teachers st
+                JOIN teachers t ON st.teacher_code = t.teacher_code
+                WHERE st.student_id = ?
+                ORDER BY st.joined_at DESC;
+            """
+            cursor.execute(query, (student_id,))
+            rows = cursor.fetchall()
+        finally:
+            cursor.close()
+            conn.close()
+
         teachers = []
         for r in rows:
             teachers.append({
@@ -635,13 +678,16 @@ class Database:
     def get_teacher_students_count(self, teacher_code: str) -> int:
         conn = self.get_connection()
         cursor = conn.cursor()
-        if self.is_postgres:
-            cursor.execute("SELECT COUNT(*) FROM student_teachers WHERE teacher_code = %s;", (teacher_code,))
-        else:
-            cursor.execute("SELECT COUNT(*) FROM student_teachers WHERE teacher_code = ?;", (teacher_code,))
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
+        try:
+            if self.is_postgres:
+                cursor.execute("SELECT COUNT(*) FROM student_teachers WHERE teacher_code = %s;", (teacher_code,))
+            else:
+                cursor.execute("SELECT COUNT(*) FROM student_teachers WHERE teacher_code = ?;", (teacher_code,))
+            row = cursor.fetchone()
+        finally:
+            cursor.close()
+            conn.close()
+
         return row[0] if row else 0
 
 
@@ -936,18 +982,25 @@ async def handle_start(message: Message, state: FSMContext):
         teacher_code = parts[1][2:].strip()
         teacher = db.get_teacher(teacher_code)
         if teacher:
-            if not db.is_student_connected(message.from_user.id, teacher_code):
+            if teacher["user_id"] == message.from_user.id:
+                connect_notice = "⚠️ *Ты не можешь прикрепиться к своему собственному классу в качестве ученика.*\n\n"
+            elif not db.is_student_connected(message.from_user.id, teacher_code):
                 db.connect_student_to_teacher(message.from_user.id, teacher_code)
                 connect_notice = (
                     f"✅ *Ты успешно прикреплён к преподавателю:*\n"
-                    f"*{teacher['full_name']}* (код `{teacher_code}`).\n"
+                    f"*{escape_md(teacher['full_name'])}* (код `{teacher_code}`).\n"
                     f"Твой прогресс теперь отображается в его ведомости.\n\n"
                 )
             else:
                 connect_notice = (
                     f"ℹ️ *Ты уже прикреплён к преподавателю:*\n"
-                    f"*{teacher['full_name']}* (код `{teacher_code}`).\n\n"
+                    f"*{escape_md(teacher['full_name'])}* (код `{teacher_code}`).\n\n"
                 )
+        else:
+            connect_notice = (
+                f"❌ *Преподаватель по ссылке-коду `{escape_md(teacher_code)}` не найден.*\n"
+                f"Проверь ссылку или уточни код у своего преподавателя.\n\n"
+            )
 
     text = (
         f"{connect_notice}"
@@ -996,7 +1049,7 @@ async def handle_teacher_profile(message: Message):
         st_count = db.get_teacher_students_count(code)
         text = (
             f"👨‍🏫 *Кабинет преподавателя*\n\n"
-            f"👤 Преподаватель: *{existing['full_name']}*\n"
+            f"👤 Преподаватель: *{escape_md(existing['full_name'])}*\n"
             f"🔑 Личный код класса: `{code}`\n"
             f"👥 Подключено учеников: *{st_count}*\n\n"
             f"🔗 *Ссылка для учеников (отправь в чат класса):*\n"
@@ -1015,7 +1068,7 @@ async def handle_teacher_profile(message: Message):
     
     text = (
         f"🎉 *Вы успешно зарегистрированы как преподаватель!*\n\n"
-        f"👤 Имя: *{full_name}*\n"
+        f"👤 Имя: *{escape_md(full_name)}*\n"
         f"🔑 Ваш личный 8-значный код: `{code}`\n\n"
         f"👥 *Ссылка для учеников (отправьте её ребятам):*\n"
         f"https://t.me/{bot_username}?start=t_{code}\n\n"
@@ -1042,10 +1095,10 @@ async def handle_teachers_list(message: Message):
     buttons = []
     lines = ["👨‍🏫 *Твои преподаватели:*\n"]
     for idx, t in enumerate(teachers, 1):
-        lines.append(f"{idx}. *{t['full_name']}* (код `{t['teacher_code']}`)")
+        lines.append(f"{idx}. *{escape_md(t['full_name'])}* (код `{t['teacher_code']}`)")
         buttons.append([
             InlineKeyboardButton(
-                text=f"❌ Отключить: {t['full_name']}",
+                text=f"❌ Отключить: {t['full_name'][:25]}",
                 callback_data=f"teacher:unlink:{t['teacher_code']}"
             )
         ])
@@ -1061,15 +1114,22 @@ async def handle_teacher_code_input(message: Message):
     teacher = db.get_teacher(code)
     if not teacher:
         await message.answer(
-            f"❌ Преподаватель с кодом `{code}` не найден.\n"
+            f"❌ Преподаватель с кодом `{escape_md(code)}` не найден.\n"
             f"Проверь правильность ввода 8 цифр или уточни код у своего преподавателя.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if teacher["user_id"] == message.from_user.id:
+        await message.answer(
+            "❌ Ты не можешь прикрепиться к своему собственному классу в качестве ученика.",
             parse_mode=ParseMode.MARKDOWN
         )
         return
 
     if db.is_student_connected(message.from_user.id, code):
         await message.answer(
-            f"ℹ️ Ты уже подключён к преподавателю *{teacher['full_name']}* (код `{code}`).",
+            f"ℹ️ Ты уже подключён к преподавателю *{escape_md(teacher['full_name'])}* (код `{code}`).",
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -1077,7 +1137,7 @@ async def handle_teacher_code_input(message: Message):
     db.connect_student_to_teacher(message.from_user.id, code)
     await message.answer(
         f"✅ *Преподаватель найден:*\n"
-        f"*{teacher['full_name']}* (код `{code}`).\n\n"
+        f"*{escape_md(teacher['full_name'])}* (код `{code}`).\n\n"
         f"Ты успешно подключён! Твой прогресс теперь отображается в его ведомости.",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -1105,10 +1165,10 @@ async def handle_unlink_teacher(callback: CallbackQuery):
     buttons = []
     lines = ["👨‍🏫 *Твои преподаватели:*\n"]
     for idx, t in enumerate(teachers, 1):
-        lines.append(f"{idx}. *{t['full_name']}* (код `{t['teacher_code']}`)")
+        lines.append(f"{idx}. *{escape_md(t['full_name'])}* (код `{t['teacher_code']}`)")
         buttons.append([
             InlineKeyboardButton(
-                text=f"❌ Отключить: {t['full_name']}",
+                text=f"❌ Отключить: {t['full_name'][:25]}",
                 callback_data=f"teacher:unlink:{t['teacher_code']}"
             )
         ])
@@ -1168,10 +1228,10 @@ async def handle_cb_my_teachers(callback: CallbackQuery):
     buttons = []
     lines = ["👨‍🏫 *Твои преподаватели:*\n"]
     for idx, t in enumerate(teachers, 1):
-        lines.append(f"{idx}. *{t['full_name']}* (код `{t['teacher_code']}`)")
+        lines.append(f"{idx}. *{escape_md(t['full_name'])}* (код `{t['teacher_code']}`)")
         buttons.append([
             InlineKeyboardButton(
-                text=f"❌ Отключить: {t['full_name']}",
+                text=f"❌ Отключить: {t['full_name'][:25]}",
                 callback_data=f"teacher:unlink:{t['teacher_code']}"
             )
         ])
@@ -1278,6 +1338,10 @@ def format_card_back(card: Dict[str, Any], show_detail: bool = False) -> str:
         if extra_parts:
             text += "\n\n" + "\n\n".join(extra_parts)
 
+    # Защита от превышения максимального размера сообщения Telegram (4096 символов)
+    if len(text) > 4000:
+        text = text[:3950] + "\n\n_...[текст сокращен для экрана Telegram]_"
+
     return text
 
 
@@ -1357,6 +1421,16 @@ async def handle_card_answer(callback: CallbackQuery, state: FSMContext):
     answer_type = parts[3]
 
     data = await state.get_data()
+    current_card_code = data.get("current_card_code")
+    
+    # Защита от race condition при быстром двойном клике
+    if not current_card_code or current_card_code != code:
+        await callback.answer("Карточка уже оценена.", show_alert=False)
+        return
+
+    # Сбрасываем текущую карточку
+    await state.update_data(current_card_code=None)
+
     shown_at = data.get("shown_at", time.time())
     elapsed = round(time.time() - shown_at, 1)
 
@@ -1453,8 +1527,9 @@ async def handle_test_answer(callback: CallbackQuery, state: FSMContext):
     shown_at = data.get("test_shown_at", time.time())
     elapsed = round(time.time() - shown_at, 1)
 
-    if not test_data or option_idx >= len(test_data["options"]):
-        await callback.answer("Ошибка сессии теста или повторный клик.")
+    # Защита от кликов по старым вопросам из истории переписки
+    if not test_data or test_data.get("correct_term", {}).get("code") != code or option_idx >= len(test_data["options"]):
+        await callback.answer("Этот вопрос уже неактуален.", show_alert=True)
         return
 
     await state.update_data(current_test_data=None)
@@ -1585,10 +1660,11 @@ async def start_dummy_web_server(port: int = 10000):
     Легковесный фоновый веб-сервер на чистом asyncio.
     Отвечает 200 OK на проверки работоспособности Render,
     чтобы бот мог работать на бесплатном тарифе Web Service ($0/мес).
+    Использует таймаут 3.0с для исключения зависания сокетов.
     """
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
-            await reader.read(1024)
+            await asyncio.wait_for(reader.read(1024), timeout=3.0)
             response = (
                 b"HTTP/1.1 200 OK\r\n"
                 b"Content-Type: text/plain; charset=utf-8\r\n"
@@ -1597,14 +1673,31 @@ async def start_dummy_web_server(port: int = 10000):
             )
             writer.write(response)
             await writer.drain()
-            writer.close()
-            await writer.wait_closed()
         except Exception:
             pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     server = await asyncio.start_server(handle_client, "0.0.0.0", port)
     logger.info(f"Фоновый веб-сервер успешно запущен на порту {port} для Render.")
     return server
+
+
+async def periodic_cleanup_task():
+    """Периодическая фоновая очистка учителей без учеников старше 7 дней (каждые 24 часа)."""
+    while True:
+        try:
+            await asyncio.sleep(86400)
+            db.cleanup_inactive_teachers()
+            logger.info("Выполнена плановая очистка неактивных преподавателей (старше 7 дней).")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Ошибка в periodic_cleanup_task: {e}")
 
 
 async def main():
@@ -1623,11 +1716,14 @@ async def main():
     except Exception as e:
         logger.warning(f"Не удалось запустить фоновый веб-сервер на порту {port}: {e}")
 
+    # Запускаем периодическую фоновую очистку неактивных учителей
+    asyncio.create_task(periodic_cleanup_task())
+
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("Бот версии 5.0 успешно запущен.")
+    logger.info("Бот версии 5.1 успешно запущен.")
     await dp.start_polling(bot)
 
 
