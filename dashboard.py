@@ -107,23 +107,35 @@ def fetch_data():
         st.error(f"Не удалось подключиться к базе данных: {e}")
         return pd.DataFrame()
 
-    query = """
-        SELECT user_id, entry, created_at 
-        FROM user_answers 
-        ORDER BY created_at DESC;
-    """
     try:
+        query = """
+            SELECT user_id, username, entry, created_at 
+            FROM user_answers 
+            ORDER BY created_at DESC;
+        """
         df = pd.read_sql(query, conn)
     except Exception:
-        # Если таблица user_answers еще не создана
-        df = pd.DataFrame()
+        # Резервный запрос, если колонка username еще не создана в БД
+        try:
+            query = """
+                SELECT user_id, entry, created_at 
+                FROM user_answers 
+                ORDER BY created_at DESC;
+            """
+            df = pd.read_sql(query, conn)
+            df["username"] = None
+        except Exception:
+            df = pd.DataFrame()
     finally:
         conn.close()
 
     if df.empty:
         return pd.DataFrame()
 
-    # Парсим строку формата "code;delta_answer;delta_time;time_seconds"
+    if "username" not in df.columns:
+        df["username"] = None
+
+    # Парсим строку формата "code;delta_answer;delta_time;time_seconds;mode"
     parsed_rows = []
     for _, row in df.iterrows():
         entry_str = str(row["entry"])
@@ -137,15 +149,16 @@ def fetch_data():
             except ValueError:
                 continue
 
+            # Режим: 'card' (карточка) или 'test' (тест)
+            raw_mode = parts[4].strip() if len(parts) >= 5 else "card"
+            mode_display = "Тесты" if raw_mode == "test" else "Карточки"
+
             term_info = TERMS_MAP.get(code, {
                 "term": f"Код {code}",
                 "module": f"Модуль {code.split('.')[0] if '.' in code else '?'}"
             })
 
-            # Статус ответа по величине дельты:
-            # <= 0: уверенный верный ответ (-1.0)
-            # 0.5: неуверенно / знаю плохо
-            # >= 1.5: ошибка / не знаю (+2.0)
+            # Статус ответа:
             if d_ans <= 0:
                 result_status = "Верно / Знаю"
                 is_problem = False
@@ -156,8 +169,15 @@ def fetch_data():
                 result_status = "Ошибка / Не знаю"
                 is_problem = True
 
+            raw_username = row.get("username")
+            username_val = str(raw_username).strip() if pd.notna(raw_username) and raw_username is not None else ""
+            if username_val in ["None", "nan", ""]:
+                username_val = None
+
             parsed_rows.append({
                 "user_id": str(row["user_id"]),
+                "username": username_val,
+                "mode": mode_display,
                 "code": code,
                 "term": term_info["term"],
                 "module": term_info["module"],
@@ -183,17 +203,43 @@ if raw_df.empty:
     st.info("ℹ️ В базе данных пока нет ответов. Запусти бота и пройди несколько карточек или тестов!")
     st.stop()
 
-# Боковая панель: фильтр по ученикам
+# Боковая панель: фильтры
 st.sidebar.header("Фильтры")
-users_list = ["Все пользователи"] + sorted(raw_df["user_id"].unique().tolist())
-selected_user = st.sidebar.selectbox("Выбери пользователя:", users_list)
 
-if selected_user == "Все пользователи":
+# 1. Фильтр по ученикам с отображением юзернеймов
+user_labels_map = {}
+for uid in raw_df["user_id"].unique():
+    sub_df = raw_df[raw_df["user_id"] == uid]
+    valid_names = [n for n in sub_df["username"].dropna().unique() if str(n).strip() and str(n) not in ["None", "nan"]]
+    if valid_names:
+        label = f"{valid_names[0]} (ID: {uid})"
+    else:
+        label = f"ID: {uid}"
+    user_labels_map[label] = uid
+
+users_options = ["Все пользователи"] + sorted(list(user_labels_map.keys()))
+selected_option = st.sidebar.selectbox("Выбери пользователя:", users_options)
+
+if selected_option == "Все пользователи":
     df = raw_df
     st.sidebar.write(f"👥 Всего учеников в базе: **{raw_df['user_id'].nunique()}**")
 else:
-    df = raw_df[raw_df["user_id"] == selected_user]
-    st.sidebar.write(f"👤 Карточка ученика ID: `{selected_user}`")
+    chosen_uid = user_labels_map[selected_option]
+    df = raw_df[raw_df["user_id"] == chosen_uid]
+    st.sidebar.write(f"👤 Карточка ученика: **{selected_option}**")
+
+# 2. Фильтр по режиму (Раздельная аналитика: Карточки / Тесты)
+mode_options = ["Все режимы", "Только карточки", "Только тесты"]
+selected_mode = st.sidebar.selectbox("Режим тренировки:", mode_options)
+
+if selected_mode == "Только карточки":
+    df = df[df["mode"] == "Карточки"]
+elif selected_mode == "Только тесты":
+    df = df[df["mode"] == "Тесты"]
+
+if df.empty:
+    st.warning(f"По выбранному режиму ({selected_mode}) пока нет данных.")
+    st.stop()
 
 # =====================================================================
 # 5. КЛЮЧЕВЫЕ МЕТРИКИ (KPI)
@@ -206,7 +252,7 @@ errors_count = int(df["is_problem"].sum())
 accuracy = round((1 - (errors_count / total_answers)) * 100, 1) if total_answers > 0 else 0.0
 
 c1.metric("Всего ответов", total_answers)
-c2.metric("Успешность", f"{accuracy}%")
+c2.metric("Успешность / Точность", f"{accuracy}%")
 c3.metric("Среднее время", f"{avg_time} сек")
 c4.metric("Ошибок / Затруднений", errors_count)
 
@@ -234,13 +280,13 @@ with col_pie1:
     st.plotly_chart(fig_status, use_container_width=True)
 
 with col_pie2:
-    st.subheader("🥧 Проблемные места по модулям")
+    st.subheader("🥧 Распределение затруднений по блокам")
     problem_df = df[df["is_problem"]]
     if not problem_df.empty:
         fig_modules = px.pie(
             problem_df,
             names="module",
-            title="Распределение затруднений по блокам",
+            title="Ошибки по модулям кодификатора",
             hole=0.4
         )
         st.plotly_chart(fig_modules, use_container_width=True)
