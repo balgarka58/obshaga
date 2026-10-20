@@ -1,23 +1,36 @@
 """
-Telegram Bot для изучения терминов обществознания (Версия 4.0 — Финальная)
+Telegram Bot для изучения терминов обществознания (Версия 5.0 — Полная экосистема)
 =============================================================================
-Архитектура:
+Архитектура и возможности:
 1. Термины загружаются из terms.json (при его отсутствии — резервная автозагрузка из social_bot.db).
-2. В Neon (PostgreSQL) или SQLite сохраняются user_id, username и строка ответа:
-   f"{code};{delta_answer};{delta_time};{time_seconds};{mode}".
-3. Двойной режим базы:
-   - Если задана переменная DATABASE_URL -> прямое подключение к Neon (PostgreSQL).
-   - Если DATABASE_URL не задана -> локальный резерв SQLite (social_bot.db).
+2. Полное теоретическое досье по кнопке «💡 Пояснение»:
+   - Развёрнутое эссе (concept_explanation)
+   - Формы и классификации (types_or_forms)
+   - Функции в обществе (functions_or_goals)
+   - Примеры из реалий РФ (illustration_rf)
+   - Ловушки и типичные ошибки на экзамене (common_pitfalls)
+3. Универсальный интерфейс:
+   - Удалены все жесткие метки «№18 ЕГЭ» — формулировки подходят как для ОГЭ (9 класс),
+     так и для фундаментальной подготовки к ЕГЭ (10–11 класс).
 4. Алгоритм интервального повторения для КАРТОЧЕК:
    - Вероятностная выборка (Weighted Random / Roulette Selection): вес определяет шанс выпадения.
-   - Сложные термины выпадают часто, новые имеют высокий приоритет, выученные периодически всплывают.
+   - Трудные термины выпадают часто, новые имеют высокий приоритет, выученные периодически всплывают.
    - Кулдаун карточек: карточка не повторяется минимум 10 шагов.
 5. Режим ТЕСТЫ:
    - Честный экзаменационный рандом (True Random) без повторов за сессию.
    - Защита от мискликов: ответы быстрее 3 секунд не записываются в общую базу.
-   - Экран завершения теста при прохождении всех терминов темы: разбор ошибок, рестарт и выход.
-6. Раздельная статистика для карточек и тестов в боте и дашборде.
-7. Встроенный лёгкий веб-сервер для бесплатного деплоя на Render Web Service ($0/мес).
+   - Экран завершения теста: разбор ошибок, рестарт и выход.
+6. Учительская система с 8-значными кодами и мульти-привязкой:
+   - Любой желающий может стать преподавателем по команде /teacher.
+   - Генерация случайного 8-значного кода (например, 83910245).
+   - Автоматическая очистка: если за 7 дней к учителю не подключился ни один ученик — профиль удаляется.
+   - Ученик может подключиться по ссылке (?start=t_83910245) или просто отправив 8-значный код сообщением.
+   - Мульти-учителя: ученик может быть одновременно подключён и к репетитору, и к школьному учителю.
+   - Управление учителями: команда /teachers с кнопками быстрого отключения.
+7. Персональная веб-аналитика для учеников:
+   - В /menu:stats формируется безопасная ссылка с токеном на персональный кабинет в онлайн-дашборде.
+8. Сохранение имени и юзернейма пользователя (full_name + @username).
+9. Встроенный фоновый веб-сервер для бесплатного деплоя на Render Web Service ($0/мес).
 """
 
 import os
@@ -25,6 +38,7 @@ import sys
 import json
 import time
 import random
+import hashlib
 import logging
 import sqlite3
 import asyncio
@@ -59,6 +73,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 DB_PATH = os.getenv("DB_PATH", "social_bot.db")
 TERMS_JSON_PATH = os.getenv("TERMS_JSON_PATH", "terms.json")
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://obshaga.streamlit.app").rstrip("/")
+SECRET_KEY = os.getenv("SECRET_KEY", "obshaga_secret_key_2025")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -226,8 +242,10 @@ catalog = TermsCatalog()
 
 class Database:
     """
-    В базе данных сохраняются user_id, username и сериализованные логи ответов.
-    Формат записи entry: "{code};{delta_answer};{delta_time};{time_seconds};{mode}"
+    В базе данных сохраняются:
+    1. Ответы учеников: user_id, username, full_name, строка entry.
+    2. Таблица учителей: teacher_code (8-значное число), user_id, full_name, created_at.
+    3. Связующая таблица student_teachers (student_id, teacher_code, joined_at).
     """
     def __init__(self, db_url: Optional[str] = DATABASE_URL, sqlite_path: str = DB_PATH):
         self.db_url = db_url
@@ -253,46 +271,91 @@ class Database:
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
                 username TEXT,
+                full_name TEXT,
                 entry TEXT NOT NULL,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
             ALTER TABLE user_answers ADD COLUMN IF NOT EXISTS username TEXT;
+            ALTER TABLE user_answers ADD COLUMN IF NOT EXISTS full_name TEXT;
             CREATE INDEX IF NOT EXISTS idx_user_answers_user ON user_answers(user_id);
+
+            CREATE TABLE IF NOT EXISTS teachers (
+                teacher_code VARCHAR(8) PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                full_name TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_teachers_user ON teachers(user_id);
+
+            CREATE TABLE IF NOT EXISTS student_teachers (
+                student_id BIGINT NOT NULL,
+                teacher_code VARCHAR(8) NOT NULL,
+                joined_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (student_id, teacher_code)
+            );
+            CREATE INDEX IF NOT EXISTS idx_student_teachers_teacher ON student_teachers(teacher_code);
+            CREATE INDEX IF NOT EXISTS idx_student_teachers_student ON student_teachers(student_id);
             """)
         else:
-            cursor.execute("""
+            cursor.executescript("""
             CREATE TABLE IF NOT EXISTS user_answers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 username TEXT,
+                full_name TEXT,
                 entry TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_user_answers_user ON user_answers(user_id);
+
+            CREATE TABLE IF NOT EXISTS teachers (
+                teacher_code TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                full_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_teachers_user ON teachers(user_id);
+
+            CREATE TABLE IF NOT EXISTS student_teachers (
+                student_id INTEGER NOT NULL,
+                teacher_code TEXT NOT NULL,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (student_id, teacher_code)
+            );
+            CREATE INDEX IF NOT EXISTS idx_student_teachers_teacher ON student_teachers(teacher_code);
+            CREATE INDEX IF NOT EXISTS idx_student_teachers_student ON student_teachers(student_id);
             """)
             try:
                 cursor.execute("ALTER TABLE user_answers ADD COLUMN username TEXT;")
+            except Exception:
+                pass
+            try:
+                cursor.execute("ALTER TABLE user_answers ADD COLUMN full_name TEXT;")
             except Exception:
                 pass
 
         conn.commit()
         cursor.close()
         conn.close()
+
+        # Запускаем автоочистку учителей без учеников старше 7 дней
+        self.cleanup_inactive_teachers()
+
         mode_str = "Neon PostgreSQL" if self.is_postgres else f"SQLite ({self.sqlite_path})"
         logger.info(f"База данных успешно инициализирована в режиме: {mode_str}.")
 
-    def save_answer_entry(self, user_id: int, username: Optional[str], entry_str: str):
+    def save_answer_entry(self, user_id: int, username: Optional[str], full_name: Optional[str], entry_str: str):
         conn = self.get_connection()
         cursor = conn.cursor()
         if self.is_postgres:
             cursor.execute(
-                "INSERT INTO user_answers (user_id, username, entry) VALUES (%s, %s, %s);",
-                (user_id, username, entry_str)
+                "INSERT INTO user_answers (user_id, username, full_name, entry) VALUES (%s, %s, %s, %s);",
+                (user_id, username, full_name, entry_str)
             )
         else:
             cursor.execute(
-                "INSERT INTO user_answers (user_id, username, entry) VALUES (?, ?, ?);",
-                (user_id, username, entry_str)
+                "INSERT INTO user_answers (user_id, username, full_name, entry) VALUES (?, ?, ?, ?);",
+                (user_id, username, full_name, entry_str)
             )
         conn.commit()
         cursor.close()
@@ -319,7 +382,6 @@ class Database:
             entry_str = row[0] if self.is_postgres else row["entry"]
             parts = str(entry_str).split(";")
             if len(parts) >= 4:
-                # Если указан режим 'test', пропускаем его при расчете веса карточек
                 mode = parts[4].strip() if len(parts) >= 5 else "card"
                 if mode == "test":
                     continue
@@ -405,6 +467,183 @@ class Database:
             "tests_avg_time": tests_avg_time,
         }
 
+    # --- УЧИТЕЛЯ И КЛАССЫ ---
+
+    def cleanup_inactive_teachers(self):
+        """
+        Удаляет учителей, созданных более 7 дней назад, к которым
+        не подключился ни один ученик (чистота базы от неактивных аккаунтов).
+        """
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            if self.is_postgres:
+                cursor.execute("""
+                    DELETE FROM teachers 
+                    WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '7 days'
+                      AND teacher_code NOT IN (SELECT DISTINCT teacher_code FROM student_teachers);
+                """)
+            else:
+                cursor.execute("""
+                    DELETE FROM teachers 
+                    WHERE created_at < datetime('now', '-7 days')
+                      AND teacher_code NOT IN (SELECT DISTINCT teacher_code FROM student_teachers);
+                """)
+            conn.commit()
+            cursor.close()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Ошибка при очистке неактивных учителей: {e}")
+
+    def get_teacher(self, teacher_code: str) -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if self.is_postgres:
+            cursor.execute("SELECT teacher_code, user_id, full_name, created_at FROM teachers WHERE teacher_code = %s;", (teacher_code,))
+        else:
+            cursor.execute("SELECT teacher_code, user_id, full_name, created_at FROM teachers WHERE teacher_code = ?;", (teacher_code,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        if row:
+            return {
+                "teacher_code": str(row[0]),
+                "user_id": int(row[1]),
+                "full_name": str(row[2]) if row[2] else f"Учитель {row[0]}",
+                "created_at": row[3]
+            }
+        return None
+
+    def get_teacher_by_user_id(self, user_id: int) -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if self.is_postgres:
+            cursor.execute("SELECT teacher_code, user_id, full_name, created_at FROM teachers WHERE user_id = %s;", (user_id,))
+        else:
+            cursor.execute("SELECT teacher_code, user_id, full_name, created_at FROM teachers WHERE user_id = ?;", (user_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        if row:
+            return {
+                "teacher_code": str(row[0]),
+                "user_id": int(row[1]),
+                "full_name": str(row[2]) if row[2] else f"Учитель {row[0]}",
+                "created_at": row[3]
+            }
+        return None
+
+    def register_teacher(self, user_id: int, full_name: str) -> str:
+        """Генерирует уникальный случайный 8-значный код и регистрирует преподавателя."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        while True:
+            code = str(random.randint(10000000, 99999999))
+            if self.is_postgres:
+                cursor.execute("SELECT 1 FROM teachers WHERE teacher_code = %s;", (code,))
+            else:
+                cursor.execute("SELECT 1 FROM teachers WHERE teacher_code = ?;", (code,))
+            if not cursor.fetchone():
+                break
+
+        if self.is_postgres:
+            cursor.execute(
+                "INSERT INTO teachers (teacher_code, user_id, full_name) VALUES (%s, %s, %s);",
+                (code, user_id, full_name)
+            )
+        else:
+            cursor.execute(
+                "INSERT INTO teachers (teacher_code, user_id, full_name) VALUES (?, ?, ?);",
+                (code, user_id, full_name)
+            )
+        conn.commit()
+        cursor.close()
+        conn.close()
+        logger.info(f"Зарегистрирован новый преподаватель {full_name} с кодом {code}.")
+        return code
+
+    def is_student_connected(self, student_id: int, teacher_code: str) -> bool:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if self.is_postgres:
+            cursor.execute("SELECT 1 FROM student_teachers WHERE student_id = %s AND teacher_code = %s;", (student_id, teacher_code))
+        else:
+            cursor.execute("SELECT 1 FROM student_teachers WHERE student_id = ? AND teacher_code = ?;", (student_id, teacher_code))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return bool(row)
+
+    def connect_student_to_teacher(self, student_id: int, teacher_code: str):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if self.is_postgres:
+            cursor.execute("""
+                INSERT INTO student_teachers (student_id, teacher_code) 
+                VALUES (%s, %s) 
+                ON CONFLICT (student_id, teacher_code) DO NOTHING;
+            """, (student_id, teacher_code))
+        else:
+            cursor.execute("""
+                INSERT OR IGNORE INTO student_teachers (student_id, teacher_code) 
+                VALUES (?, ?);
+            """, (student_id, teacher_code))
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+    def disconnect_student_from_teacher(self, student_id: int, teacher_code: str):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if self.is_postgres:
+            cursor.execute("DELETE FROM student_teachers WHERE student_id = %s AND teacher_code = %s;", (student_id, teacher_code))
+        else:
+            cursor.execute("DELETE FROM student_teachers WHERE student_id = ? AND teacher_code = ?;", (student_id, teacher_code))
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+    def get_student_teachers(self, student_id: int) -> List[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        query = """
+            SELECT t.teacher_code, t.full_name, st.joined_at 
+            FROM student_teachers st
+            JOIN teachers t ON st.teacher_code = t.teacher_code
+            WHERE st.student_id = %s
+            ORDER BY st.joined_at DESC;
+        """ if self.is_postgres else """
+            SELECT t.teacher_code, t.full_name, st.joined_at 
+            FROM student_teachers st
+            JOIN teachers t ON st.teacher_code = t.teacher_code
+            WHERE st.student_id = ?
+            ORDER BY st.joined_at DESC;
+        """
+        cursor.execute(query, (student_id,))
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        teachers = []
+        for r in rows:
+            teachers.append({
+                "teacher_code": str(r[0]),
+                "full_name": str(r[1]) if r[1] else f"Учитель {r[0]}",
+                "joined_at": r[2]
+            })
+        return teachers
+
+    def get_teacher_students_count(self, teacher_code: str) -> int:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if self.is_postgres:
+            cursor.execute("SELECT COUNT(*) FROM student_teachers WHERE teacher_code = %s;", (teacher_code,))
+        else:
+            cursor.execute("SELECT COUNT(*) FROM student_teachers WHERE teacher_code = ?;", (teacher_code,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return row[0] if row else 0
+
 
 db = Database()
 
@@ -445,7 +684,6 @@ def select_next_card(user_id: int, module_filter: Optional[int] = None) -> Optio
     progress_map = db.get_user_progress_map(user_id)
     recent_codes = set(session_tracker.get_recent(user_id))
 
-    # Исключаем последние 10 показанных терминов (кулдаун)
     candidates = [t for t in available_terms if t["code"] not in recent_codes]
     if not candidates:
         candidates = available_terms
@@ -458,7 +696,6 @@ def select_next_card(user_id: int, module_filter: Optional[int] = None) -> Optio
 
     weights = [get_effective_weight(t) for t in candidates]
 
-    # Вероятностный выбор по весам
     chosen = random.choices(candidates, weights=weights, k=1)[0]
     session_tracker.push(user_id, chosen["code"])
     return chosen
@@ -691,8 +928,30 @@ router = Router()
 @router.message(CommandStart())
 async def handle_start(message: Message, state: FSMContext):
     await state.clear()
+    
+    # Проверяем deep link реферального подключения к учителю (?start=t_83910245)
+    connect_notice = ""
+    parts = message.text.split() if message.text else []
+    if len(parts) > 1 and parts[1].startswith("t_"):
+        teacher_code = parts[1][2:].strip()
+        teacher = db.get_teacher(teacher_code)
+        if teacher:
+            if not db.is_student_connected(message.from_user.id, teacher_code):
+                db.connect_student_to_teacher(message.from_user.id, teacher_code)
+                connect_notice = (
+                    f"✅ *Ты успешно прикреплён к преподавателю:*\n"
+                    f"*{teacher['full_name']}* (код `{teacher_code}`).\n"
+                    f"Твой прогресс теперь отображается в его ведомости.\n\n"
+                )
+            else:
+                connect_notice = (
+                    f"ℹ️ *Ты уже прикреплён к преподавателю:*\n"
+                    f"*{teacher['full_name']}* (код `{teacher_code}`).\n\n"
+                )
+
     text = (
-        "👋 *Добро пожаловать в тренажер терминов ЕГЭ по обществознанию!*\n\n"
+        f"{connect_notice}"
+        "👋 *Добро пожаловать в тренажер терминов по обществознанию!*\n\n"
         "Здесь ты сможешь выучить все ключевые понятия кодификатора без зубрёжки:\n\n"
         "• 🗂 *Карточки* — умное интервальное повторение. Трудные термины выпадают чаще, "
         "а выученные периодически всплывают для проверки памяти.\n"
@@ -709,13 +968,154 @@ async def handle_help(message: Message):
         "1. *Карточки (Интервальное повторение):*\n"
         "• Карточки не идут по скучной очереди. Алгоритм рассчитывает вес каждого термина.\n"
         "• Если жмёшь `🟢 Знаю`, карточка отдаляется. Если `🔴 Забыл` — сразу летит в приоритет.\n"
+        "• Кнопка `💡 Пояснение` открывает полное теоретическое досье (эссе, формы, функции, примеры РФ, типичные ловушки).\n"
         "• Есть защита от повторений: один и тот же термин не выпадает 10 шагов подряд.\n\n"
-        "2. *Тесты (Экзаменационный срез):*\n"
-        "• Случайная выборка вопросов по выбранной теме.\n"
+        "2. *Тесты (Контрольный срез):*\n"
+        "• Случайная выборка вопросов по выбранной теме без повторений за сессию.\n"
         "• Ответы быстрее 3 секунд не считаются в общую статистику (защита от случайных мискликов).\n"
-        "• В конце теста ты увидишь процент точности и сможешь разобрать ошибки."
+        "• В конце теста ты увидишь процент точности и сможешь разобрать ошибки.\n\n"
+        "3. *Преподавателям и репетиторам:*\n"
+        "• Напиши команду `/teacher`, чтобы получить свой личный 8-значный код класса и персональную веб-аналитику.\n\n"
+        "4. *Подключение к преподавателю:*\n"
+        "• Просто отправь 8-значный код учителя сообщением в этот чат.\n"
+        "• Список подключённых преподавателей и отключение: команда `/teachers`."
     )
     await message.answer(text, reply_markup=Keyboards.back_to_menu(), parse_mode=ParseMode.MARKDOWN)
+
+
+@router.message(Command("teacher"))
+async def handle_teacher_profile(message: Message):
+    user_id = message.from_user.id
+    existing = db.get_teacher_by_user_id(user_id)
+    
+    bot_info = await message.bot.get_me()
+    bot_username = bot_info.username or "obshaga_bot"
+
+    if existing:
+        code = existing["teacher_code"]
+        st_count = db.get_teacher_students_count(code)
+        text = (
+            f"👨‍🏫 *Кабинет преподавателя*\n\n"
+            f"👤 Преподаватель: *{existing['full_name']}*\n"
+            f"🔑 Личный код класса: `{code}`\n"
+            f"👥 Подключено учеников: *{st_count}*\n\n"
+            f"🔗 *Ссылка для учеников (отправь в чат класса):*\n"
+            f"https://t.me/{bot_username}?start=t_{code}\n\n"
+            f"📊 *Твоя онлайн-аналитика класса:*\n"
+            f"{DASHBOARD_URL}/?teacher={code}\n\n"
+            f"_💡 Ученики могут перейти по ссылке выше или просто отправить в чат бота твой 8-значный код `{code}`._"
+        )
+        await message.answer(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        return
+
+    # Если еще не зарегистрирован как учитель:
+    user = message.from_user
+    full_name = user.full_name or (f"@{user.username}" if user.username else f"Преподаватель {user.id}")
+    code = db.register_teacher(user_id, full_name)
+    
+    text = (
+        f"🎉 *Вы успешно зарегистрированы как преподаватель!*\n\n"
+        f"👤 Имя: *{full_name}*\n"
+        f"🔑 Ваш личный 8-значный код: `{code}`\n\n"
+        f"👥 *Ссылка для учеников (отправьте её ребятам):*\n"
+        f"https://t.me/{bot_username}?start=t_{code}\n\n"
+        f"📊 *Ваша онлайн-аналитика класса:*\n"
+        f"{DASHBOARD_URL}/?teacher={code}\n\n"
+        f"💡 _Ученики могут перейти по ссылке или просто отправить в чат бота ваш код `{code}`._\n"
+        f"⏳ _Если за 7 дней к вам не подключится ни один ученик, профиль учителя автоматически аннулируется для чистоты базы._"
+    )
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+
+
+@router.message(Command("teachers"))
+async def handle_teachers_list(message: Message):
+    teachers = db.get_student_teachers(message.from_user.id)
+    if not teachers:
+        await message.answer(
+            "ℹ️ Ты пока не прикреплён ни к одному преподавателю.\n\n"
+            "Чтобы подключиться, отправь его 8-значный код сообщением в этот чат "
+            "или перейди по ссылке-приглашению от учителя.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    buttons = []
+    lines = ["👨‍🏫 *Твои преподаватели:*\n"]
+    for idx, t in enumerate(teachers, 1):
+        lines.append(f"{idx}. *{t['full_name']}* (код `{t['teacher_code']}`)")
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"❌ Отключить: {t['full_name']}",
+                callback_data=f"teacher:unlink:{t['teacher_code']}"
+            )
+        ])
+    buttons.append([InlineKeyboardButton(text="⬅️ В главное меню", callback_data="back_to_main")])
+
+    text = "\n".join(lines) + "\n\n_Нажми кнопку ниже, если хочешь отключиться от преподавателя:_"
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.MARKDOWN)
+
+
+@router.message(F.text.regexp(r"^\d{8}$"))
+async def handle_teacher_code_input(message: Message):
+    code = message.text.strip()
+    teacher = db.get_teacher(code)
+    if not teacher:
+        await message.answer(
+            f"❌ Преподаватель с кодом `{code}` не найден.\n"
+            f"Проверь правильность ввода 8 цифр или уточни код у своего преподавателя.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if db.is_student_connected(message.from_user.id, code):
+        await message.answer(
+            f"ℹ️ Ты уже подключён к преподавателю *{teacher['full_name']}* (код `{code}`).",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    db.connect_student_to_teacher(message.from_user.id, code)
+    await message.answer(
+        f"✅ *Преподаватель найден:*\n"
+        f"*{teacher['full_name']}* (код `{code}`).\n\n"
+        f"Ты успешно подключён! Твой прогресс теперь отображается в его ведомости.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+
+@router.callback_query(F.data.startswith("teacher:unlink:"))
+async def handle_unlink_teacher(callback: CallbackQuery):
+    code = callback.data.split(":")[2]
+    teacher = db.get_teacher(code)
+    t_name = teacher["full_name"] if teacher else f"Код {code}"
+    db.disconnect_student_from_teacher(callback.from_user.id, code)
+    await callback.answer(f"Отключено от {t_name}", show_alert=True)
+
+    teachers = db.get_student_teachers(callback.from_user.id)
+    if not teachers:
+        if callback.message:
+            await callback.message.edit_text(
+                "ℹ️ Ты отключился от всех преподавателей.\n\n"
+                "Чтобы подключиться снова, просто отправь 8-значный код преподавателя.",
+                reply_markup=Keyboards.back_to_menu(),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        return
+
+    buttons = []
+    lines = ["👨‍🏫 *Твои преподаватели:*\n"]
+    for idx, t in enumerate(teachers, 1):
+        lines.append(f"{idx}. *{t['full_name']}* (код `{t['teacher_code']}`)")
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"❌ Отключить: {t['full_name']}",
+                callback_data=f"teacher:unlink:{t['teacher_code']}"
+            )
+        ])
+    buttons.append([InlineKeyboardButton(text="⬅️ В главное меню", callback_data="back_to_main")])
+    text = "\n".join(lines) + "\n\n_Нажми кнопку ниже, если хочешь отключиться от преподавателя:_"
+    if callback.message:
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.MARKDOWN)
 
 
 @router.callback_query(F.data == "back_to_main")
@@ -732,6 +1132,10 @@ async def handle_show_stats(callback: CallbackQuery):
     user_id = callback.from_user.id
     stats = db.get_user_stats(user_id)
 
+    # Формируем персональную защищённую ссылку для ученика
+    token = hashlib.md5(f"{user_id}_{SECRET_KEY}".encode()).hexdigest()[:8]
+    student_web_url = f"{DASHBOARD_URL}/?student={user_id}&token={token}"
+
     text = (
         "📊 *Твоя статистика изучения*\n\n"
         "🗂 *Карточки (Интервальное повторение):*\n"
@@ -744,8 +1148,37 @@ async def handle_show_stats(callback: CallbackQuery):
         f"• Точность: *{stats['tests_accuracy']}%* ({stats['tests_correct']} верно / {stats['tests_errors']} ошибок)\n"
         f"• Среднее время: *{stats['tests_avg_time']} сек*"
     )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Открыть подробную веб-аналитику", url=student_web_url)],
+        [InlineKeyboardButton(text="👨‍🏫 Мои преподаватели", callback_data="menu:my_teachers")],
+        [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="back_to_main")]
+    ])
     if callback.message:
-        await callback.message.edit_text(text, reply_markup=Keyboards.back_to_menu(), parse_mode=ParseMode.MARKDOWN)
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:my_teachers")
+async def handle_cb_my_teachers(callback: CallbackQuery):
+    teachers = db.get_student_teachers(callback.from_user.id)
+    if not teachers:
+        await callback.answer("У тебя пока нет прикреплённых преподавателей. Отправь код учителя сообщением!", show_alert=True)
+        return
+
+    buttons = []
+    lines = ["👨‍🏫 *Твои преподаватели:*\n"]
+    for idx, t in enumerate(teachers, 1):
+        lines.append(f"{idx}. *{t['full_name']}* (код `{t['teacher_code']}`)")
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"❌ Отключить: {t['full_name']}",
+                callback_data=f"teacher:unlink:{t['teacher_code']}"
+            )
+        ])
+    buttons.append([InlineKeyboardButton(text="⬅️ В статистику", callback_data="menu:stats")])
+    text = "\n".join(lines) + "\n\n_Нажми кнопку ниже, чтобы отключить преподавателя:_"
+    if callback.message:
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.MARKDOWN)
     await callback.answer()
 
 
@@ -781,7 +1214,6 @@ async def handle_topic_selection(callback: CallbackQuery, state: FSMContext):
         await send_next_flashcard(callback, state)
     else:
         await state.set_state(UserFlow.in_tests)
-        # Инициализируем экзаменационный пул без повторений
         available = catalog.get_terms(module_filter)
         if not available:
             empty_text = "❌ В выбранном модуле пока недостаточно терминов."
@@ -806,7 +1238,7 @@ async def handle_topic_selection(callback: CallbackQuery, state: FSMContext):
 
 
 # ---------------------------------------------------------------------
-# КАРТОЧКИ
+# КАРТОЧКИ С ПОЛНЫМ ДОСЬЕ И ЧИСТЫМ ИНТЕРФЕЙСОМ
 # ---------------------------------------------------------------------
 
 def format_card_back(card: Dict[str, Any], show_detail: bool = False) -> str:
@@ -814,13 +1246,38 @@ def format_card_back(card: Dict[str, Any], show_detail: bool = False) -> str:
     traits_formatted = "\n".join([f"• {t}" for t in traits]) if traits else "• Признаки уточняются"
 
     text = (
-        f"🏷 *{card['module_title']}* · _№18 ЕГЭ_\n\n"
+        f"🏷 *{card['module_title']}*\n\n"
         f"🎓 *{card['term'].upper()}*\n\n"
         f"🏛 *Родовое понятие:*\n_{card['genus']}_\n\n"
         f"📌 *Ключевые признаки:*\n{traits_formatted}"
     )
-    if show_detail and card.get("concept_explanation"):
-        text += f"\n\n💡 *Развёрнутое пояснение:*\n_{card['concept_explanation']}_"
+
+    if show_detail:
+        extra_parts = []
+        if card.get("concept_explanation"):
+            extra_parts.append(f"💡 *Теоретическое пояснение:*\n_{card['concept_explanation']}_")
+
+        struct = card.get("structure_for_tests", {})
+        if struct.get("types_or_forms"):
+            types_str = "\n".join([f"• {item}" for item in struct["types_or_forms"]])
+            extra_parts.append(f"🧩 *Формы и классификации:*\n{types_str}")
+
+        if struct.get("functions_or_goals"):
+            funcs_str = "\n".join([f"• {item}" for item in struct["functions_or_goals"]])
+            extra_parts.append(f"⚙️ *Функции в обществе:*\n{funcs_str}")
+
+        ege = card.get("ege_context_and_examples", {})
+        if ege.get("illustration_rf"):
+            extra_parts.append(f"🇷🇺 *Пример из реалий РФ:*\n_{ege['illustration_rf']}_")
+
+        pitfalls = card.get("common_pitfalls", [])
+        if pitfalls:
+            pitfalls_str = "\n".join([f"• {item}" for item in pitfalls])
+            extra_parts.append(f"⚠️ *Ловушки и частые ошибки:*\n{pitfalls_str}")
+
+        if extra_parts:
+            text += "\n\n" + "\n\n".join(extra_parts)
+
     return text
 
 
@@ -842,7 +1299,7 @@ async def send_next_flashcard(callback: CallbackQuery, state: FSMContext):
     text = (
         f"🏷 *{card['module_title']}*\n\n"
         f"✨ *{card['term'].upper()}*\n\n"
-        f"💭 _Вспомни род и ключевые признаки понятия для №18 ЕГЭ._"
+        f"💭 _Вспомни род и ключевые признаки понятия._"
     )
 
     if callback.message:
@@ -890,7 +1347,7 @@ async def handle_card_detail(callback: CallbackQuery, state: FSMContext):
             reply_markup=Keyboards.flashcard_back(code, has_detail=True),
             parse_mode=ParseMode.MARKDOWN
         )
-    await callback.answer("Подробный разбор открыт!")
+    await callback.answer("Подробный теоретический разбор открыт!")
 
 
 @router.callback_query(F.data.startswith("card:ans:"))
@@ -907,11 +1364,12 @@ async def handle_card_answer(callback: CallbackQuery, state: FSMContext):
     delta_ans = SpacedRepetitionAlgorithm.calculate_answer_delta(answer_type)
     delta_tm = SpacedRepetitionAlgorithm.calculate_time_delta(elapsed, is_correct=is_positive)
 
-    # Сохраняем с меткой 'card'
+    # Сохраняем с меткой 'card', username и full_name
     entry_str = f"{code};{delta_ans};{delta_tm};{elapsed};card"
     user = callback.from_user
-    username = f"@{user.username}" if user.username else (user.full_name or f"ID_{user.id}")
-    db.save_answer_entry(user.id, username, entry_str)
+    username = f"@{user.username}" if user.username else None
+    full_name = user.full_name or (user.first_name or f"Пользователь {user.id}")
+    db.save_answer_entry(user.id, username, full_name, entry_str)
 
     if answer_type == "know_well":
         feedback_toast = "🟢 Отлично! Закреплено."
@@ -957,7 +1415,6 @@ async def send_next_test(callback: CallbackQuery, state: FSMContext):
             )
         return
 
-    # Берём следующий случайный термин из пула
     next_code = pool.pop()
     await state.update_data(test_pool=pool)
 
@@ -1000,14 +1457,12 @@ async def handle_test_answer(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Ошибка сессии теста или повторный клик.")
         return
 
-    # Очищаем test_data от повторных кликов
     await state.update_data(current_test_data=None)
 
     chosen_option = test_data["options"][option_idx]
     is_correct = chosen_option["is_correct"]
     correct_term = test_data["correct_term"]
 
-    # Обновляем локальную статистику сессии
     correct_count = data.get("test_session_correct", 0)
     session_errors = data.get("test_session_errors", [])
     session_times = data.get("test_session_times", [])
@@ -1038,10 +1493,10 @@ async def handle_test_answer(callback: CallbackQuery, state: FSMContext):
         entry_str = f"{code};{delta_ans};{delta_tm};{elapsed};test"
 
         user = callback.from_user
-        username = f"@{user.username}" if user.username else (user.full_name or f"ID_{user.id}")
-        db.save_answer_entry(user.id, username, entry_str)
+        username = f"@{user.username}" if user.username else None
+        full_name = user.full_name or (user.first_name or f"Пользователь {user.id}")
+        db.save_answer_entry(user.id, username, full_name, entry_str)
 
-    # Формируем компактный понятный разбор
     if is_correct:
         status_text = "🎉 *Верно!* Отличная работа."
     else:
@@ -1172,7 +1627,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("Бот версии 4.0 успешно запущен.")
+    logger.info("Бот версии 5.0 успешно запущен.")
     await dp.start_polling(bot)
 
 
