@@ -1,6 +1,7 @@
 import io
 import os
 import json
+import hashlib
 import sqlite3
 import pandas as pd
 import streamlit as st
@@ -25,6 +26,8 @@ st.set_page_config(
 DATABASE_URL = os.getenv("DATABASE_URL")
 DB_PATH = os.getenv("DB_PATH", "social_bot.db")
 TERMS_JSON_PATH = os.getenv("TERMS_JSON_PATH", "terms.json")
+SECRET_KEY = os.getenv("SECRET_KEY", "obshaga_secret_key_2025")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "obshaga_admin_2025")
 
 # =====================================================================
 # 2. ЗАГРУЗКА МЕТАДАННЫХ ТЕРМИНОВ (JSON ИЛИ РЕЗЕРВ ИЗ SQLITE)
@@ -112,7 +115,6 @@ def fetch_all_data():
     st_teachers_df = pd.DataFrame()
 
     try:
-        # 1. Загружаем ответы
         try:
             query_answers = "SELECT user_id, username, full_name, entry, created_at FROM user_answers ORDER BY created_at DESC;"
             answers_df = pd.read_sql(query_answers, conn)
@@ -124,14 +126,12 @@ def fetch_all_data():
             except Exception:
                 answers_df = pd.DataFrame()
 
-        # 2. Загружаем учителей
         try:
             query_teachers = "SELECT teacher_code, user_id, full_name, created_at FROM teachers;"
             teachers_df = pd.read_sql(query_teachers, conn)
         except Exception:
             teachers_df = pd.DataFrame()
 
-        # 3. Загружаем связи учеников и учителей
         try:
             query_st = "SELECT student_id, teacher_code, joined_at FROM student_teachers;"
             st_teachers_df = pd.read_sql(query_st, conn)
@@ -149,7 +149,6 @@ def fetch_all_data():
     if "full_name" not in answers_df.columns:
         answers_df["full_name"] = None
 
-    # Парсим записи ответов
     parsed_rows = []
     for _, row in answers_df.iterrows():
         entry_str = str(row["entry"])
@@ -231,21 +230,29 @@ def render_user_avatar_badge(full_name: str, username: Optional[str], user_id: s
 
 
 # =====================================================================
-# 4. ИНТЕРФЕЙС И РОУТИНГ ПО РОЛЯМ
+# 4. ИНТЕРФЕЙС И РОУТИНГ ПО РОЛЯМ (БЕЗОПАСНЫЙ РЕЖИМ)
 # =====================================================================
 
 raw_df, teachers_df, st_teachers_df = fetch_all_data()
 
-# Считываем параметры из адресной строки
 query_params = st.query_params
 student_param = query_params.get("student")
+token_param = query_params.get("token")
 teacher_param = query_params.get("teacher")
+admin_param = query_params.get("admin")
 
 # ---------------------------------------------------------------------
-# СЦЕНАРИЙ 1: ПЕРСОНАЛЬНЫЙ КАБИНЕТ УЧЕНИКА (?student=...)
+# СЦЕНАРИЙ 1: ПЕРСОНАЛЬНЫЙ КАБИНЕТ УЧЕНИКА (?student=...&token=...)
 # ---------------------------------------------------------------------
 if student_param:
     st.title("🎓 Личный кабинет ученика")
+
+    # Проверка криптографического токена для защиты от подглядывания
+    expected_token = hashlib.md5(f"{student_param}_{SECRET_KEY}".encode()).hexdigest()[:8]
+    if token_param != expected_token:
+        st.error("🔒 Доступ ограничен: отсутствует или не совпадает персональный токен.")
+        st.info("Пожалуйста, открывайте аналитику по кнопке «🌐 Открыть подробную веб-аналитику» прямо из Telegram-бота (раздел «📊 Моя статистика»).")
+        st.stop()
 
     if raw_df.empty:
         st.info("ℹ️ В базе пока нет данных об ответах. Запусти бота и пройди несколько карточек или тестов!")
@@ -256,13 +263,11 @@ if student_param:
         st.warning(f"Ученик с ID `{student_param}` пока не совершил ни одного действия в тренажере.")
         st.stop()
 
-    # Извлекаем метаданные ученика
     sample_row = student_df.iloc[0]
     full_name = sample_row["full_name"]
     username = sample_row["username"]
     render_user_avatar_badge(full_name, username, str(student_param))
 
-    # Фильтр по режимам для ученика
     mode_options = ["Все режимы", "Только карточки", "Только тесты"]
     selected_mode = st.sidebar.selectbox("Режим тренировки:", mode_options)
     if selected_mode == "Только карточки":
@@ -276,7 +281,6 @@ if student_param:
         st.warning(f"По режиму «{selected_mode}» у тебя пока нет ответов.")
         st.stop()
 
-    # KPI метрики ученика
     c1, c2, c3, c4 = st.columns(4)
     total_answers = len(df)
     avg_time = round(df["time_sec"].mean(), 1) if total_answers > 0 else 0.0
@@ -310,11 +314,7 @@ if student_param:
         st.subheader("🥧 Твои ошибки по блокам")
         problem_df = df[df["is_problem"]]
         if not problem_df.empty:
-            fig_modules = px.pie(
-                problem_df,
-                names="module",
-                hole=0.4
-            )
+            fig_modules = px.pie(problem_df, names="module", hole=0.4)
             st.plotly_chart(fig_modules, use_container_width=True)
         else:
             st.success("🎉 Затруднений и ошибок пока нет — все ответы уверенные!")
@@ -362,7 +362,6 @@ if student_param:
         )
         st.plotly_chart(fig_time, use_container_width=True)
 
-    # Список подключенных преподавателей
     if not st_teachers_df.empty and not teachers_df.empty:
         my_t_codes = st_teachers_df[st_teachers_df["student_id"] == int(student_param)]["teacher_code"].tolist()
         if my_t_codes:
@@ -390,7 +389,6 @@ elif teacher_param:
 
     st.caption(f"Просмотр успеваемости класса: **{teacher_name}**")
 
-    # Ищем учеников этого класса
     if st_teachers_df.empty:
         st.info(f"ℹ️ К классу `{teacher_code}` пока не прикрепился ни один ученик. Отправьте ученикам ссылку-приглашение из бота!")
         st.stop()
@@ -405,7 +403,6 @@ elif teacher_param:
         st.info("ℹ️ Ученики вашего класса пока не начали решать карточки и тесты в боте.")
         st.stop()
 
-    # Боковая панель учителя: выбор ученика и режима
     st.sidebar.header("Фильтры класса")
     student_labels = {"👥 Весь класс (Сводка)": "ALL"}
     for uid in class_student_ids:
@@ -437,7 +434,6 @@ elif teacher_param:
         st.warning(f"По выбранному режиму ({selected_mode}) пока нет данных.")
         st.stop()
 
-    # Кнопка скачивания ведомости в Excel
     st.sidebar.divider()
     if not class_df.empty:
         summary_rows = []
@@ -470,7 +466,6 @@ elif teacher_param:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-    # KPI класса
     c1, c2, c3, c4 = st.columns(4)
     total_answers = len(active_df)
     avg_time = round(active_df["time_sec"].mean(), 1) if total_answers > 0 else 0.0
@@ -556,18 +551,61 @@ elif teacher_param:
 
 
 # ---------------------------------------------------------------------
-# СЦЕНАРИЙ 3: ГЛОБАЛЬНАЯ АДМИНИСТРАТИВНАЯ ПАНЕЛЬ (БЕЗ ПАРАМЕТРОВ)
+# СЦЕНАРИЙ 3: ВХОД БЕЗ ПАРАМЕТРОВ (ПРИВЕТСТВИЕ + ЗАЩИТА АДМИНИСТРАТОРА)
 # ---------------------------------------------------------------------
 else:
-    st.title("📊 Глобальная аналитическая панель тренажера")
+    # Проверяем авторизацию администратора
+    is_admin_authed = False
+    if admin_param and admin_param == ADMIN_PASSWORD:
+        is_admin_authed = True
+
+    if not is_admin_authed:
+        # Проверяем пароль в сайдбаре
+        st.sidebar.header("🔒 Вход администратора")
+        admin_input = st.sidebar.text_input("Пароль главного администратора:", type="password")
+        if admin_input:
+            if admin_input == ADMIN_PASSWORD:
+                is_admin_authed = True
+            else:
+                st.sidebar.error("Неверный пароль администратора.")
+
+    if not is_admin_authed:
+        # Защитная приветственная страница (данные учеников НЕ раскрываются посторонним!)
+        st.title("📊 Аналитический портал тренажера по обществознанию")
+        st.write(
+            "Добро пожаловать в веб-аналитику тренажера понятий кодификатора!\n\n"
+            "В целях защиты персональных данных успеваемость разделена на изолированные разделы:"
+        )
+
+        c_info1, c_info2 = st.columns(2)
+        with c_info1:
+            st.info(
+                "🎓 **Для учеников:**\n\n"
+                "Чтобы посмотреть свою подробную статистику, графики и прогресс — "
+                "открой Telegram-бот, нажми **«📊 Моя статистика»** и перейди по персональной кнопке "
+                "**«🌐 Открыть подробную веб-аналитику»**."
+            )
+        with c_info2:
+            st.success(
+                "👨‍🏫 **Для преподавателей:**\n\n"
+                "Чтобы увидеть ведомость и аналитику своего класса — "
+                "используй персональную ссылку на класс, которую бот выдал при регистрации "
+                "по команде `/teacher` (формата `?teacher=КОД_КЛАССА`)."
+            )
+
+        st.caption("🔒 Если вы главный администратор проекта — введите пароль в левой боковой панели для просмотра общей базы.")
+        st.stop()
+
+    # Если администратор успешно авторизовался:
+    st.title("🛡 Глобальная панель администратора")
+    st.success("Авторизован как главный администратор проекта.")
 
     if raw_df.empty:
         st.info("ℹ️ В базе данных пока нет ответов. Запусти бота и пройди несколько карточек или тестов!")
         st.stop()
 
-    st.sidebar.header("Фильтры")
+    st.sidebar.header("Фильтры базы")
 
-    # 1. Фильтр по ученикам с отображением аватаров и юзернеймов
     user_labels_map = {}
     for uid in raw_df["user_id"].unique():
         sub_df = raw_df[raw_df["user_id"] == uid]
@@ -589,7 +627,6 @@ else:
         s_row = df.iloc[0]
         render_user_avatar_badge(s_row["full_name"], s_row["username"], chosen_uid)
 
-    # 2. Фильтр по режиму
     mode_options = ["Все режимы", "Только карточки", "Только тесты"]
     selected_mode = st.sidebar.selectbox("Режим тренировки:", mode_options)
 
@@ -602,7 +639,6 @@ else:
         st.warning(f"По выбранному режиму ({selected_mode}) пока нет данных.")
         st.stop()
 
-    # KPI метрики
     c1, c2, c3, c4 = st.columns(4)
     total_answers = len(df)
     avg_time = round(df["time_sec"].mean(), 1) if total_answers > 0 else 0.0
@@ -636,12 +672,7 @@ else:
         st.subheader("🥧 Распределение затруднений по блокам")
         problem_df = df[df["is_problem"]]
         if not problem_df.empty:
-            fig_modules = px.pie(
-                problem_df,
-                names="module",
-                title="Ошибки по модулям кодификатора",
-                hole=0.4
-            )
+            fig_modules = px.pie(problem_df, names="module", title="Ошибки по модулям кодификатора", hole=0.4)
             st.plotly_chart(fig_modules, use_container_width=True)
         else:
             st.success("🎉 Затруднений и ошибок пока нет — все ответы уверенные!")
