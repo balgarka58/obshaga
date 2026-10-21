@@ -1,5 +1,5 @@
 """
-Telegram Bot для изучения терминов обществознания (Версия 6.0 — Полная экосистема)
+Telegram Bot для изучения терминов обществознания (Версия 6.1 — Стабильная экосистема)
 =============================================================================
 Архитектура и возможности:
 1. Термины загружаются из terms.json (при его отсутствии — резервная автозагрузка из social_bot.db).
@@ -52,6 +52,7 @@ import asyncio
 from datetime import datetime, date, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from collections import deque
+from zoneinfo import ZoneInfo
 
 try:
     from dotenv import load_dotenv
@@ -84,12 +85,24 @@ DB_PATH = os.getenv("DB_PATH", "social_bot.db")
 TERMS_JSON_PATH = os.getenv("TERMS_JSON_PATH", "terms.json")
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://obshaga.streamlit.app").rstrip("/")
 SECRET_KEY = os.getenv("SECRET_KEY", "obshaga_secret_key_2025")
+TIMEZONE_STR = os.getenv("TIMEZONE", "Europe/Moscow")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("social_bot")
+
+try:
+    TZ = ZoneInfo(TIMEZONE_STR)
+except Exception:
+    logger.warning(f"Не удалось загрузить часовой пояс {TIMEZONE_STR}, используется UTC.")
+    TZ = timezone.utc
+
+
+def get_local_today() -> date:
+    """Возвращает текущую дату в заданном часовом поясе (по умолчанию Europe/Moscow)."""
+    return datetime.now(TZ).date()
 
 
 def generate_student_token(user_id: Any, token_version: int = 1, secret_key: Optional[str] = None) -> str:
@@ -337,7 +350,14 @@ class TermsCatalog:
                 mod_num = int(item.get("module_number") or 1) if str(item.get("module_number") or "").isdigit() else 1
 
             raw_traits = item.get("traits")
-            traits = [str(t).strip() for t in raw_traits if str(t or "").strip()] if isinstance(raw_traits, list) else []
+            # Защита от None и нестроковых значений в списке признаков
+            traits = []
+            if isinstance(raw_traits, list):
+                for t in raw_traits:
+                    if t is not None:
+                        s_t = str(t).strip()
+                        if s_t:
+                            traits.append(s_t)
 
             raw_struct = item.get("structure_for_tests")
             struct = raw_struct if isinstance(raw_struct, dict) else {}
@@ -610,16 +630,19 @@ class Database:
     def get_problem_term_codes(self, user_id: int) -> List[str]:
         """
         Возвращает список кодов проблемных терминов для режима «Работа над ошибками»:
-        - термины с текущим весом в карточках >= 7.0 (если после этого не было успешного закрытия в тесте);
+        - термины с текущим весом в карточках >= 7.0;
         - термины, где последний ответ в карточках или тестах был ошибочным / неуверенным (delta_ans > 0).
-        Если ученик проработал проблемный термин в карточках (вес стал < 7.0 и ответ «Знаю»)
-        или безошибочно ответил по нему в тесте, термин выходит из списка проблемных.
+        Если ученик проработал проблемный термин в карточках (вес стал < 7.0 и ответ «Знаю»),
+        термин выходит из списка проблемных. Успех в тесте НЕ закрывает термин навсегда:
+        если после этого в карточках снова была ошибка, термин возвращается в проблемные.
         """
         entries = self._fetch_user_entries(user_id)
         progress_map = self._compute_progress_from_entries(entries)
 
-        latest_outcome_problem: Dict[str, bool] = {}
-        resolved_by_test_after_card: Dict[str, bool] = {}
+        # Отслеживаем последний результат по каждому коду с учётом режима
+        last_card_problem: Dict[str, bool] = {}
+        last_test_problem: Dict[str, bool] = {}
+        last_action_mode: Dict[str, str] = {}
 
         for entry_str in entries:
             parts = entry_str.split(";")
@@ -633,25 +656,38 @@ class Database:
                 except ValueError:
                     continue
                 mode = parts[4].strip() if len(parts) >= 5 else "card"
+
                 if mode == "test":
                     if sec >= SpacedRepetitionAlgorithm.MIN_TIME_WINDOW:
-                        latest_outcome_problem[code] = (d_ans > 0)
-                        resolved_by_test_after_card[code] = (d_ans <= 0)
+                        last_test_problem[code] = (d_ans > 0)
+                        last_action_mode[code] = "test"
                 else:
-                    latest_outcome_problem[code] = (d_ans > 0)
-                    resolved_by_test_after_card[code] = False
+                    last_card_problem[code] = (d_ans > 0)
+                    last_action_mode[code] = "card"
 
         problem_codes = []
         seen = set()
-        for code, p in progress_map.items():
-            is_high_weight = p["total_weight"] >= 7.0 and not resolved_by_test_after_card.get(code, False)
-            is_recent_err = latest_outcome_problem.get(code, False)
-            if is_high_weight or is_recent_err:
-                if catalog.get_by_code(code) and code not in seen:
-                    seen.add(code)
-                    problem_codes.append(code)
 
-        for code, is_prob in latest_outcome_problem.items():
+        for code, p in progress_map.items():
+            # Термин проблемный, если вес >= 7.0
+            is_high_weight = p["total_weight"] >= 7.0
+
+            # Или если последнее действие в карточках было ошибочным (delta_ans > 0)
+            is_card_err = last_card_problem.get(code, False)
+
+            # Проверяем, было ли последнее действие в тесте успешным и не было ли после него ошибок в карточках
+            is_test_ok = (last_action_mode.get(code) == "test" and not last_test_problem.get(code, False))
+
+            # Если термин был успешно закрыт в тесте, но потом в карточках снова ошиблись - он проблемный
+            if is_test_ok and not is_card_err and not is_high_weight:
+                continue
+
+            if (is_high_weight or is_card_err) and catalog.get_by_code(code) and code not in seen:
+                seen.add(code)
+                problem_codes.append(code)
+
+        # Добавляем термины, где последнее действие (в карточках или тестах) было ошибочным
+        for code, is_prob in last_card_problem.items():
             if is_prob and catalog.get_by_code(code) and code not in seen:
                 seen.add(code)
                 problem_codes.append(code)
@@ -682,7 +718,7 @@ class Database:
         - active_days_year: количество активных дней за последние 365 дней
         - today_actions: количество засчитанных действий за сегодня
         """
-        today_dt = reference_date or datetime.now(timezone.utc).date()
+        today_dt = reference_date or get_local_today()
         rows = self._fetch_user_entries_with_timestamps(user_id)
 
         active_dates_set = set()
@@ -931,7 +967,7 @@ class Database:
         2) Сегодня напоминание ещё не отправлялось (last_reminder_date != today_iso).
         3) Есть активная серия (current_streak >= 1), но сегодня ещё 0 действий (today_actions == 0).
         """
-        today_dt = reference_date or datetime.now(timezone.utc).date()
+        today_dt = reference_date or get_local_today()
         today_iso = today_dt.isoformat()
 
         conn = self.get_connection()
@@ -968,6 +1004,7 @@ class Database:
         """
         Удаляет учителей, созданных более 7 дней назад, к которым
         не подключился ни один ученик (чистота базы от неактивных аккаунтов).
+        Также каскадно очищает таблицу student_teachers от «висячих» записей.
         """
         try:
             conn = self.get_connection()
@@ -980,6 +1017,10 @@ class Database:
                           AND NOT EXISTS (
                               SELECT 1 FROM student_teachers st WHERE st.teacher_code = t.teacher_code
                           );
+                        DELETE FROM student_teachers st
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM teachers t WHERE t.teacher_code = st.teacher_code
+                        );
                     """)
                 else:
                     cursor.execute("""
@@ -988,6 +1029,10 @@ class Database:
                           AND NOT EXISTS (
                               SELECT 1 FROM student_teachers st WHERE st.teacher_code = teachers.teacher_code
                           );
+                        DELETE FROM student_teachers
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM teachers t WHERE t.teacher_code = student_teachers.teacher_code
+                        );
                     """)
                 conn.commit()
             finally:
@@ -2691,7 +2736,7 @@ async def process_daily_reminders(bot_instance: Bot, reference_date: Optional[da
     Проверяет пользователей с активной серией занятий (current_streak >= 1), которые
     сегодня ещё не занимались, и отправляет им одно вежливое напоминание в день.
     """
-    today_dt = reference_date or datetime.now(timezone.utc).date()
+    today_dt = reference_date or get_local_today()
     today_iso = today_dt.isoformat()
     candidates = db.get_users_for_daily_reminder(reference_date=today_dt)
     sent_count = 0
@@ -2766,7 +2811,7 @@ async def periodic_background_task(bot_instance: Optional[Bot] = None):
             db.cleanup_inactive_teachers()
             now_utc = datetime.now(timezone.utc)
             if bot_instance is not None and now_utc.hour >= 15:
-                await process_daily_reminders(bot_instance, reference_date=now_utc.date())
+                await process_daily_reminders(bot_instance, reference_date=get_local_today())
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -2795,7 +2840,7 @@ async def main():
 
     bg_task = asyncio.create_task(periodic_background_task(bot))
 
-    logger.info("Бот версии 6.0 успешно запущен.")
+    logger.info("Бот версии 6.1 успешно запущен.")
     try:
         await dp.start_polling(bot)
     finally:
