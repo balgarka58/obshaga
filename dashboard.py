@@ -10,6 +10,7 @@ import sqlite3
 import warnings
 import urllib.parse
 from datetime import datetime, date, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List, Tuple
 import pandas as pd
 import streamlit as st
@@ -18,18 +19,13 @@ import plotly.express as px
 warnings.filterwarnings("ignore", category=UserWarning, module="pandas")
 
 try:
-    import plotly.graph_objects as go
-except ImportError:
-    go = None
-
-try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
 # =====================================================================
-# 1. НАСТРОЙКА СТРАНИЦЫ, БЕЗОПАСНОСТИ И ТОКЕНОВ (ВЕРСИЯ 6.0)
+# 1. НАСТРОЙКА СТРАНИЦЫ, БЕЗОПАСНОСТИ И ТОКЕНОВ (ВЕРСИЯ 6.1)
 # =====================================================================
 
 st.set_page_config(
@@ -59,6 +55,12 @@ DB_PATH = os.getenv("DB_PATH", "social_bot.db")
 TERMS_JSON_PATH = os.getenv("TERMS_JSON_PATH", "terms.json")
 SECRET_KEY = os.getenv("SECRET_KEY", "obshaga_secret_key_2025")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "obshaga_admin_2025")
+TIMEZONE_STR = os.getenv("TIMEZONE", "Europe/Moscow")
+
+try:
+    TZ = ZoneInfo(TIMEZONE_STR)
+except Exception:
+    TZ = timezone.utc
 
 TIME_WINDOW_OPTIONS = [
     "За всё время",
@@ -457,7 +459,7 @@ def fetch_all_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 
 # =====================================================================
-# 4. ФИЛЬТРАЦИЯ ПО ВРЕМЕННОМУ ОКНУ И GITHUB-КАЛЕНДАРЬ АКТИВНОСТИ
+# 4. ФИЛЬТРАЦИЯ ПО ВРЕМЕННОМУ ОКНУ И КАЛЕНДАРЬ АКТИВНОСТИ
 # =====================================================================
 
 def _normalize_timestamps(series: pd.Series) -> pd.Series:
@@ -475,12 +477,12 @@ def filter_df_by_time_window(
     """
     Фильтрует DataFrame по выбранному временному окну для верхней аналитики.
     Возвращает кортеж: (filtered_df, prev_period_df, period_label).
-    НЕ затрагивает данные, передаваемые в нижний GitHub-календарь активности.
+    НЕ затрагивает данные, передаваемые в нижний календарь активности.
     """
     if df.empty or period_choice == "За всё время":
         return df.copy(), pd.DataFrame(columns=df.columns), "За всё время"
 
-    now_dt = reference_now or datetime.now(timezone.utc).replace(tzinfo=None)
+    now_dt = reference_now or datetime.now(TZ).replace(tzinfo=None)
     if isinstance(now_dt, pd.Timestamp):
         now_dt = now_dt.to_pydatetime().replace(tzinfo=None)
     today_start = datetime(now_dt.year, now_dt.month, now_dt.day)
@@ -572,7 +574,7 @@ def render_sidebar_time_filter(key_prefix: str = "main") -> Tuple[str, Optional[
     )
     custom_dates = None
     if period_choice == "Свой диапазон дат":
-        today_d = datetime.now(timezone.utc).date()
+        today_d = datetime.now(TZ).date()
         default_start = today_d - timedelta(days=14)
         if hasattr(st.sidebar, "date_input"):
             custom_dates = st.sidebar.date_input(
@@ -585,19 +587,19 @@ def render_sidebar_time_filter(key_prefix: str = "main") -> Tuple[str, Optional[
     return period_choice, custom_dates
 
 
-def build_github_calendar_data(
+def build_calendar_data(
     unfiltered_df: pd.DataFrame,
     counter_mode: str = "Все режимы",
     end_date: Optional[date] = None
 ) -> Dict[str, Any]:
     """
-    Формирует полную 53-недельную сетку активности (в стиле GitHub) за последние 365 дней.
+    Формирует полную 53-недельную сетку активности за последние 365 дней.
     ВАЖНО: принимает НЕ отфильтрованный по датам DataFrame, чтобы фильтр временного окна
     верхней аналитики никогда не обрезал календарь активности.
     Количество действий в ячейке и в подсказке при наведении рассчитывается строго
     по выбранному счётчику (counter_mode: «Все режимы» / «Все действия», «Только карточки», «Только тесты»).
     """
-    today_d = end_date or datetime.now(timezone.utc).date()
+    today_d = end_date or datetime.now(TZ).date()
     if isinstance(today_d, datetime):
         today_d = today_d.date()
 
@@ -759,10 +761,12 @@ def build_github_calendar_data(
     }
 
 
-def build_github_calendar_html(cal_data: Dict[str, Any]) -> str:
+def build_calendar_html(cal_data: Dict[str, Any]) -> str:
     """
-    Генерирует адаптивную сетку календаря активности в стиле GitHub (HTML/CSS)
+    Генерирует адаптивную сетку календаря активности (HTML/CSS)
     с всплывающими подсказками при наведении на каждый день.
+    Оптимизировано под мобильные устройства: гибкая ширина, уменьшенные ячейки,
+    горизонтальный скролл только при необходимости.
     """
     level_colors = {
         -1: "rgba(255, 255, 255, 0.02)",
@@ -775,11 +779,17 @@ def build_github_calendar_html(cal_data: Dict[str, Any]) -> str:
     weeks_count = cal_data["weeks_count"]
     month_labels = cal_data["month_labels"]
 
-    month_cells_html = ['<div style="width: 28px;"></div>']
+    # Адаптивные размеры для мобильных
+    cell_size = 11
+    gap = 2
+    label_width = 24
+    total_width = label_width + (cell_size + gap) * weeks_count
+
+    month_cells_html = [f'<div style="width: {label_width}px;"></div>']
     for w_idx in range(weeks_count):
         m_txt = html.escape(month_labels.get(w_idx, ""))
         month_cells_html.append(
-            f'<div style="width: 13px; font-size: 10px; color: #94a3b8; text-align: left; overflow: visible; white-space: nowrap;">{m_txt}</div>'
+            f'<div style="width: {cell_size}px; font-size: 9px; color: #94a3b8; text-align: left; overflow: visible; white-space: nowrap;">{m_txt}</div>'
         )
 
     grid_by_pos = {(c["weekday_idx"], c["week_idx"]): c for c in cal_data["cells"]}
@@ -787,7 +797,7 @@ def build_github_calendar_html(cal_data: Dict[str, Any]) -> str:
     for d_idx in range(7):
         day_label = WEEKDAY_SHORT_RU[d_idx] if d_idx in (0, 2, 4, 6) else ""
         row_squares = [
-            f'<div style="width: 28px; font-size: 10px; color: #94a3b8; line-height: 13px; padding-right: 4px;">{day_label}</div>'
+            f'<div style="width: {label_width}px; font-size: 9px; color: #94a3b8; line-height: {cell_size}px; padding-right: 4px; flex-shrink: 0;">{day_label}</div>'
         ]
         for w_idx in range(weeks_count):
             cell = grid_by_pos[(d_idx, w_idx)]
@@ -796,48 +806,51 @@ def build_github_calendar_html(cal_data: Dict[str, Any]) -> str:
             safe_tip = html.escape(cell["tooltip"], quote=True)
             row_squares.append(
                 f'<div title="{safe_tip}" data-date="{cell["date"]}" data-count="{cell["count"]}" '
-                f'style="width: 13px; height: 13px; border-radius: 3px; background: {color}; border: {border}; cursor: pointer;"></div>'
+                f'style="width: {cell_size}px; height: {cell_size}px; border-radius: 2px; background: {color}; border: {border}; cursor: pointer; flex-shrink: 0;"></div>'
             )
         rows_html.append(
-            f'<div style="display: flex; gap: 3px; align-items: center; margin-bottom: 3px;">{"".join(row_squares)}</div>'
+            f'<div style="display: flex; gap: {gap}px; align-items: center; margin-bottom: {gap}px;">{"".join(row_squares)}</div>'
         )
 
     legend_squares = "".join([
-        f'<span style="display:inline-block; width:12px; height:12px; border-radius:3px; background:{level_colors[lvl]}; border:1px solid rgba(255,255,255,0.1);"></span>'
+        f'<span style="display:inline-block; width:{cell_size}px; height:{cell_size}px; border-radius:2px; background:{level_colors[lvl]}; border:1px solid rgba(255,255,255,0.1);"></span>'
         for lvl in [0, 1, 2, 3, 4]
     ])
 
+    # Оборачиваем в контейнер с горизонтальным скроллом для мобильных
     return f"""
-    <div style="padding: 16px; background: rgba(15, 23, 42, 0.65); border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.1); overflow-x: auto; margin-top: 8px;">
-        <div style="display: flex; gap: 3px; margin-bottom: 6px; min-width: 780px;">
-            {"".join(month_cells_html)}
-        </div>
-        <div style="min-width: 780px;">
-            {"".join(rows_html)}
-        </div>
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px; font-size: 12px; color: #94a3b8; min-width: 780px;">
-            <div>Наведите курсор на ячейку, чтобы увидеть дату и точное число действий по выбранному счётчику ({html.escape(cal_data['mode_label'])}).</div>
-            <div style="display: flex; align-items: center; gap: 5px;">
-                <span>Меньше</span>
-                {legend_squares}
-                <span>Больше</span>
+    <div style="padding: 12px; background: rgba(15, 23, 42, 0.65); border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.1); overflow-x: auto; margin-top: 8px;">
+        <div style="min-width: {total_width}px;">
+            <div style="display: flex; gap: {gap}px; margin-bottom: 4px;">
+                {"".join(month_cells_html)}
+            </div>
+            <div>
+                {"".join(rows_html)}
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 8px; font-size: 11px; color: #94a3b8; flex-wrap: wrap; gap: 4px;">
+                <div>Наведите курсор на ячейку, чтобы увидеть дату и точное число действий по выбранному счётчику ({html.escape(cal_data['mode_label'])}).</div>
+                <div style="display: flex; align-items: center; gap: 4px;">
+                    <span>Меньше</span>
+                    {legend_squares}
+                    <span>Больше</span>
+                </div>
             </div>
         </div>
     </div>
     """
 
 
-def render_github_activity_calendar(
+def render_activity_calendar(
     unfiltered_date_df: pd.DataFrame,
     default_mode: str = "Все режимы",
     key_prefix: str = "gh"
 ):
     """
-    Отрисовывает в нижней части страницы годовой календарь активности в стиле GitHub.
+    Отрисовывает в нижней части страницы годовой календарь активности.
     Не зависит от фильтра временного окна в боковой панели (всегда показывает последние 365 дней).
     """
     st.divider()
-    st.subheader("🟩 Календарь активности за год (GitHub-стиль)")
+    st.subheader("🟩 Календарь активности за год")
     st.caption(
         "Отображает полную историю занятий за последние 365 дней независимо от выбранного выше фильтра дат. "
         "При наведении на ячейку показывается количество выполненных действий в зависимости от выбранного счётчика."
@@ -857,7 +870,7 @@ def render_github_activity_calendar(
     else:
         chosen_counter = default_mode
 
-    cal_data = build_github_calendar_data(unfiltered_date_df, counter_mode=chosen_counter)
+    cal_data = build_calendar_data(unfiltered_date_df, counter_mode=chosen_counter)
 
     c_s1, c_s2, c_s3, c_s4 = st.columns(4)
     c_s1.metric("🔥 Текущая серия", f"{cal_data['current_streak']} дн.")
@@ -865,48 +878,7 @@ def render_github_activity_calendar(
     c_s3.metric("🗓 Активных дней за год", f"{cal_data['active_days_year']} из 365")
     c_s4.metric(f"⚡️ Всего за год ({cal_data['mode_label']})", cal_data["total_actions_year"])
 
-    st.markdown(build_github_calendar_html(cal_data), unsafe_allow_html=True)
-
-    if go is not None:
-        fig_hm = go.Figure(
-            data=go.Heatmap(
-                z=cal_data["z_matrix"],
-                text=cal_data["hover_matrix"],
-                hoverinfo="text",
-                colorscale=[
-                    [0.0, "#161b22"],
-                    [0.05, "#0e4429"],
-                    [0.25, "#006d32"],
-                    [0.6, "#26a641"],
-                    [1.0, "#39d353"],
-                ],
-                showscale=False,
-                xgap=3,
-                ygap=3,
-            )
-        )
-        fig_hm.update_layout(
-            height=190,
-            margin=dict(l=30, r=10, t=10, b=20),
-            yaxis=dict(
-                tickmode="array",
-                tickvals=[0, 1, 2, 3, 4, 5, 6],
-                ticktext=WEEKDAY_SHORT_RU,
-                autorange="reversed",
-                showgrid=False,
-                zeroline=False,
-            ),
-            xaxis=dict(
-                tickmode="array",
-                tickvals=list(cal_data["month_labels"].keys()),
-                ticktext=list(cal_data["month_labels"].values()),
-                showgrid=False,
-                zeroline=False,
-            ),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-        )
-        st.plotly_chart(fig_hm, use_container_width=True)
+    st.markdown(build_calendar_html(cal_data), unsafe_allow_html=True)
 
 
 # =====================================================================
@@ -1410,7 +1382,7 @@ def run_dashboard_app():
                 period_label=period_label
             )
 
-        render_github_activity_calendar(
+        render_activity_calendar(
             unfiltered_date_df=student_df,
             default_mode=selected_mode,
             key_prefix="student_gh"
@@ -1558,7 +1530,7 @@ def run_dashboard_app():
             else:
                 render_user_avatar_badge(f"ID: {selected_uid}", None, selected_uid)
                 st.info(f"Ученик с ID `{selected_uid}` пока не дал ни одного ответа в тренажере.")
-                render_github_activity_calendar(
+                render_activity_calendar(
                     unfiltered_date_df=entity_unfiltered_df,
                     default_mode=selected_mode,
                     key_prefix="teacher_gh_empty"
@@ -1587,7 +1559,7 @@ def run_dashboard_app():
                 period_label=period_label
             )
 
-        render_github_activity_calendar(
+        render_activity_calendar(
             unfiltered_date_df=entity_unfiltered_df,
             default_mode=selected_mode,
             key_prefix="teacher_gh"
@@ -1606,15 +1578,7 @@ def run_dashboard_app():
             st.session_state["is_admin_authed"] = True
 
         if not st.session_state["is_admin_authed"]:
-            st.sidebar.header("🔒 Вход администратора")
-            admin_input = st.sidebar.text_input("Пароль главного администратора:", type="password")
-            if admin_input:
-                if verify_secret(admin_input, ADMIN_PASSWORD):
-                    st.session_state["is_admin_authed"] = True
-                else:
-                    st.sidebar.error("Неверный пароль администратора.")
-
-        if not st.session_state["is_admin_authed"]:
+            # Красивая главная страница для обычных пользователей
             st.title("📊 Аналитический портал тренажера по обществознанию")
             st.write(
                 "Добро пожаловать в веб-аналитику тренажера понятий кодификатора!\n\n"
@@ -1637,10 +1601,21 @@ def run_dashboard_app():
                     "по команде `/teacher`."
                 )
 
-            st.caption("🔒 Если вы главный администратор проекта — введите пароль в левой боковой панели для просмотра общей базы.")
+            # Блок входа администратора (виден только тем, кто знает пароль)
+            with st.expander("🔒 Вход для администратора", expanded=False):
+                admin_input = st.text_input("Пароль главного администратора:", type="password", key="admin_pass_input")
+                if st.button("Войти"):
+                    if verify_secret(admin_input, ADMIN_PASSWORD):
+                        st.session_state["is_admin_authed"] = True
+                        st.rerun()
+                    else:
+                        st.error("Неверный пароль администратора.")
+
+            st.caption("🔒 Если вы главный администратор проекта — введите пароль в блоке выше для просмотра общей базы.")
             st.stop()
             return
 
+        # ---- АДМИН-ПАНЕЛЬ (доступна только после входа) ----
         st.title("🛡 Глобальная панель администратора")
         st.success("Вы авторизованы как главный администратор проекта.")
         if st.sidebar.button("🚪 Выйти из панели администратора"):
@@ -1701,7 +1676,7 @@ def run_dashboard_app():
                 period_label=period_label
             )
 
-        render_github_activity_calendar(
+        render_activity_calendar(
             unfiltered_date_df=entity_df,
             default_mode=selected_mode,
             key_prefix="admin_gh"
