@@ -108,11 +108,7 @@ def _get_query_param(query_params: Any, key: str) -> Optional[str]:
 
 
 def generate_student_token(user_id: Any, token_version: int = 1, secret_key: Optional[str] = None) -> str:
-    """
-    Генерирует персональный 8-символьный токен доступа ученика к веб-аналитике.
-    Синхронизировано с bot.py: при token_version == 1 сохраняет обратную совместимость,
-    а при сбросе (version > 1) формирует новый токен и отзывает старый.
-    """
+    """Генерирует персональный 8-символьный токен доступа ученика к веб-аналитике."""
     key = secret_key if secret_key is not None else os.getenv("SECRET_KEY", SECRET_KEY)
     uid_str = str(user_id).strip()
     ver = int(token_version) if token_version and int(token_version) > 1 else 1
@@ -400,6 +396,7 @@ def fetch_all_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                 continue
 
             raw_mode = parts[4].strip() if len(parts) >= 5 else "card"
+            # Единообразие с ботом: в режиме тестов ответы быстрее 3.0 сек считаются мискликами и не учитываются
             if raw_mode == "test" and sec < 3.0:
                 continue
 
@@ -457,9 +454,10 @@ def fetch_all_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 # =====================================================================
 
 def _normalize_timestamps(series: pd.Series) -> pd.Series:
-    """Безопасно приводит столбец created_at к наивному UTC Timestamp."""
+    """Безопасно приводит столбец created_at к Timestamp в целевом часовом поясе."""
     parsed = pd.to_datetime(series, utc=True, errors="coerce")
-    return parsed.dt.tz_localize(None)
+    # Конвертируем в локальный пояс и убираем tzinfo для совместимости с наивными датами
+    return parsed.dt.tz_convert(TZ).dt.tz_localize(None)
 
 
 def filter_df_by_time_window(
@@ -468,10 +466,7 @@ def filter_df_by_time_window(
     custom_dates: Optional[Any] = None,
     reference_now: Optional[datetime] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
-    """
-    Фильтрует DataFrame по выбранному временному окну для верхней аналитики.
-    Возвращает кортеж: (filtered_df, prev_period_df, period_label).
-    """
+    """Фильтрует DataFrame по выбранному временному окну."""
     if df.empty or period_choice == "За всё время":
         return df.copy(), pd.DataFrame(columns=df.columns), "За всё время"
 
@@ -562,9 +557,7 @@ def build_calendar_data(
     counter_mode: str = "Все режимы",
     end_date: Optional[date] = None
 ) -> Dict[str, Any]:
-    """
-    Формирует полную 53-недельную сетку активности за последние 365 дней.
-    """
+    """Формирует полную 53-недельную сетку активности за последние 365 дней."""
     today_d = end_date or datetime.now(TZ).date()
     if isinstance(today_d, datetime):
         today_d = today_d.date()
@@ -728,10 +721,7 @@ def build_calendar_data(
 
 
 def build_calendar_html(cal_data: Dict[str, Any]) -> str:
-    """
-    Генерирует адаптивную сетку календаря активности (HTML/CSS)
-    с всплывающими подсказками при наведении (ПК) и появлением текста при клике (Телефон).
-    """
+    """Генерирует адаптивную сетку календаря активности (HTML/CSS) с всплывающими подсказками."""
     level_colors = {
         -1: "rgba(255, 255, 255, 0.02)",
         0: "#161b22",
@@ -768,7 +758,8 @@ def build_calendar_html(cal_data: Dict[str, Any]) -> str:
             border = "1px solid rgba(255,255,255,0.06)" if cell["level"] <= 0 else "1px solid rgba(255,255,255,0.15)"
             safe_tip = html.escape(cell["tooltip"], quote=True)
             
-            click_action = f"showCalInfo('{cell['date_formatted']}', '{cell['count']}', '{cell['cards_count']}', '{cell['tests_count']}', '{cell['accuracy']}', '{cal_data['mode_label']}')"
+            safe_mode = html.escape(cal_data['mode_label'], quote=True)
+            click_action = f"showCalInfo('{cell['date_formatted']}', '{cell['count']}', '{cell['cards_count']}', '{cell['tests_count']}', '{cell['accuracy']}', '{safe_mode}')"
             
             row_squares.append(
                 f'<div title="{safe_tip}" data-date="{cell["date"]}" data-count="{cell["count"]}" '
@@ -840,13 +831,14 @@ def render_activity_calendar(
     default_mode: str = "Все режимы",
     key_prefix: str = "gh"
 ):
-    """
-    Отрисовывает в нижней части страницы годовой календарь активности.
-    Не зависит от фильтра временного окна (всегда показывает последние 365 дней).
-    """
+    """Отрисовывает в нижней части страницы годовой календарь активности."""
     st.divider()
     st.subheader("🟩 Календарь активности за год")
     
+    if unfiltered_date_df.empty:
+        st.info("ℹ️ Пока нет данных для отображения календаря.")
+        return
+
     counter_options = ["Все режимы", "Только карточки", "Только тесты"]
     default_idx = counter_options.index(default_mode) if default_mode in counter_options else 0
 
@@ -869,7 +861,7 @@ def render_activity_calendar(
     c_s3.metric("🗓 Активных дней за год", f"{cal_data['active_days_year']} из 365")
     c_s4.metric(f"⚡️ Всего за год ({cal_data['mode_label']})", cal_data["total_actions_year"])
 
-    components.html(build_calendar_html(cal_data), height=280, scrolling=True)
+    components.html(build_calendar_html(cal_data), height=280, scrolling=False)
 
 
 # =====================================================================
@@ -1093,6 +1085,10 @@ def render_analytics_dashboard(
     period_label: str = "За всё время"
 ):
     """Единый визуальный модуль аналитики (за выбранное временное окно)."""
+    if df.empty:
+        st.warning("Нет данных за выбранный период.")
+        return
+
     st.caption(f"📅 Отображаемый период: **{period_label}**")
 
     c1, c2, c3, c4 = st.columns(4)
@@ -1234,7 +1230,7 @@ def run_dashboard_app():
                 subtitle=f"ID: {student_id_str} | Режим: {selected_mode}",
                 df=window_df, period_label=period_label,
             )
-            st.download_button("📄 Скачать PDF-отчёт", data=pdf_bytes, file_name=f"Отчет_{student_id_str}.pdf", mime="application/pdf")
+            st.download_button("📄 Скачать PDF-отчёт", data=pdf_bytes, file_name=f"Отчет_{student_id_str}.pdf", mime="application/pdf", use_container_width=True)
 
         # --- ОСНОВНОЙ КОНТЕНТ ---
         if window_df.empty:
@@ -1318,14 +1314,14 @@ def run_dashboard_app():
 
             active_window_df, prev_window_df, period_label = filter_df_by_time_window(mode_entity_df, period_choice, custom_dates)
             
-            report_df = build_class_summary_df(class_student_ids, entity_unfiltered_df)
+            report_df = build_class_summary_df(class_student_ids, active_window_df)
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                 report_df.to_excel(writer, index=False, sheet_name="Ведомость класса")
-            st.download_button("📥 Скачать ведомость (.xlsx)", data=buffer.getvalue(), file_name=f"Класс_{teacher_code}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button("📥 Скачать ведомость (.xlsx)", data=buffer.getvalue(), file_name=f"Класс_{teacher_code}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
             
             pdf_class_bytes = generate_pdf_report(title=f"Ведомость класса {teacher_code}", subtitle=teacher_name, df=active_window_df, period_label=period_label, class_summary_df=report_df)
-            st.download_button("📄 Скачать PDF-отчёт (.pdf)", data=pdf_class_bytes, file_name=f"Класс_{teacher_code}.pdf", mime="application/pdf")
+            st.download_button("📄 Скачать PDF-отчёт (.pdf)", data=pdf_class_bytes, file_name=f"Класс_{teacher_code}.pdf", mime="application/pdf", use_container_width=True)
 
         # --- ОСНОВНОЙ КОНТЕНТ ---
         if selected_uid != "ALL" and not entity_unfiltered_df.empty:
@@ -1362,7 +1358,7 @@ def run_dashboard_app():
             with c_info2:
                 st.success("👨‍🏫 **Для преподавателей:**\nИспользуйте персональную ссылку, которую бот выдал по команде `/teacher`.")
 
-            with st.popover("⚙️ Вход для администратора", use_container_width=True):
+            with st.popover("🔒 Вход для администратора", use_container_width=True):
                 admin_input = st.text_input("Пароль:", type="password", key="admin_pass")
                 if st.button("Войти", use_container_width=True):
                     if verify_secret(admin_input, ADMIN_PASSWORD):
@@ -1410,6 +1406,11 @@ def run_dashboard_app():
             if period_choice == "Свой диапазон дат":
                 today_d = datetime.now(TZ).date()
                 custom_dates = st.date_input("Выберите даты:", value=(today_d - timedelta(days=14), today_d), key="admin_custom_dates")
+
+            st.divider()
+            if st.button("🔄 Обновить данные из БД", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
 
             if selected_option == "Все пользователи":
                 entity_df = raw_df
