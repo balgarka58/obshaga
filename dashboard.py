@@ -788,7 +788,6 @@ def build_calendar_html(cal_data: Dict[str, Any]) -> str:
     weeks_count = cal_data["weeks_count"]
     month_labels = cal_data["month_labels"]
 
-    # Адаптивные размеры для мобильных (ширина клетки 11px, чтобы весь год помещался в экран)
     cell_size = 11
     gap = 2
     label_width = 24
@@ -814,7 +813,6 @@ def build_calendar_html(cal_data: Dict[str, Any]) -> str:
             border = "1px solid rgba(255,255,255,0.06)" if cell["level"] <= 0 else "1px solid rgba(255,255,255,0.15)"
             safe_tip = html.escape(cell["tooltip"], quote=True)
             
-            # Добавляем onclick, который выводит текст в блок под календарём (для мобилок)
             click_action = f"showCalInfo('{cell['date_formatted']}', '{cell['count']}', '{cell['cards_count']}', '{cell['tests_count']}', '{cell['accuracy']}', '{cal_data['mode_label']}')"
             
             row_squares.append(
@@ -831,27 +829,25 @@ def build_calendar_html(cal_data: Dict[str, Any]) -> str:
         for lvl in [0, 1, 2, 3, 4]
     ])
 
-    # Оборачиваем в контейнер с горизонтальным скроллом для мобильных + добавляем JS
-    return f"""
+    html_template = """
     <div style="padding: 12px; background: rgba(15, 23, 42, 0.65); border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.1); overflow-x: auto; margin-top: 8px; font-family: sans-serif;">
-        <div style="min-width: {total_width}px;">
-            <div style="display: flex; gap: {gap}px; margin-bottom: 4px;">
-                {"".join(month_cells_html)}
+        <div style="min-width: {{TOTAL_WIDTH}}px;">
+            <div style="display: flex; gap: {{GAP}}px; margin-bottom: 4px;">
+                {{MONTH_CELLS}}
             </div>
             <div>
-                {"".join(rows_html)}
+                {{ROWS_HTML}}
             </div>
             <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 8px; font-size: 11px; color: #94a3b8; flex-wrap: wrap; gap: 4px;">
                 <div>Нажмите или наведите на ячейку, чтобы увидеть детали.</div>
                 <div style="display: flex; align-items: center; gap: 4px;">
                     <span>Меньше</span>
-                    {legend_squares}
+                    {{LEGEND_SQUARES}}
                     <span>Больше</span>
                 </div>
             </div>
         </div>
         
-        <!-- Блок для вывода информации по клику (для мобильных) -->
         <div id="cal-info" style="margin-top: 12px; padding: 10px; background: rgba(255,255,255,0.05); border-radius: 8px; font-size: 13px; color: #e2e8f0; display: none;">
             Нажмите на клетку, чтобы увидеть детали.
         </div>
@@ -874,6 +870,14 @@ def build_calendar_html(cal_data: Dict[str, Any]) -> str:
     </div>
     """
 
+    return (
+        html_template
+        .replace("{{TOTAL_WIDTH}}", str(total_width))
+        .replace("{{GAP}}", str(gap))
+        .replace("{{MONTH_CELLS}}", "".join(month_cells_html))
+        .replace("{{ROWS_HTML}}", "".join(rows_html))
+        .replace("{{LEGEND_SQUARES}}", legend_squares)
+    )
 
 def render_activity_calendar(
     unfiltered_date_df: pd.DataFrame,
