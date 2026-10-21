@@ -1,5 +1,5 @@
 """
-Telegram Bot для изучения терминов обществознания (Версия 6.1 — Стабильная экосистема)
+Telegram Bot для изучения терминов обществознания (Версия 6.2 — Стабильная экосистема)
 =============================================================================
 Архитектура и возможности:
 1. Термины загружаются из terms.json (при его отсутствии — резервная автозагрузка из social_bot.db).
@@ -49,6 +49,7 @@ import hashlib
 import logging
 import sqlite3
 import asyncio
+import urllib.parse
 from datetime import datetime, date, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 from collections import deque
@@ -62,7 +63,7 @@ except ImportError:
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -85,8 +86,6 @@ DB_PATH = os.getenv("DB_PATH", "social_bot.db")
 TERMS_JSON_PATH = os.getenv("TERMS_JSON_PATH", "terms.json")
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://obshaga.streamlit.app").rstrip("/")
 SECRET_KEY = os.getenv("SECRET_KEY", "obshaga_secret_key_2025")
-
-# --- НОВАЯ ПРАВКА: Часовой пояс ---
 TIMEZONE_STR = os.getenv("TIMEZONE", "Europe/Moscow")
 
 logging.basicConfig(
@@ -95,6 +94,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("social_bot")
 
+# --- НОВАЯ ПРАВКА: Безопасный импорт часового пояса ---
 try:
     TZ = ZoneInfo(TIMEZONE_STR)
 except Exception:
@@ -104,7 +104,7 @@ except Exception:
 def get_local_today() -> date:
     """Возвращает текущую дату в заданном часовом поясе (по умолчанию Europe/Moscow)."""
     return datetime.now(TZ).date()
-# ----------------------------------
+# ------------------------------------------------------
 
 def generate_student_token(user_id: Any, token_version: int = 1, secret_key: Optional[str] = None) -> str:
     """
@@ -350,7 +350,7 @@ class TermsCatalog:
             except (ValueError, IndexError):
                 mod_num = int(item.get("module_number") or 1) if str(item.get("module_number") or "").isdigit() else 1
 
-            # --- НОВАЯ ПРАВКА: Защита от None в traits ---
+            # Защита от None и нестроковых значений в списке признаков
             raw_traits = item.get("traits")
             traits = []
             if isinstance(raw_traits, list):
@@ -359,7 +359,6 @@ class TermsCatalog:
                         s_t = str(t).strip()
                         if s_t:
                             traits.append(s_t)
-            # ---------------------------------------------
 
             raw_struct = item.get("structure_for_tests")
             struct = raw_struct if isinstance(raw_struct, dict) else {}
@@ -457,12 +456,23 @@ class Database:
 
                 CREATE TABLE IF NOT EXISTS teachers (
                     teacher_code VARCHAR(8) PRIMARY KEY,
-                    user_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL UNIQUE,  -- Уникальный индекс для защиты от дублей
                     full_name TEXT,
                     token_version INTEGER NOT NULL DEFAULT 1,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
                 ALTER TABLE teachers ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 1;
+                
+                -- Защита от дублей для старых баз (добавляем UNIQUE, если его нет)
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint WHERE conname = 'teachers_user_id_key'
+                    ) THEN
+                        ALTER TABLE teachers ADD CONSTRAINT teachers_user_id_key UNIQUE (user_id);
+                    END IF;
+                END $$;
+
                 CREATE INDEX IF NOT EXISTS idx_teachers_user ON teachers(user_id);
 
                 CREATE TABLE IF NOT EXISTS student_teachers (
@@ -496,7 +506,7 @@ class Database:
 
                 CREATE TABLE IF NOT EXISTS teachers (
                     teacher_code TEXT PRIMARY KEY,
-                    user_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL UNIQUE,
                     full_name TEXT,
                     token_version INTEGER NOT NULL DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -520,6 +530,12 @@ class Database:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 """)
+                # Безопасное добавление UNIQUE для старых баз SQLite
+                try:
+                    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_teachers_user_unique ON teachers(user_id);")
+                except Exception:
+                    pass
+                
                 for alter_sql in [
                     "ALTER TABLE user_answers ADD COLUMN username TEXT;",
                     "ALTER TABLE user_answers ADD COLUMN full_name TEXT;",
@@ -635,9 +651,9 @@ class Database:
         - термины с текущим весом в карточках >= 7.0;
         - термины, где последний ответ в карточках или тестах был ошибочным / неуверенным (delta_ans > 0).
         Если ученик проработал проблемный термин в карточках (вес стал < 7.0 и ответ «Знаю»),
-        термин выходит из списка проблемных.
+        термин выходит из списка проблемных. Успех в тесте НЕ закрывает термин навсегда:
+        если после этого в карточках снова была ошибка, термин возвращается в проблемные.
         """
-        # --- НОВАЯ ПРАВКА: Логика теста больше не закрывает термин навсегда ---
         entries = self._fetch_user_entries(user_id)
         progress_map = self._compute_progress_from_entries(entries)
 
@@ -663,8 +679,10 @@ class Database:
                         last_test_problem[code] = (d_ans > 0)
                         last_action_mode[code] = "test"
                 else:
-                    last_card_problem[code] = (d_ans > 0)
-                    last_action_mode[code] = "card"
+                    # Для карточек тоже проверяем время (защита от мисклика)
+                    if sec >= 1.0:
+                        last_card_problem[code] = (d_ans > 0)
+                        last_action_mode[code] = "card"
 
         problem_codes = []
         seen = set()
@@ -687,20 +705,25 @@ class Database:
                 problem_codes.append(code)
 
         return problem_codes
-        # ----------------------------------------------------------------------
 
     @staticmethod
-    def _extract_date_from_ts(raw_ts: Any) -> Optional[date]:
+    def _extract_date_from_ts(raw_ts: Any, target_tz=None) -> Optional[date]:
+        """Извлекает дату из timestamp с конвертацией в нужный часовой пояс."""
         if raw_ts is None:
             return None
         if isinstance(raw_ts, datetime):
+            if raw_ts.tzinfo is not None and target_tz is not None:
+                raw_ts = raw_ts.astimezone(target_tz)
             return raw_ts.date()
         if isinstance(raw_ts, date):
             return raw_ts
         s = str(raw_ts).strip()
         if len(s) >= 10:
             try:
-                return date.fromisoformat(s[:10])
+                dt = datetime.fromisoformat(s[:19])
+                if dt.tzinfo is not None and target_tz is not None:
+                    dt = dt.astimezone(target_tz)
+                return dt.date()
             except ValueError:
                 pass
         return None
@@ -713,9 +736,7 @@ class Database:
         - active_days_year: количество активных дней за последние 365 дней
         - today_actions: количество засчитанных действий за сегодня
         """
-        # --- НОВАЯ ПРАВКА: Использование часового пояса ---
         today_dt = reference_date or get_local_today()
-        # --------------------------------------------------
         rows = self._fetch_user_entries_with_timestamps(user_id)
 
         active_dates_set = set()
@@ -733,7 +754,8 @@ class Database:
             if mode == "test" and sec < SpacedRepetitionAlgorithm.MIN_TIME_WINDOW:
                 continue
 
-            d = self._extract_date_from_ts(created_at) or today_dt
+            # Конвертируем время в локальный часовой пояс для правильной группировки по дням
+            d = self._extract_date_from_ts(created_at, target_tz=TZ) or today_dt
             active_dates_set.add(d)
             if d == today_dt:
                 today_actions += 1
@@ -1007,7 +1029,6 @@ class Database:
             cursor = conn.cursor()
             try:
                 if self.is_postgres:
-                    # --- НОВАЯ ПРАВКА: Каскадная очистка student_teachers ---
                     cursor.execute("""
                         DELETE FROM teachers t
                         WHERE t.created_at < CURRENT_TIMESTAMP - INTERVAL '7 days'
@@ -1019,7 +1040,6 @@ class Database:
                             SELECT 1 FROM teachers t WHERE t.teacher_code = st.teacher_code
                         );
                     """)
-                    # -----------------------------------------------------------
                 else:
                     cursor.execute("""
                         DELETE FROM teachers
@@ -1041,7 +1061,7 @@ class Database:
 
     def get_teacher(self, teacher_code: str) -> Optional[Dict[str, Any]]:
         clean_code = str(teacher_code or "").strip()
-        if not clean_code:
+        if not clean_code or not clean_code.isdigit():
             return None
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -1276,20 +1296,34 @@ class SessionTracker:
     """Отслеживает последние 10 показанных карточек для исключения повторений подряд."""
     def __init__(self, max_users: int = 10000):
         self.recent_history: Dict[int, deque] = {}
+        self.last_seen: Dict[int, float] = {}
         self.max_users = max_users
 
     def push(self, user_id: int, code: str):
+        # Очистка старых записей перед добавлением, если достигнут лимит
         if user_id not in self.recent_history:
             if len(self.recent_history) >= self.max_users:
                 oldest_uid = next(iter(self.recent_history))
                 self.recent_history.pop(oldest_uid, None)
+                self.last_seen.pop(oldest_uid, None)
             self.recent_history[user_id] = deque(maxlen=10)
+        
         self.recent_history[user_id].append(code)
+        self.last_seen[user_id] = time.time()
 
     def get_recent(self, user_id: int) -> List[str]:
         if user_id in self.recent_history:
+            self.last_seen[user_id] = time.time()
             return list(self.recent_history[user_id])
         return []
+
+    def cleanup_old_sessions(self, max_age_seconds: int = 172800):  # 48 часов
+        """Удаляет записи пользователей, которые не заходили более 48 часов."""
+        now = time.time()
+        to_remove = [uid for uid, last_t in self.last_seen.items() if now - last_t > max_age_seconds]
+        for uid in to_remove:
+            self.recent_history.pop(uid, None)
+            self.last_seen.pop(uid, None)
 
 
 session_tracker = SessionTracker()
@@ -1707,7 +1741,11 @@ def _build_teacher_cabinet_view(
     is_new: bool = False
 ) -> Tuple[str, InlineKeyboardMarkup]:
     t_token = generate_teacher_token(code, token_version)
-    raw_dash_url = f"{DASHBOARD_URL}/?teacher={code}&token={t_token}"
+    
+    safe_code_url = urllib.parse.quote(code)
+    safe_token_url = urllib.parse.quote(t_token)
+    
+    raw_dash_url = f"{DASHBOARD_URL}/?teacher={safe_code_url}&token={safe_token_url}"
     invite_url = escape_md(f"https://t.me/{bot_username}?start=t_{code}")
     dash_url = escape_md(raw_dash_url)
 
@@ -1837,7 +1875,10 @@ async def handle_reset_link_command(message: Message):
     user_id = message.from_user.id
     new_student_ver = db.rotate_user_token(user_id)
     student_token = generate_student_token(user_id, new_student_ver)
-    student_url = f"{DASHBOARD_URL}/?student={user_id}&token={student_token}"
+    
+    safe_uid = urllib.parse.quote(str(user_id))
+    safe_token = urllib.parse.quote(student_token)
+    student_url = f"{DASHBOARD_URL}/?student={safe_uid}&token={safe_token}"
 
     buttons = [
         [InlineKeyboardButton(text="🌐 Открыть личную веб-аналитику", url=student_url)]
@@ -1852,7 +1893,11 @@ async def handle_reset_link_command(message: Message):
     if teacher_res:
         t_code, new_t_ver = teacher_res
         t_token = generate_teacher_token(t_code, new_t_ver)
-        teacher_url = f"{DASHBOARD_URL}/?teacher={t_code}&token={t_token}"
+        
+        safe_t_code = urllib.parse.quote(t_code)
+        safe_t_token = urllib.parse.quote(t_token)
+        teacher_url = f"{DASHBOARD_URL}/?teacher={safe_t_code}&token={safe_t_token}"
+        
         lines.append(f"\n👨‍🏫 *Новая ссылка аналитики класса ({escape_md(t_code)}):*\n{escape_md(teacher_url)}")
         buttons.append([InlineKeyboardButton(text="👨‍🏫 Открыть аналитику класса", url=teacher_url)])
 
@@ -1990,7 +2035,10 @@ def _build_stats_view(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     reminders_on = db.get_user_reminders_enabled(user_id)
 
     token = generate_student_token(user_id, token_ver)
-    student_web_url = f"{DASHBOARD_URL}/?student={user_id}&token={token}"
+    
+    safe_uid = urllib.parse.quote(str(user_id))
+    safe_token = urllib.parse.quote(token)
+    student_web_url = f"{DASHBOARD_URL}/?student={safe_uid}&token={safe_token}"
 
     reminder_label = "🔔 Напоминания: Вкл" if reminders_on else "🔕 Напоминания: Выкл"
 
@@ -2258,6 +2306,9 @@ def format_card_back(card: Dict[str, Any], show_detail: bool = False) -> str:
         if traits
         else "• Признаки уточняются"
     )
+    
+    if len(traits) > 10:
+        traits_formatted += f"\n_...и ещё {len(traits)-10} признаков_"
 
     mod_title = strip_md_delimiters(truncate_plain(card.get("module_title") or "Обществознание", 120))
     term_title = strip_md_delimiters(truncate_plain(str(card.get("term") or "").upper(), 150))
@@ -2284,11 +2335,15 @@ def format_card_back(card: Dict[str, Any], show_detail: bool = False) -> str:
     types_list = [str(x).strip() for x in (struct.get("types_or_forms") or []) if str(x).strip()]
     if types_list:
         types_str = "\n".join([f"• {escape_md(truncate_plain(item, 220))}" for item in types_list[:8]])
+        if len(types_list) > 8:
+            types_str += f"\n_...и ещё {len(types_list)-8} форм_"
         extra_blocks.append(f"🧩 *Формы и классификации:*\n{types_str}")
 
     funcs_list = [str(x).strip() for x in (struct.get("functions_or_goals") or []) if str(x).strip()]
     if funcs_list:
         funcs_str = "\n".join([f"• {escape_md(truncate_plain(item, 220))}" for item in funcs_list[:8]])
+        if len(funcs_list) > 8:
+            funcs_str += f"\n_...и ещё {len(funcs_list)-8} функций_"
         extra_blocks.append(f"⚙️ *Функции в обществе:*\n{funcs_str}")
 
     ege = card.get("ege_context_and_examples") or {}
@@ -2300,6 +2355,8 @@ def format_card_back(card: Dict[str, Any], show_detail: bool = False) -> str:
     pitfalls = [str(x).strip() for x in (card.get("common_pitfalls") or []) if str(x).strip()]
     if pitfalls:
         pitfalls_str = "\n".join([f"• {escape_md(truncate_plain(item, 250))}" for item in pitfalls[:6]])
+        if len(pitfalls) > 6:
+            pitfalls_str += f"\n_...и ещё {len(pitfalls)-6} ошибок_"
         extra_blocks.append(f"⚠️ *Ловушки и частые ошибки:*\n{pitfalls_str}")
 
     result_text = base_text
@@ -2323,6 +2380,10 @@ async def send_next_flashcard(callback: CallbackQuery, state: FSMContext):
     module_filter = data.get("module_filter")
     is_error_workout = data.get("is_error_workout", False)
     user_id = callback.from_user.id
+
+    if not callback.message:
+        await callback.answer("Сообщение устарело, начните заново.", show_alert=True)
+        return
 
     custom_codes = None
     if is_error_workout:
@@ -2480,6 +2541,10 @@ async def send_next_test(callback: CallbackQuery, state: FSMContext):
     pool = list(data.get("test_pool") or [])
     module_filter = data.get("module_filter")
     is_error_workout = data.get("is_error_workout", False)
+
+    if not callback.message:
+        await callback.answer("Сообщение устарело.", show_alert=True)
+        return
 
     if not pool:
         total = data.get("test_total_in_session", 0)
@@ -2758,6 +2823,10 @@ async def process_daily_reminders(bot_instance: Bot, reference_date: Optional[da
             )
             db.mark_reminder_sent(uid, today_iso)
             sent_count += 1
+        except TelegramForbiddenError:
+            # Пользователь заблокировал бота — просто помечаем, чтобы не спамить
+            logger.info(f"Пользователь {uid} заблокировал бота. Напоминание не отправлено.")
+            db.mark_reminder_sent(uid, today_iso)
         except Exception as e:
             logger.warning(f"Не удалось отправить напоминание пользователю {uid}: {e}")
             db.mark_reminder_sent(uid, today_iso)
@@ -2770,7 +2839,6 @@ async def start_dummy_web_server(port: int = 10000):
     Легковесный фоновый веб-сервер на чистом asyncio.
     Отвечает 200 OK на проверки работоспособности Render,
     чтобы бот мог работать на бесплатном тарифе Web Service ($0/мес).
-    Использует таймаут 3.0с для исключения зависания сокетов.
     """
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
@@ -2801,12 +2869,14 @@ async def periodic_background_task(bot_instance: Optional[Bot] = None):
     """
     Периодическая фоновая задача (каждый час):
     1) Очищает неактивных преподавателей без учеников старше 7 дней.
-    2) В вечернее время (после 15:00 UTC / 18:00 МСК) рассылает мягкие напоминания о сохранении серии.
+    2) Очищает старые сессии карточек (TTL 48 часов).
+    3) В вечернее время (после 15:00 UTC / 18:00 МСК) рассылает мягкие напоминания о сохранении серии.
     """
     while True:
         try:
             await asyncio.sleep(3600)
             db.cleanup_inactive_teachers()
+            session_tracker.cleanup_old_sessions()
             now_utc = datetime.now(timezone.utc)
             if bot_instance is not None and now_utc.hour >= 15:
                 await process_daily_reminders(bot_instance, reference_date=get_local_today())
@@ -2838,7 +2908,7 @@ async def main():
 
     bg_task = asyncio.create_task(periodic_background_task(bot))
 
-    logger.info("Бот версии 6.1 успешно запущен.")
+    logger.info("Бот версии 6.2 успешно запущен.")
     try:
         await dp.start_polling(bot)
     finally:
