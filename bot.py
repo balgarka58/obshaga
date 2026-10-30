@@ -85,7 +85,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 DB_PATH = os.getenv("DB_PATH", "social_bot.db")
 TERMS_JSON_PATH = os.getenv("TERMS_JSON_PATH", "terms.json")
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://obshaga.streamlit.app").rstrip("/")
-SECRET_KEY = os.getenv("SECRET_KEY", "obshaga_secret_key_2025")
+SECRET_KEY = os.getenv("SECRET_KEY")
 TIMEZONE_STR = os.getenv("TIMEZONE", "Europe/Moscow")
 
 logging.basicConfig(
