@@ -56,8 +56,8 @@ div[class*="ProfileBadge"] {display: none !important;}
 DATABASE_URL = os.getenv("DATABASE_URL")
 DB_PATH = os.getenv("DB_PATH", "social_bot.db")
 TERMS_JSON_PATH = os.getenv("TERMS_JSON_PATH", "terms.json")
-SECRET_KEY = os.getenv("SECRET_KEY", "obshaga_secret_key_2025")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "obshaga_admin_2025")
+SECRET_KEY = os.getenv("SECRET_KEY")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 TIMEZONE_STR = os.getenv("TIMEZONE", "Europe/Moscow")
 
 try:
