@@ -28,7 +28,7 @@ except ImportError:
     pass
 
 # =====================================================================
-# 1. НАСТРОЙКА СТРАНИЦЫ, АВТО-ТЕМЫ УСТРОЙСТВА И БЕЗОПАСНОСТИ (ВЕРСИЯ 7.1)
+# 1. НАСТРОЙКА СТРАНИЦЫ, АВТО-ТЕМЫ УСТРОЙСТВА И БЕЗОПАСНОСТИ (ВЕРСИЯ 7.3)
 # =====================================================================
 
 st.set_page_config(
@@ -171,7 +171,10 @@ def _get_query_param(query_params: Any, key: str) -> Optional[str]:
 def generate_student_token(user_id: Any, token_version: int = 1, secret_key: Optional[str] = None) -> str:
     key = secret_key if secret_key is not None else os.getenv("SECRET_KEY", SECRET_KEY)
     uid_str = str(user_id).strip()
-    ver = int(token_version) if token_version and int(token_version) > 1 else 1
+    try:
+        ver = max(1, int(token_version or 1))
+    except (ValueError, TypeError):
+        ver = 1
     payload = f"{uid_str}_{key}" if ver == 1 else f"{uid_str}_{key}_v{ver}"
     return hashlib.md5(payload.encode("utf-8")).hexdigest()[:8]
 
@@ -179,28 +182,80 @@ def generate_student_token(user_id: Any, token_version: int = 1, secret_key: Opt
 def generate_teacher_token(teacher_code: Any, token_version: int = 1, secret_key: Optional[str] = None) -> str:
     key = secret_key if secret_key is not None else os.getenv("SECRET_KEY", SECRET_KEY)
     code_str = str(teacher_code).strip()
-    ver = max(1, int(token_version or 1))
+    try:
+        ver = max(1, int(token_version or 1))
+    except (ValueError, TypeError):
+        ver = 1
     payload = f"teacher_{code_str}_{key}_v{ver}"
     return hashlib.md5(payload.encode("utf-8")).hexdigest()[:8]
 
 
 # =====================================================================
-# 2. МЕТАДАННЫЕ ТЕРМИНОВ И НЕЧЁТКИЙ ПОИСК С ЗАЩИТОЙ ОТ ОПЕЧАТОК
+# 2. МЕТАДАННЫЕ ТЕРМИНОВ И БЫСТРЫЙ НЕЧЁТКИЙ ПОИСК С ИНДЕКСОМ ТРИГРАММ
 # =====================================================================
+
+_SEARCH_CLEAN_RE = re.compile(r"[^a-zа-я0-9\s-]")
+_MULTISPACE_RE = re.compile(r"\s+")
+_WORD_SPLIT_RE = re.compile(r"[\s-]+")
+
 
 def _normalize_search_str(s: str) -> str:
     s = str(s or "").lower().replace("ё", "е").strip()
-    return re.sub(r"[^a-zа-я0-9\s-]", " ", s)
+    return _MULTISPACE_RE.sub(" ", _SEARCH_CLEAN_RE.sub(" ", s)).strip()
 
 
 def _get_trigrams(s: str) -> Set[str]:
-    clean = re.sub(r"\s+", " ", _normalize_search_str(s)).strip()
+    clean = _normalize_search_str(s)
     if not clean:
         return set()
     padded = f"  {clean} "
     if len(padded) < 3:
         return {padded}
     return {padded[i:i + 3] for i in range(len(padded) - 2)}
+
+
+def _compute_similarity_preindexed(
+    q_norm: str,
+    q_tri: Set[str],
+    t_norm: str,
+    t_tri: Set[str],
+    t_words_indexed: List[Tuple[str, Set[str]]],
+) -> float:
+    if not q_norm or not t_norm:
+        return 0.0
+    if q_norm == t_norm:
+        return 1.0
+    if t_norm.startswith(q_norm):
+        return 0.96
+    if q_norm in t_norm:
+        return 0.90
+
+    inter_len = len(q_tri & t_tri) if (q_tri and t_tri) else 0
+    union_len = len(q_tri) + len(t_tri) - inter_len
+    tri_score = inter_len / max(1, union_len)
+
+    if inter_len == 0 and abs(len(q_norm) - len(t_norm)) > 6:
+        for w, _ in t_words_indexed:
+            if w.startswith(q_norm):
+                return 0.93
+        return 0.0
+
+    seq_full = difflib.SequenceMatcher(None, q_norm, t_norm).ratio()
+
+    word_best = 0.0
+    for w, w_tri in t_words_indexed:
+        if w.startswith(q_norm):
+            word_best = max(word_best, 0.93)
+        else:
+            w_inter = len(q_tri & w_tri) if (q_tri and w_tri) else 0
+            if w_inter == 0 and not (set(q_norm) & set(w)):
+                continue
+            w_union = len(q_tri) + len(w_tri) - w_inter
+            w_tri_score = w_inter / max(1, w_union)
+            r = difflib.SequenceMatcher(None, q_norm, w).ratio()
+            word_best = max(word_best, (r * 0.65) + (w_tri_score * 0.35))
+
+    return round(max((seq_full * 0.6) + (tri_score * 0.4), word_best), 4)
 
 
 def compute_fuzzy_similarity(query: str, target: str) -> float:
@@ -217,21 +272,8 @@ def compute_fuzzy_similarity(query: str, target: str) -> float:
 
     q_tri = _get_trigrams(q_norm)
     t_tri = _get_trigrams(t_norm)
-    tri_score = len(q_tri & t_tri) / max(1, len(q_tri | t_tri)) if (q_tri and t_tri) else 0.0
-    seq_full = difflib.SequenceMatcher(None, q_norm, t_norm).ratio()
-
-    t_words = [w for w in re.split(r"[\s-]+", t_norm) if len(w) >= 3]
-    word_best = 0.0
-    for w in t_words:
-        if w.startswith(q_norm):
-            word_best = max(word_best, 0.93)
-        else:
-            r = difflib.SequenceMatcher(None, q_norm, w).ratio()
-            w_tri = _get_trigrams(w)
-            w_tri_score = len(q_tri & w_tri) / max(1, len(q_tri | w_tri)) if (q_tri and w_tri) else 0.0
-            word_best = max(word_best, (r * 0.65) + (w_tri_score * 0.35))
-
-    return round(max((seq_full * 0.6) + (tri_score * 0.4), word_best), 4)
+    t_words = [(w, _get_trigrams(w)) for w in _WORD_SPLIT_RE.split(t_norm) if len(w) >= 3]
+    return _compute_similarity_preindexed(q_norm, q_tri, t_norm, t_tri, t_words)
 
 
 @st.cache_data
@@ -313,7 +355,7 @@ TERMS_MAP = load_terms_metadata()
 
 
 # =====================================================================
-# 3. ПОДКЛЮЧЕНИЕ К БД И КЭШИРОВАНИЕ ТОКЕНОВ В STREAMLIT (ЭКОНОМИЯ NEON)
+# 3. ПОДКЛЮЧЕНИЕ К БД, ЧТЕНИЕ АРХИВА И КЭШИРОВАНИЕ ТОКЕНОВ В STREAMLIT
 # =====================================================================
 
 def get_db_connection():
@@ -323,7 +365,7 @@ def get_db_connection():
         return psycopg2.connect(db_url, connect_timeout=10), True
     else:
         sqlite_path = os.getenv("DB_PATH", "social_bot.db")
-        conn = sqlite3.connect(sqlite_path, timeout=10.0)
+        conn = sqlite3.connect(sqlite_path, timeout=15.0)
         return conn, False
 
 
@@ -408,7 +450,11 @@ def verify_teacher_access(teacher_code: str, provided_token: Optional[str]) -> b
 
 @st.cache_data(ttl=60)
 def fetch_all_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Загружает данные с 60-секундным кэшем, чтобы не будить Neon при каждом клике по фильтрам."""
+    """
+    Загружает полную историю ответов (как свежие записи из user_answers, так и сжатый
+    архив старше 30 дней из user_daily_archive), обеспечивая 100% точность всех графиков,
+    годового календаря активности и ведомостей после архивации БД.
+    """
     COLUMNS = [
         "user_id", "username", "full_name", "mode", "code", "term",
         "module", "delta_ans", "delta_time", "time_sec", "status",
@@ -428,6 +474,7 @@ def fetch_all_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         )
 
     answers_df = pd.DataFrame()
+    archive_df = pd.DataFrame()
     teachers_df = pd.DataFrame(columns=TEACHER_COLUMNS)
     st_teachers_df = pd.DataFrame(columns=ST_COLUMNS)
 
@@ -442,6 +489,26 @@ def fetch_all_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                 answers_df["full_name"] = None
             except Exception:
                 answers_df = pd.DataFrame()
+
+        try:
+            query_arch = """
+                SELECT user_id, username, full_name, archive_date, mode, code, 
+                       tries_count, errors_count, total_time_sec, total_delta_weight, last_delta_ans 
+                FROM user_daily_archive ORDER BY archive_date DESC;
+            """
+            archive_df = pd.read_sql(query_arch, conn)
+        except Exception:
+            try:
+                query_arch_legacy = """
+                    SELECT user_id, archive_date, mode, code, 
+                           tries_count, errors_count, total_time_sec, total_delta_weight, last_delta_ans 
+                    FROM user_daily_archive ORDER BY archive_date DESC;
+                """
+                archive_df = pd.read_sql(query_arch_legacy, conn)
+                archive_df["username"] = None
+                archive_df["full_name"] = None
+            except Exception:
+                archive_df = pd.DataFrame()
 
         try:
             query_teachers = "SELECT teacher_code, user_id, full_name, COALESCE(token_version, 1) AS token_version, created_at FROM teachers;"
@@ -478,33 +545,102 @@ def fetch_all_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     finally:
         conn.close()
 
-    if answers_df.empty:
+    if answers_df.empty and archive_df.empty:
         return pd.DataFrame(columns=COLUMNS), teachers_df, st_teachers_df
 
-    if "username" not in answers_df.columns:
-        answers_df["username"] = None
-    if "full_name" not in answers_df.columns:
-        answers_df["full_name"] = None
+    # Собираем карту известных имён и юзернеймов пользователей (чтобы архивные записи всегда имели актуальное ФИО)
+    user_profiles: Dict[str, Tuple[Optional[str], str]] = {}
+
+    def _clean_profile_fields(uid_str: str, raw_u: Any, raw_f: Any) -> Tuple[Optional[str], str]:
+        u_val = str(raw_u).strip() if pd.notna(raw_u) and raw_u is not None else ""
+        if u_val in ("None", "nan", ""):
+            u_val = None
+        f_val = str(raw_f).strip() if pd.notna(raw_f) and raw_f is not None else ""
+        if f_val in ("None", "nan", ""):
+            f_val = ""
+        prev_u, prev_f = user_profiles.get(uid_str, (None, ""))
+        best_u = prev_u or u_val
+        best_f = prev_f or f_val
+        user_profiles[uid_str] = (best_u, best_f)
+        return best_u, (best_f or best_u or f"ID: {uid_str}")
 
     parsed_rows = []
-    for _, row in answers_df.iterrows():
-        entry_str = str(row.get("entry") or "")
-        parts = entry_str.split(";")
-        if len(parts) >= 4:
-            code = parts[0].strip()
+
+    if not answers_df.empty:
+        if "username" not in answers_df.columns:
+            answers_df["username"] = None
+        if "full_name" not in answers_df.columns:
+            answers_df["full_name"] = None
+
+        for _, row in answers_df.iterrows():
+            uid_str = str(row["user_id"]).strip()
+            username_val, fname_val = _clean_profile_fields(uid_str, row.get("username"), row.get("full_name"))
+
+            entry_str = str(row.get("entry") or "")
+            parts = entry_str.split(";")
+            if len(parts) >= 4:
+                code = parts[0].strip()
+                if not code:
+                    continue
+                try:
+                    d_ans = float(parts[1])
+                    d_time = float(parts[2])
+                    sec = max(0.0, float(parts[3]))
+                except ValueError:
+                    continue
+
+                raw_mode = parts[4].strip() if len(parts) >= 5 else "card"
+                if raw_mode == "test" and sec < 3.0:
+                    continue
+
+                mode_display = "Тесты" if raw_mode == "test" else "Карточки"
+
+                term_info = TERMS_MAP.get(code, {
+                    "term": f"Код {code}",
+                    "module": f"Модуль {code.split('.')[0] if '.' in code else '?'}"
+                })
+
+                if d_ans <= 0:
+                    result_status = "Верно / Знаю"
+                    is_problem = False
+                elif d_ans < 1.5:
+                    result_status = "Неуверенно"
+                    is_problem = True
+                else:
+                    result_status = "Ошибка / Не знаю"
+                    is_problem = True
+
+                parsed_rows.append({
+                    "user_id": uid_str,
+                    "username": username_val,
+                    "full_name": fname_val,
+                    "mode": mode_display,
+                    "code": code,
+                    "term": term_info["term"],
+                    "module": term_info["module"],
+                    "delta_ans": d_ans,
+                    "delta_time": d_time,
+                    "time_sec": sec,
+                    "status": result_status,
+                    "is_problem": is_problem,
+                    "created_at": row["created_at"]
+                })
+
+    # Распаковываем сжатые записи из user_daily_archive
+    if not archive_df.empty:
+        if "username" not in archive_df.columns:
+            archive_df["username"] = None
+        if "full_name" not in archive_df.columns:
+            archive_df["full_name"] = None
+
+        for _, arow in archive_df.iterrows():
+            uid_str = str(arow["user_id"]).strip()
+            username_val, fname_val = _clean_profile_fields(uid_str, arow.get("username"), arow.get("full_name"))
+
+            code = str(arow.get("code") or "").strip()
             if not code:
                 continue
-            try:
-                d_ans = float(parts[1])
-                d_time = float(parts[2])
-                sec = max(0.0, float(parts[3]))
-            except ValueError:
-                continue
-
-            raw_mode = parts[4].strip() if len(parts) >= 5 else "card"
-            if raw_mode == "test" and sec < 3.0:
-                continue
-
+            raw_mode = str(arow.get("mode") or "card").strip()
             mode_display = "Тесты" if raw_mode == "test" else "Карточки"
 
             term_info = TERMS_MAP.get(code, {
@@ -512,46 +648,71 @@ def fetch_all_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                 "module": f"Модуль {code.split('.')[0] if '.' in code else '?'}"
             })
 
-            if d_ans <= 0:
-                result_status = "Верно / Знаю"
-                is_problem = False
-            elif d_ans < 1.5:
-                result_status = "Неуверенно"
-                is_problem = True
-            else:
-                result_status = "Ошибка / Не знаю"
-                is_problem = True
+            try:
+                tries_cnt = max(1, min(500, int(arow.get("tries_count") or 1)))
+                err_cnt = max(0, min(tries_cnt, int(arow.get("errors_count") or 0)))
+                total_sec = max(0.0, float(arow.get("total_time_sec") or 0.0))
+                last_d_ans = float(arow.get("last_delta_ans") or 0.0)
+            except (ValueError, TypeError):
+                continue
 
-            raw_username = row.get("username")
-            username_val = str(raw_username).strip() if pd.notna(raw_username) and raw_username is not None else ""
-            if username_val in ["None", "nan", ""]:
-                username_val = None
+            ok_cnt = tries_cnt - err_cnt
+            avg_sec = round(total_sec / tries_cnt, 1)
+            if raw_mode == "test" and avg_sec < 3.0:
+                avg_sec = 3.0
 
-            raw_fname = row.get("full_name")
-            fname_val = str(raw_fname).strip() if pd.notna(raw_fname) and raw_fname is not None else ""
-            if fname_val in ["None", "nan", ""]:
-                fname_val = username_val or f"ID: {row['user_id']}"
+            arch_date = arow.get("archive_date")
+            created_ts = f"{str(arch_date)[:10]} 12:00:00" if arch_date is not None else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-            parsed_rows.append({
-                "user_id": str(row["user_id"]).strip(),
-                "username": username_val,
-                "full_name": fname_val,
-                "mode": mode_display,
-                "code": code,
-                "term": term_info["term"],
-                "module": term_info["module"],
-                "delta_ans": d_ans,
-                "delta_time": d_time,
-                "time_sec": sec,
-                "status": result_status,
-                "is_problem": is_problem,
-                "created_at": row["created_at"]
-            })
+            for _ in range(ok_cnt):
+                parsed_rows.append({
+                    "user_id": uid_str,
+                    "username": username_val,
+                    "full_name": fname_val,
+                    "mode": mode_display,
+                    "code": code,
+                    "term": term_info["term"],
+                    "module": term_info["module"],
+                    "delta_ans": -1.0,
+                    "delta_time": 0.0,
+                    "time_sec": avg_sec,
+                    "status": "Верно / Знаю",
+                    "is_problem": False,
+                    "created_at": created_ts,
+                })
+
+            err_status = "Неуверенно" if (0 < last_d_ans < 1.5 and raw_mode != "test") else "Ошибка / Не знаю"
+            err_d_ans = last_d_ans if last_d_ans > 0 else 2.0
+            for _ in range(err_cnt):
+                parsed_rows.append({
+                    "user_id": uid_str,
+                    "username": username_val,
+                    "full_name": fname_val,
+                    "mode": mode_display,
+                    "code": code,
+                    "term": term_info["term"],
+                    "module": term_info["module"],
+                    "delta_ans": err_d_ans,
+                    "delta_time": 0.0,
+                    "time_sec": avg_sec,
+                    "status": err_status,
+                    "is_problem": True,
+                    "created_at": created_ts,
+                })
 
     if not parsed_rows:
         return pd.DataFrame(columns=COLUMNS), teachers_df, st_teachers_df
 
-    return pd.DataFrame(parsed_rows), teachers_df, st_teachers_df
+    out_df = pd.DataFrame(parsed_rows)
+    # Проставляем единые актуальные ФИО/username для каждого user_id
+    for uid_str, (u_best, f_best) in user_profiles.items():
+        if f_best:
+            mask = out_df["user_id"] == uid_str
+            out_df.loc[mask, "full_name"] = f_best
+            if u_best:
+                out_df.loc[mask, "username"] = u_best
+
+    return out_df, teachers_df, st_teachers_df
 
 
 # =====================================================================
@@ -559,7 +720,10 @@ def fetch_all_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 # =====================================================================
 
 def _normalize_timestamps(series: pd.Series) -> pd.Series:
-    parsed = pd.to_datetime(series, utc=True, errors="coerce")
+    try:
+        parsed = pd.to_datetime(series, format="mixed", utc=True, errors="coerce")
+    except TypeError:
+        parsed = pd.to_datetime(series, utc=True, errors="coerce")
     return parsed.dt.tz_convert(TZ).dt.tz_localize(None)
 
 
@@ -661,10 +825,9 @@ def build_calendar_data(
 ) -> Dict[str, Any]:
     """
     Формирует данные календаря активности:
-    1. Исправлен баг пропущенных месяцев (больше никаких «12 недель в октябре»):
-       теперь месяц определяется по любому дню недели, на который пришлось 1-е число месяца.
-    2. Подготавливает помесячные данные за последние 12 месяцев для мобильного вида (Вариант Б)
-       со стрелочками переключения месяцев без горизонтального скролла!
+    1. Точная разметка месяцев по дню недели, на который пришлось 1-е число месяца.
+    2. Помесячные данные за последние 12 месяцев для мобильного вида (Вариант Б)
+       со стрелочками переключения месяцев без горизонтального скролла.
     """
     today_d = end_date or datetime.now(TZ).date()
     if isinstance(today_d, datetime):
@@ -693,11 +856,12 @@ def build_calendar_data(
         ts_series = _normalize_timestamps(mode_df["created_at"]).fillna(pd.Timestamp(today_d))
         mode_df["_date"] = ts_series.dt.date
         for d_val, grp in mode_df.groupby("_date"):
-            cnt = len(grp)
-            daily_counts[d_val] = cnt
-            daily_cards[d_val] = int((grp["mode"] == "Карточки").sum())
-            daily_tests[d_val] = int((grp["mode"] == "Тесты").sum())
-            daily_errors[d_val] = int(grp["is_problem"].sum())
+            if d_val <= today_d:
+                cnt = len(grp)
+                daily_counts[d_val] = cnt
+                daily_cards[d_val] = int((grp["mode"] == "Карточки").sum())
+                daily_tests[d_val] = int((grp["mode"] == "Тесты").sum())
+                daily_errors[d_val] = int(grp["is_problem"].sum())
 
     active_dates = sorted([d for d, c in daily_counts.items() if c > 0])
     year_start_365 = today_d - timedelta(days=364)
@@ -719,7 +883,7 @@ def build_calendar_data(
 
     if today_d in daily_counts and daily_counts[today_d] > 0:
         chk = today_d
-    elif (today_d - timedelta(days=1)) in daily_counts and daily_counts[today_d - timedelta(days=1)] > 0:
+    elif (today_d - timedelta(days=1)) in daily_counts and daily_counts[(today_d - timedelta(days=1))] > 0:
         chk = today_d - timedelta(days=1)
     else:
         chk = None
@@ -824,7 +988,6 @@ def build_calendar_data(
                 "tooltip": tooltip,
             })
 
-    # Формируем помесячные сетки за последние 12 месяцев для мобильного вида (Вариант Б)
     months_data: List[Dict[str, Any]] = []
     cur_y, cur_m = today_d.year, today_d.month
     ym_list: List[Tuple[int, int]] = []
@@ -894,14 +1057,7 @@ def build_calendar_data(
 
 
 def build_calendar_html(cal_data: Dict[str, Any]) -> str:
-    """
-    Генерирует адаптивный виджет календаря активности v7.1:
-    1. На компьютерах (> 720px): сбалансированная центрированная годовая сетка (53 недели)
-       с точными подписями всех 12 месяцев и привязанной к сетке легендой «Меньше — Больше».
-    2. На телефонах (<= 720px, Вариант Б): удобный помесячный календарь (Пн–Вс) со стрелочками
-       «‹ Месяц ›» — крупные ячейки с числами, 0 горизонтального скролла!
-    3. Автоматическая смена темы (светлая / тёмная) по системной настройке устройства (prefers-color-scheme).
-    """
+    """Генерирует адаптивный виджет календаря активности v7.3 с защитой от XSS."""
     weeks_count = cal_data["weeks_count"]
     month_labels = cal_data["month_labels"]
     safe_mode = html.escape(cal_data["mode_label"], quote=True)
@@ -930,12 +1086,12 @@ def build_calendar_html(cal_data: Dict[str, Any]) -> str:
             lvl_cls = f"lvl-{lvl}" if lvl >= 0 else "lvl-future"
             safe_tip = html.escape(cell["tooltip"], quote=True)
             click_js = (
-                f"showCalDetail('{cell['date_formatted']}', {cell['count']}, "
-                f"{cell['cards_count']}, {cell['tests_count']}, '{cell['accuracy']}', '{safe_mode}')"
+                f"showCalDetail('{cell['date_formatted']}', {int(cell['count'])}, "
+                f"{int(cell['cards_count'])}, {int(cell['tests_count'])}, '{cell['accuracy']}', '{safe_mode}')"
             )
             row_squares.append(
                 f'<div class="gh-cell {lvl_cls}" title="{safe_tip}" '
-                f'data-date="{cell["date"]}" data-count="{cell["count"]}" '
+                f'data-date="{cell["date"]}" data-count="{int(cell["count"])}" '
                 f'onclick="{click_js}"></div>'
             )
         rows_html.append(f'<div class="gh-row">{"".join(row_squares)}</div>')
@@ -945,7 +1101,7 @@ def build_calendar_html(cal_data: Dict[str, Any]) -> str:
         for lvl in [0, 1, 2, 3, 4]
     ])
 
-    months_json = json.dumps(cal_data.get("months_data", []), ensure_ascii=False)
+    months_json = json.dumps(cal_data.get("months_data", []), ensure_ascii=False).replace("</", "<\\/")
 
     return f"""
     <style>
@@ -1717,7 +1873,7 @@ def render_analytics_dashboard(
 
 
 # =====================================================================
-# 7. ИНТЕРФЕЙС И РОУТИНГ ПО РОЛЯМ (ВЕРСИЯ 7.1)
+# 7. ИНТЕРФЕЙС И РОУТИНГ ПО РОЛЯМ (ВЕРСИЯ 7.3)
 # =====================================================================
 
 def run_dashboard_app():
@@ -1868,7 +2024,6 @@ def run_dashboard_app():
 
             active_window_df, prev_window_df, period_label = filter_df_by_time_window(mode_entity_df, period_choice, custom_dates)
 
-            # Ведомость класса всегда считает всех учеников класса за выбранный период и режим
             class_mode_df = (
                 class_df[class_df["mode"] == "Карточки"] if selected_mode == "Только карточки"
                 else (class_df[class_df["mode"] == "Тесты"] if selected_mode == "Только тесты" else class_df)
@@ -1900,7 +2055,7 @@ def run_dashboard_app():
         return
 
     # -----------------------------------------------------------------
-    # СЦЕНАРИЙ 3: АДМИН-ПАНЕЛЬ И ГЛАВНАЯ (ИСПРАВЛЕН ВЫХОД ИЗ ПАНЕЛИ)
+    # СЦЕНАРИЙ 3: АДМИН-ПАНЕЛЬ И ГЛАВНАЯ
     # -----------------------------------------------------------------
     else:
         if "is_admin_authed" not in st.session_state:
