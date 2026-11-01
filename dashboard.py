@@ -28,7 +28,7 @@ except ImportError:
     pass
 
 # =====================================================================
-# 1. НАСТРОЙКА СТРАНИЦЫ, АВТО-ТЕМЫ УСТРОЙСТВА И БЕЗОПАСНОСТИ (ВЕРСИЯ 7.0)
+# 1. НАСТРОЙКА СТРАНИЦЫ, АВТО-ТЕМЫ УСТРОЙСТВА И БЕЗОПАСНОСТИ (ВЕРСИЯ 7.1)
 # =====================================================================
 
 st.set_page_config(
@@ -761,7 +761,6 @@ def build_calendar_data(
 
     for w_idx in range(weeks_count):
         week_monday = start_monday + timedelta(weeks=w_idx)
-        # Ищем, есть ли в этой неделе 1-е число нового месяца (или это самая первая колонка)
         week_dates = [week_monday + timedelta(days=i) for i in range(7)]
         first_of_month = next((d for d in week_dates if d.day == 1), None)
         if w_idx == 0:
@@ -772,7 +771,6 @@ def build_calendar_data(
         elif first_of_month is not None:
             ym = (first_of_month.year, first_of_month.month)
             if ym != last_labeled_ym:
-                # Защита от наложения подписей на соседних колонках
                 if w_idx - last_label_w_idx >= 2:
                     month_labels[w_idx] = MONTH_SHORT_RU.get(first_of_month.month, "")
                     last_label_w_idx = w_idx
@@ -897,7 +895,7 @@ def build_calendar_data(
 
 def build_calendar_html(cal_data: Dict[str, Any]) -> str:
     """
-    Генерирует адаптивный виджет календаря активности v7.0:
+    Генерирует адаптивный виджет календаря активности v7.1:
     1. На компьютерах (> 720px): сбалансированная центрированная годовая сетка (53 недели)
        с точными подписями всех 12 месяцев и привязанной к сетке легендой «Меньше — Больше».
     2. На телефонах (<= 720px, Вариант Б): удобный помесячный календарь (Пн–Вс) со стрелочками
@@ -1705,7 +1703,6 @@ def render_analytics_dashboard(
                     }
                 )
             else:
-                # Проверяем, есть ли такой термин в общем справочнике кодификатора
                 cat_matches = []
                 for c_code, c_info in TERMS_MAP.items():
                     sc = compute_fuzzy_similarity(clean_q, c_info["term"])
@@ -1720,7 +1717,7 @@ def render_analytics_dashboard(
 
 
 # =====================================================================
-# 7. ИНТЕРФЕЙС И РОУТИНГ ПО РОЛЯМ (ВЕРСИЯ 7.0)
+# 7. ИНТЕРФЕЙС И РОУТИНГ ПО РОЛЯМ (ВЕРСИЯ 7.1)
 # =====================================================================
 
 def run_dashboard_app():
@@ -1820,7 +1817,6 @@ def run_dashboard_app():
 
         st.caption(f"Просмотр: **{teacher_name}**")
 
-        # ИСПРАВЛЕН БАГ NameError: сначала инициализируем class_student_ids, затем проверяем
         class_student_ids: List[str] = (
             st_teachers_df[st_teachers_df["teacher_code"].astype(str) == teacher_code]["student_id"].astype(str).unique().tolist()
             if not st_teachers_df.empty
@@ -1872,7 +1868,13 @@ def run_dashboard_app():
 
             active_window_df, prev_window_df, period_label = filter_df_by_time_window(mode_entity_df, period_choice, custom_dates)
 
-            report_df = build_class_summary_df(class_student_ids, active_window_df)
+            # Ведомость класса всегда считает всех учеников класса за выбранный период и режим
+            class_mode_df = (
+                class_df[class_df["mode"] == "Карточки"] if selected_mode == "Только карточки"
+                else (class_df[class_df["mode"] == "Тесты"] if selected_mode == "Только тесты" else class_df)
+            )
+            class_window_df, _, _ = filter_df_by_time_window(class_mode_df, period_choice, custom_dates)
+            report_df = build_class_summary_df(class_student_ids, class_window_df)
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                 report_df.to_excel(writer, index=False, sheet_name="Ведомость класса")
@@ -1904,8 +1906,6 @@ def run_dashboard_app():
         if "is_admin_authed" not in st.session_state:
             st.session_state["is_admin_authed"] = False
 
-        # Если параметр ?admin= передан в URL, авторизуем и сразу очищаем URL,
-        # чтобы кнопка «Выйти из панели» работала с первого клика и не зацикливалась!
         if admin_param and verify_secret(admin_param, ADMIN_PASSWORD):
             st.session_state["is_admin_authed"] = True
             try:
@@ -1920,7 +1920,7 @@ def run_dashboard_app():
 
             c_info1, c_info2 = st.columns(2)
             with c_info1:
-                st.info("🎓 **Для учеников:**\nОткройте Telegram-бот и нажмите «📊 Моя статистика» → «📱 Открыть аналитику в Telegram».")
+                st.info("🎓 **Для учеников:**\nОткройте Telegram-бот и нажмите «📊 Моя статистика» → «📱 Открыть веб-аналитику».")
             with c_info2:
                 st.success("👨‍🏫 **Для преподавателей:**\nИспользуйте персональную ссылку, которую бот выдал по команде `/teacher`.")
 
