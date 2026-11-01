@@ -1,10 +1,26 @@
-Copyright (c) 2026 balgarka58
+Copyright (c) 2026 balgarka58. All rights reserved.
 
-All rights reserved.
+PROPRIETARY AND CONFIDENTIAL SOURCE CODE LICENSE
 
-This source code is provided solely for demonstration, educational, and portfolio review purposes.
+This software, including all its source code, algorithms, databases, data structures, documentation, assets, and associated files (collectively, the "Software"), is the exclusive proprietary and intellectual property of balgarka58 (the "Copyright Holder").
 
-No permission is granted to copy, modify, distribute, publish, sublicense, host, deploy, 
-or create derivative works from this software or any part of it, in source code or binary form, 
-whether for commercial or non-commercial purposes, without prior explicit written authorization 
-from the copyright holder.
+TERMS AND CONDITIONS:
+
+NO PERMISSION TO USE, COPY, OR DISTRIBUTE:
+No license, right, title, or interest of any kind is granted to any person or entity. You may NOT:
+
+Copy, clone, duplicate, mirror, or reproduce the Software or any portion thereof;
+
+Modify, adapt, translate, decompile, disassemble, reverse engineer, or create derivative works based on the Software;
+
+Publish, distribute, sell, resell, lease, rent, sublicense, assign, or transfer the Software or any part of it;
+
+Host, deploy, run, execute, or operate the Software on any public, private, or cloud servers, services, or platforms;
+
+Use the Software, its data, or contents for training, fine-tuning, or testing artificial intelligence (AI), machine learning (ML), or automated algorithms, or for data scraping and mining.
+
+STRICTLY PROPRIETARY:
+Viewing this repository or source code does not constitute a grant of rights or a waiver of any intellectual property rights. All unauthorized copying, sharing, hosting, commercial or non-commercial reuse, or distribution is strictly prohibited and constitutes an infringement of copyright and applicable intellectual property laws.
+
+NO WARRANTIES:
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY.
