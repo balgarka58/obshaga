@@ -2437,7 +2437,7 @@ def _build_stats_view_sync(user_id: int, prefix_notice: str = "") -> Tuple[str, 
         "📊 *Ваша статистика изучения*\n\n"
         "🔥 *Регулярность и серия занятий:*\n"
         f"• Текущая серия: *{stats['current_streak']} дн. подряд* (рекорд: *{stats['best_streak']} дн.*)\n"
-        f"• Действий сегодня: *{stats['today_actions']}* | Активных дней за год: *{stats['active_days_year']}*\n"
+        f"• Действий сегодня: *{stats['today_actions']}* | Активных дней за год: *{stats['active_days_year']}*\n\n"
         "🗂 *Карточки:*\n"
         f"• Всего ответов: *{stats['cards_count']}*\n"
         f"• 🟢 Выучено надёжно: *{stats['learned']}*\n"
@@ -2507,7 +2507,6 @@ async def handle_search_start(message: Message, state: FSMContext):
     text = (
         "🔎 *Поиск термина*\n\n"
         "Введите название понятия (минимум *3 буквы*).\n"
-        "Даже если вы допустите опечатку (например, _«ифлянция»_ или _«стратификацыя»_), бот поймёт вас и найдёт нужный термин:"
     )
     await render_single_screen(message, state, text, reply_markup=Keyboards.back_to_menu())
 
