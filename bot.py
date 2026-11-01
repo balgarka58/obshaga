@@ -9,6 +9,7 @@ import logging
 import sqlite3
 import asyncio
 import difflib
+import threading
 import traceback
 import urllib.parse
 from datetime import datetime, date, timedelta, timezone
@@ -31,9 +32,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
     WebAppInfo,
@@ -42,7 +40,7 @@ from aiogram.types import (
 from aiogram.client.default import DefaultBotProperties
 
 # =====================================================================
-# 1. КОНФИГУРАЦИЯ, ТОКЕНЫ И БЕЗОПАСНАЯ РАЗМЕТКА (ВЕРСИЯ 7.0)
+# 1. КОНФИГУРАЦИЯ, ТОКЕНЫ И БЕЗОПАСНАЯ РАЗМЕТКА (ВЕРСИЯ 7.1 — CLEAN CHAT)
 # =====================================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -77,7 +75,6 @@ def normalize_neon_pooler_url(db_url: Optional[str]) -> Optional[str]:
     Автоматически конвертирует прямой URL Neon в адрес Connection Pooler (-pooler),
     чтобы обойти жёсткий лимит одновременных подключений на бесплатном тарифе Neon
     (PgBouncer выдерживает до 10 000 виртуальных подключений).
-    Если нужно отключить авто-пулер, задайте NEON_USE_POOLER=0.
     """
     if not db_url or not db_url.startswith("postgres"):
         return db_url
@@ -97,11 +94,7 @@ def normalize_neon_pooler_url(db_url: Optional[str]) -> Optional[str]:
 
 
 def generate_student_token(user_id: Any, token_version: int = 1, secret_key: Optional[str] = None) -> str:
-    """
-    Генерирует персональный 8-символьный токен доступа ученика к веб-аналитике.
-    При token_version == 1 сохраняет обратную совместимость, при сбросе (version > 1)
-    выпускает новый хэш, мгновенно делая старые ссылки недействительными.
-    """
+    """Генерирует персональный 8-символьный токен доступа ученика к веб-аналитике."""
     key = secret_key if secret_key is not None else os.getenv("SECRET_KEY", SECRET_KEY)
     uid_str = str(user_id).strip()
     ver = int(token_version) if token_version and int(token_version) > 1 else 1
@@ -157,15 +150,69 @@ def truncate_plain(text: str, max_len: int) -> str:
     return s[: max(0, max_len - 3)].rstrip() + "..."
 
 
-async def safe_send_markdown(
+# =====================================================================
+# 2. МЕХАНИЗМ «ОДНОГО ЭКРАНА» (CLEAN CHAT ENGINE)
+# =====================================================================
+
+class ScreenManager:
+    """
+    Хранит ID последнего активного сообщения бота для каждого чата,
+    чтобы при любом действии пользователя:
+    1) Мгновенно удалять сообщение пользователя (message.delete()).
+    2) Удалять предыдущее сообщение бота и показывать обновлённый экран
+       с актуальной нижней Reply-клавиатурой.
+    В результате в чате ВСЕГДА остаётся ровно 1 актуальное сообщение, без засорения истории.
+    """
+    def __init__(self, max_chats: int = 10000):
+        self.last_bot_msg_id: Dict[int, int] = {}
+        self.max_chats = max_chats
+
+    def get_last_id(self, chat_id: int) -> Optional[int]:
+        return self.last_bot_msg_id.get(chat_id)
+
+    def set_last_id(self, chat_id: int, message_id: int):
+        if chat_id not in self.last_bot_msg_id and len(self.last_bot_msg_id) >= self.max_chats:
+            oldest = next(iter(self.last_bot_msg_id))
+            self.last_bot_msg_id.pop(oldest, None)
+        self.last_bot_msg_id[chat_id] = message_id
+
+
+screen_manager = ScreenManager()
+
+
+async def _safe_delete_message(bot: Bot, chat_id: int, message_id: Optional[int]):
+    """Тихо удаляет сообщение, игнорируя ошибки если оно уже удалено."""
+    if not message_id:
+        return
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+async def render_single_screen(
     message: Message,
+    state: FSMContext,
     text: str,
     reply_markup: Any = None,
     disable_web_page_preview: bool = True,
 ) -> Message:
-    """Отправляет сообщение с Markdown и безопасным fallback при сбое парсинга."""
+    """
+    Главный движок отображения «Одного экрана» (Clean Chat):
+    1. Удаляет входящее сообщение пользователя, чтобы его клики/слова не висели в чате.
+    2. Отправляет новое состояние экрана с обновлённой нижней клавиатурой.
+    3. Удаляет предыдущее сообщение бота, оставляя в чате ровно 1 сообщение.
+    """
+    chat_id = message.chat.id
+    user_msg_id = message.message_id
+    bot = message.bot
+
+    data = await state.get_data()
+    prev_bot_id = data.get("last_bot_msg_id") or screen_manager.get_last_id(chat_id)
+
+    # 1. Отправляем обновлённый экран (с fallback без разметки при нестандартных символах)
     try:
-        return await message.answer(
+        new_msg = await message.answer(
             text,
             reply_markup=reply_markup,
             parse_mode=ParseMode.MARKDOWN,
@@ -174,48 +221,30 @@ async def safe_send_markdown(
     except TelegramBadRequest as e:
         if "can't parse entities" in str(e).lower():
             logger.warning(f"Fallback отправки без Markdown: {e}")
-            return await message.answer(
+            new_msg = await message.answer(
                 text,
                 reply_markup=reply_markup,
                 parse_mode=None,
                 disable_web_page_preview=disable_web_page_preview,
             )
-        raise
+        else:
+            raise
 
+    # 2. Сохраняем ID единственного активного сообщения бота
+    screen_manager.set_last_id(chat_id, new_msg.message_id)
+    await state.update_data(last_bot_msg_id=new_msg.message_id)
 
-async def safe_edit_text(
-    message: Optional[Message],
-    text: str,
-    reply_markup: Optional[InlineKeyboardMarkup] = None,
-    parse_mode: Optional[str] = ParseMode.MARKDOWN,
-    disable_web_page_preview: Optional[bool] = None,
-):
-    """Безопасное редактирование inline-сообщения с fallback на отправку без разметки."""
-    if not message:
-        return
-    kwargs: Dict[str, Any] = {"reply_markup": reply_markup, "parse_mode": parse_mode}
-    if disable_web_page_preview is not None:
-        kwargs["disable_web_page_preview"] = disable_web_page_preview
+    # 3. Параллельно удаляем сообщение пользователя и старое сообщение бота
+    delete_tasks = [_safe_delete_message(bot, chat_id, user_msg_id)]
+    if prev_bot_id and prev_bot_id != new_msg.message_id:
+        delete_tasks.append(_safe_delete_message(bot, chat_id, prev_bot_id))
+    await asyncio.gather(*delete_tasks, return_exceptions=True)
 
-    try:
-        await message.edit_text(text, **kwargs)
-    except TelegramBadRequest as e:
-        err_msg = str(e).lower()
-        if "message is not modified" in err_msg:
-            return
-        if "can't parse entities" in err_msg:
-            kwargs["parse_mode"] = None
-            try:
-                await message.edit_text(text, **kwargs)
-            except TelegramBadRequest as inner_e:
-                if "message is not modified" not in str(inner_e).lower():
-                    raise
-            return
-        raise
+    return new_msg
 
 
 # =====================================================================
-# 2. ЖИВЫЕ ЛОГИ ОШИБОК В TELEGRAM-КАНАЛ (LIVE ERROR LOGGER)
+# 3. ЖИВЫЕ ЛОГИ ОШИБОК В TELEGRAM-КАНАЛ (LIVE ERROR LOGGER)
 # =====================================================================
 
 class LiveErrorLogger:
@@ -256,7 +285,7 @@ class LiveErrorLogger:
         now_str = datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")
         tb_short = tb_str[-2600:] if len(tb_str) > 2600 else tb_str
         msg_text = (
-            f"🚨 <b>ОШИБКА В БОТЕ v7.0</b>{repeat_badge}\n"
+            f"🚨 <b>ОШИБКА В БОТЕ v7.1</b>{repeat_badge}\n"
             f"⏰ <b>Время:</b> <code>{now_str}</code>\n"
             f"👤 <b>Пользователь:</b> <code>{self._escape_html(user_info)}</code>\n"
             f"📍 <b>Контекст:</b> <code>{self._escape_html(context_info or 'Global')}</code>\n"
@@ -280,7 +309,7 @@ live_logger = LiveErrorLogger()
 
 
 # =====================================================================
-# 3. АЛГОРИТМ ИНТЕРВАЛЬНОГО ПОВТОРЕНИЯ ДЛЯ КАРТОЧЕК
+# 4. АЛГОРИТМ ИНТЕРВАЛЬНОГО ПОВТОРЕНИЯ ДЛЯ КАРТОЧЕК
 # =====================================================================
 
 class SpacedRepetitionAlgorithm:
@@ -327,7 +356,7 @@ class SpacedRepetitionAlgorithm:
 
 
 # =====================================================================
-# 4. КАТАЛОГ ТЕРМИНОВ И НЕЧЁТКИЙ ПОИСК С ЗАЩИТОЙ ОТ ОПЕЧАТОК (3-ГРАММЫ)
+# 5. КАТАЛОГ ТЕРМИНОВ И НЕЧЁТКИЙ ПОИСК С ЗАЩИТОЙ ОТ ОПЕЧАТОК (3-ГРАММЫ)
 # =====================================================================
 
 def _safe_json_loads(raw_val: Any, default: Any) -> Any:
@@ -364,8 +393,8 @@ def _get_trigrams(s: str) -> Set[str]:
 def compute_fuzzy_similarity(query: str, target: str) -> float:
     """
     Комбинированная оценка сходства для поиска с опечатками (например: «ифлянция» -> «Инфляция»):
-    1. Прямое вхождение подстроки -> 0.95+
-    2. Пересечение 3-грамм (триграмм) + SequenceMatcher (Левенштейн/Ратклифф) по словам и целиком.
+    1. Прямое вхождение подстроки -> 0.90+
+    2. Пересечение 3-грамм (триграмм) + SequenceMatcher по словам и целиком.
     """
     q_norm = _normalize_search_str(query)
     t_norm = _normalize_search_str(target)
@@ -565,23 +594,21 @@ catalog = TermsCatalog()
 
 
 # =====================================================================
-# 5. БАЗА ДАННЫХ С ОПТИМИЗАЦИЕЙ NEON (RAM-КЭШ + ПУЛЕР + SCALE-TO-ZERO)
+# 6. БАЗА ДАННЫХ С ОПТИМИЗАЦИЕЙ NEON (RAM-КЭШ + ПУЛЕР + ПОТОКОБЕЗОПАСНОСТЬ)
 # =====================================================================
 
 class Database:
     """
-    Оптимизированный слой работы с БД (Neon PostgreSQL / SQLite):
-    1. Автоматическое использование Neon Connection Pooler (-pooler) и коротких транзакций,
-       чтобы исключить ошибки 'too many connections' и не держать соединения открытыми.
-    2. Кэширование истории и прогресса активных пользователей в RAM (_user_entries_cache):
-       при тренировке карточек/тестов бот НЕ перечитывает всю историю из БД на каждый клик,
-       а делает только 1 лёгкий INSERT и обновляет RAM-кэш. Нагрузка на чтение снижена на ~90%.
-    3. Полная совместимость с потоками через asyncio.to_thread для неблокирующей работы бота.
+    Оптимизированный и потокобезопасный слой работы с БД (Neon PostgreSQL / SQLite):
+    1. Автоматическое использование Neon Connection Pooler (-pooler) и коротких транзакций.
+    2. Потокобезопасное кэширование истории в RAM (_cache_lock + _user_entries_cache).
+    3. Оптимизированный SQL-запрос для вечерних напоминаний (1 агрегированный запрос вместо N+1).
     """
     def __init__(self, db_url: Optional[str] = DATABASE_URL, sqlite_path: str = DB_PATH):
         self.db_url = normalize_neon_pooler_url(db_url)
         self.sqlite_path = sqlite_path
         self.is_postgres = bool(self.db_url and self.db_url.startswith("postgres"))
+        self._cache_lock = threading.Lock()
         self._user_entries_cache: Dict[int, Tuple[float, List[Tuple[str, Any]]]] = {}
         self._user_settings_cache: Dict[int, Tuple[float, int, bool]] = {}
         self._cache_ttl = 600.0  # 10 минут кэша в оперативной памяти
@@ -601,12 +628,13 @@ class Database:
             return conn
 
     def invalidate_user_cache(self, user_id: Optional[int] = None):
-        if user_id is None:
-            self._user_entries_cache.clear()
-            self._user_settings_cache.clear()
-        else:
-            self._user_entries_cache.pop(user_id, None)
-            self._user_settings_cache.pop(user_id, None)
+        with self._cache_lock:
+            if user_id is None:
+                self._user_entries_cache.clear()
+                self._user_settings_cache.clear()
+            else:
+                self._user_entries_cache.pop(user_id, None)
+                self._user_settings_cache.pop(user_id, None)
 
     def init_db(self):
         conn = self.get_connection()
@@ -728,7 +756,7 @@ class Database:
         logger.info(f"База данных успешно инициализирована: {mode_str}.")
 
     def save_answer_entry(self, user_id: int, username: Optional[str], full_name: Optional[str], entry_str: str):
-        """Сохраняет детальную строку ответа в БД и мгновенно дописывает её в RAM-кэш без лишнего SELECT."""
+        """Сохраняет детальную строку ответа в БД и потокобезопасно дописывает её в RAM-кэш без лишнего SELECT."""
         now_dt = datetime.now(timezone.utc)
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -748,22 +776,24 @@ class Database:
             cursor.close()
             conn.close()
 
-        # Обновляем RAM-кэш пользователя, чтобы следующий шаг не делал SELECT из БД
-        cached = self._user_entries_cache.get(user_id)
-        if cached is not None:
-            ts_cached, rows_list = cached
-            if time.time() - ts_cached < self._cache_ttl:
-                rows_list.append((entry_str, now_dt))
-                self._user_entries_cache[user_id] = (time.time(), rows_list)
+        with self._cache_lock:
+            cached = self._user_entries_cache.get(user_id)
+            if cached is not None:
+                ts_cached, rows_list = cached
+                if time.time() - ts_cached < self._cache_ttl:
+                    new_list = list(rows_list)
+                    new_list.append((entry_str, now_dt))
+                    self._user_entries_cache[user_id] = (time.time(), new_list)
 
     def _fetch_user_entries_with_timestamps(self, user_id: int) -> List[Tuple[str, Any]]:
         """Возвращает историю (entry, created_at) из RAM-кэша или загружает её 1 раз из БД."""
         now = time.time()
-        cached = self._user_entries_cache.get(user_id)
-        if cached is not None:
-            ts_cached, rows_list = cached
-            if now - ts_cached < self._cache_ttl:
-                return list(rows_list)
+        with self._cache_lock:
+            cached = self._user_entries_cache.get(user_id)
+            if cached is not None:
+                ts_cached, rows_list = cached
+                if now - ts_cached < self._cache_ttl:
+                    return list(rows_list)
 
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -778,9 +808,10 @@ class Database:
             conn.close()
 
         result = [(str(r[0]), r[1]) for r in rows]
-        if len(self._user_entries_cache) > 2000:
-            self._user_entries_cache.clear()
-        self._user_entries_cache[user_id] = (now, result)
+        with self._cache_lock:
+            if len(self._user_entries_cache) > 2000:
+                self._user_entries_cache.clear()
+            self._user_entries_cache[user_id] = (now, result)
         return list(result)
 
     def _fetch_user_entries(self, user_id: int) -> List[str]:
@@ -882,23 +913,35 @@ class Database:
 
     @staticmethod
     def _extract_date_from_ts(raw_ts: Any, target_tz=None) -> Optional[date]:
+        """Безопасно извлекает дату с корректным переводом наивных UTC-строк SQLite в целевой часовой пояс."""
         if raw_ts is None:
             return None
         if isinstance(raw_ts, datetime):
-            if raw_ts.tzinfo is not None and target_tz is not None:
-                raw_ts = raw_ts.astimezone(target_tz)
-            return raw_ts.date()
+            dt = raw_ts
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if target_tz is not None:
+                dt = dt.astimezone(target_tz)
+            return dt.date()
         if isinstance(raw_ts, date):
             return raw_ts
         s = str(raw_ts).strip()
         if len(s) >= 10:
             try:
-                dt = datetime.fromisoformat(s[:19])
-                if dt.tzinfo is not None and target_tz is not None:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if target_tz is not None:
                     dt = dt.astimezone(target_tz)
                 return dt.date()
             except ValueError:
-                pass
+                try:
+                    dt = datetime.fromisoformat(s[:19]).replace(tzinfo=timezone.utc)
+                    if target_tz is not None:
+                        dt = dt.astimezone(target_tz)
+                    return dt.date()
+                except ValueError:
+                    pass
         return None
 
     def get_user_streak_info(self, user_id: int, reference_date: Optional[date] = None) -> Dict[str, int]:
@@ -1041,9 +1084,10 @@ class Database:
 
     def _load_user_settings_cached(self, user_id: int) -> Tuple[int, bool]:
         now = time.time()
-        cached = self._user_settings_cache.get(user_id)
-        if cached is not None and (now - cached[0] < self._cache_ttl):
-            return cached[1], cached[2]
+        with self._cache_lock:
+            cached = self._user_settings_cache.get(user_id)
+            if cached is not None and (now - cached[0] < self._cache_ttl):
+                return cached[1], cached[2]
 
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -1055,7 +1099,8 @@ class Database:
             row = cursor.fetchone()
             t_ver = int(row[0]) if row and row[0] is not None else 1
             rem_on = bool(int(row[1])) if row and row[1] is not None else True
-            self._user_settings_cache[user_id] = (now, t_ver, rem_on)
+            with self._cache_lock:
+                self._user_settings_cache[user_id] = (now, t_ver, rem_on)
             return t_ver, rem_on
         except Exception:
             return 1, True
@@ -1094,7 +1139,8 @@ class Database:
                 new_ver = int(row[0]) if row else 2
                 rem_on = bool(int(row[1])) if row and row[1] is not None else True
             conn.commit()
-            self._user_settings_cache[user_id] = (time.time(), new_ver, rem_on)
+            with self._cache_lock:
+                self._user_settings_cache[user_id] = (time.time(), new_ver, rem_on)
             return new_ver
         finally:
             cursor.close()
@@ -1121,7 +1167,8 @@ class Database:
             conn.commit()
             t_ver = int(row[0]) if row and row[0] is not None else 1
             rem_on = bool(int(row[1])) if row and row[1] is not None else True
-            self._user_settings_cache[user_id] = (time.time(), t_ver, rem_on)
+            with self._cache_lock:
+                self._user_settings_cache[user_id] = (time.time(), t_ver, rem_on)
             return rem_on
         finally:
             cursor.close()
@@ -1148,14 +1195,25 @@ class Database:
             conn.close()
 
     def get_users_for_daily_reminder(self, reference_date: Optional[date] = None) -> List[Dict[str, Any]]:
+        """
+        Выполняет проверку кандидатов на вечернее напоминание за 1 соединение с БД
+        (без N+1 коннектов в цикле), экономя ресурсы Neon.
+        """
         today_dt = reference_date or get_local_today()
         today_iso = today_dt.isoformat()
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=2)
 
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute("SELECT DISTINCT user_id FROM user_answers;")
-            all_uids = [int(r[0]) for r in cursor.fetchall() if r and r[0] is not None]
+            if self.is_postgres:
+                cursor.execute("SELECT DISTINCT user_id FROM user_answers WHERE created_at >= %s;", (cutoff_dt,))
+            else:
+                cursor.execute("SELECT DISTINCT user_id FROM user_answers WHERE created_at >= datetime('now', '-2 days');")
+            recent_uids = [int(r[0]) for r in cursor.fetchall() if r and r[0] is not None]
+
+            if not recent_uids:
+                return []
 
             cursor.execute("SELECT user_id, reminders_enabled, last_reminder_date FROM user_settings;")
             settings_map = {
@@ -1167,7 +1225,7 @@ class Database:
             conn.close()
 
         candidates = []
-        for uid in all_uids:
+        for uid in recent_uids:
             rem_enabled, last_sent = settings_map.get(uid, (True, ""))
             if not rem_enabled or last_sent == today_iso:
                 continue
@@ -1442,7 +1500,7 @@ db = Database()
 
 
 # =====================================================================
-# 6. СЕССИОННЫЙ МЕНЕДЖЕР И ВЫБОРКА КАРТОЧЕК
+# 7. СЕССИОННЫЙ МЕНЕДЖЕР И ВЫБОРКА КАРТОЧЕК
 # =====================================================================
 
 class SessionTracker:
@@ -1517,7 +1575,7 @@ def select_next_card(
 
 
 # =====================================================================
-# 7. ГЕНЕРАТОР ТЕСТОВ
+# 8. ГЕНЕРАТОР ТЕСТОВ
 # =====================================================================
 
 class TestGenerator:
@@ -1698,7 +1756,7 @@ class TestGenerator:
 
 
 # =====================================================================
-# 8. СОСТОЯНИЯ И НИЖНИЕ REPLY-КЛАВИАТУРЫ (ВЕРСИЯ 7.0)
+# 9. СОСТОЯНИЯ И НИЖНИЕ REPLY-КЛАВИАТУРЫ (100% БЕЗ ИНЛАЙН-КНОПОК)
 # =====================================================================
 
 class UserFlow(StatesGroup):
@@ -1708,6 +1766,11 @@ class UserFlow(StatesGroup):
     in_tests = State()
     in_errors_menu = State()
     in_search = State()
+    in_stats = State()
+    in_stats_reset_confirm = State()
+    in_my_teachers = State()
+    in_teacher_cabinet = State()
+    in_teacher_reset_confirm = State()
 
 
 # Константы кнопок нижней Reply-клавиатуры
@@ -1718,6 +1781,8 @@ BTN_MAIN_SEARCH = "🔎 Поиск термина"
 BTN_MAIN_STATS = "📊 Моя статистика"
 
 BTN_BACK_MAIN = "🏠 В главное меню"
+BTN_BACK_STATS = "⬅️ К статистике"
+BTN_BACK_TEACHER = "⬅️ В кабинет учителя"
 
 TOPIC_BUTTONS_MAP = {
     "🌐 Все темы": "all",
@@ -1741,12 +1806,22 @@ BTN_TEST_RESTART = "🔄 Начать заново"
 BTN_ERR_CARDS = "🗂 Проработать в карточках"
 BTN_ERR_TESTS = "🎯 Проверить в тесте"
 
+# Кнопки раздела «Моя статистика» и «Кабинет преподавателя» (полностью на нижней клавиатуре)
+BTN_STATS_WEBAPP = "📱 Открыть веб-аналитику"
+BTN_STATS_REMIND_ON = "🔔 Напоминания: Вкл"
+BTN_STATS_REMIND_OFF = "🔕 Напоминания: Выкл"
+BTN_STATS_RESET_LINK = "🔄 Сбросить ссылку"
+BTN_STATS_MY_TEACHERS = "👨‍🏫 Преподаватели"
+BTN_CONFIRM_RESET_YES = "✅ Да, обновить ссылку"
+
+BTN_TEACHER_WEBAPP = "📱 Аналитика класса"
+BTN_TEACHER_RESET_LINK = "🔄 Сбросить ссылку класса"
+
 
 class Keyboards:
     """
-    В версии 7.0 все основные игровые и навигационные экраны работают через
-    удобную нижнюю Reply-клавиатуру (под большим пальцем, как в Дайвинчике/Тиндере),
-    сохраняя при этом полную поддержку Inline-кнопок и WebApp (Telegram Mini App).
+    Все экраны бота (включая статистику, управление преподавателями, сброс ссылок и Mini App)
+    работают исключительно через нижнюю Reply-клавиатуру (0 инлайн-кнопок).
     """
     @staticmethod
     def main_menu() -> ReplyKeyboardMarkup:
@@ -1880,6 +1955,66 @@ class Keyboards:
         )
 
     @staticmethod
+    def stats_reply(student_web_url: str, reminders_on: bool) -> ReplyKeyboardMarkup:
+        reminder_label = BTN_STATS_REMIND_ON if reminders_on else BTN_STATS_REMIND_OFF
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=BTN_STATS_WEBAPP, web_app=WebAppInfo(url=student_web_url))],
+                [KeyboardButton(text=reminder_label), KeyboardButton(text=BTN_STATS_RESET_LINK)],
+                [KeyboardButton(text=BTN_STATS_MY_TEACHERS), KeyboardButton(text=BTN_BACK_MAIN)],
+            ],
+            resize_keyboard=True,
+            is_persistent=True,
+            input_field_placeholder="Управление статистикой и аналитикой..."
+        )
+
+    @staticmethod
+    def stats_reset_confirm_reply() -> ReplyKeyboardMarkup:
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=BTN_CONFIRM_RESET_YES)],
+                [KeyboardButton(text=BTN_BACK_STATS), KeyboardButton(text=BTN_BACK_MAIN)],
+            ],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
+
+    @staticmethod
+    def my_teachers_reply(teachers: List[Dict[str, Any]]) -> ReplyKeyboardMarkup:
+        rows = []
+        for t in teachers[:6]:
+            rows.append([KeyboardButton(text=f"❌ Отключить {t['teacher_code']}")])
+        rows.append([KeyboardButton(text=BTN_BACK_STATS), KeyboardButton(text=BTN_BACK_MAIN)])
+        return ReplyKeyboardMarkup(
+            keyboard=rows,
+            resize_keyboard=True,
+            is_persistent=True,
+            input_field_placeholder="Выберите действие или отправьте 8-значный код учителя..."
+        )
+
+    @staticmethod
+    def teacher_cabinet_reply(teacher_web_url: str) -> ReplyKeyboardMarkup:
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=BTN_TEACHER_WEBAPP, web_app=WebAppInfo(url=teacher_web_url))],
+                [KeyboardButton(text=BTN_TEACHER_RESET_LINK), KeyboardButton(text=BTN_BACK_MAIN)],
+            ],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
+
+    @staticmethod
+    def teacher_reset_confirm_reply() -> ReplyKeyboardMarkup:
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=BTN_CONFIRM_RESET_YES)],
+                [KeyboardButton(text=BTN_BACK_TEACHER), KeyboardButton(text=BTN_BACK_MAIN)],
+            ],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
+
+    @staticmethod
     def back_to_menu() -> ReplyKeyboardMarkup:
         return ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text=BTN_BACK_MAIN)]],
@@ -1888,22 +2023,9 @@ class Keyboards:
             input_field_placeholder="Введите запрос или вернитесь в меню..."
         )
 
-    @staticmethod
-    def stats_inline(student_web_url: str, reminders_on: bool) -> InlineKeyboardMarkup:
-        reminder_label = "🔔 Напоминания: Вкл" if reminders_on else "🔕 Напоминания: Выкл"
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📱 Открыть аналитику в Telegram (Mini App)", web_app=WebAppInfo(url=student_web_url))],
-            [InlineKeyboardButton(text="🌐 Открыть в браузере", url=student_web_url)],
-            [InlineKeyboardButton(text="🔄 Сбросить ссылку на аналитику", callback_data="stats:reset_prompt")],
-            [
-                InlineKeyboardButton(text=reminder_label, callback_data="stats:toggle_reminder"),
-                InlineKeyboardButton(text="👨‍🏫 Преподаватели", callback_data="menu:my_teachers"),
-            ],
-        ])
-
 
 # =====================================================================
-# 9. ФОРМАТИРОВАНИЕ КАРТОЧЕК И ТЕОРЕТИЧЕСКОГО ДОСЬЕ
+# 10. ФОРМАТИРОВАНИЕ КАРТОЧЕК И ТЕОРЕТИЧЕСКОГО ДОСЬЕ
 # =====================================================================
 
 def format_card_back(card: Dict[str, Any], show_detail: bool = False) -> str:
@@ -1983,7 +2105,7 @@ def format_card_back(card: Dict[str, Any], show_detail: bool = False) -> str:
 
 
 # =====================================================================
-# 10. ХЕНДЛЕРЫ БОТА (REPLY + INLINE + WEBAPP + FUZZY SEARCH)
+# 11. ХЕНДЛЕРЫ БОТА (РЕЖИМ ОДНОГО ЭКРАНА + REPLY-КЛАВИАТУРЫ)
 # =====================================================================
 
 router = Router()
@@ -2042,27 +2164,18 @@ async def handle_start(message: Message, state: FSMContext):
             )
 
     text = f"{connect_notice}🏠 *Главное меню*\n\nВыберите формат тренировки:"
-    await safe_send_markdown(message, text, reply_markup=Keyboards.main_menu())
+    await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
 
 
 @router.message(F.text.in_({BTN_BACK_MAIN, "⬅️ В главное меню", "🚪 В главное меню", "🚪 Меню", "🚪 Завершить тест"}))
 async def handle_reply_back_to_main(message: Message, state: FSMContext):
     await state.clear()
     text = "🏠 *Главное меню*\n\nВыберите формат тренировки:"
-    await safe_send_markdown(message, text, reply_markup=Keyboards.main_menu())
-
-
-@router.callback_query(F.data == "back_to_main")
-async def handle_back_to_main_cb(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    text = "🏠 *Главное меню*\n\nВыберите формат тренировки:"
-    if callback.message:
-        await safe_send_markdown(callback.message, text, reply_markup=Keyboards.main_menu())
-    await callback.answer()
+    await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
 
 
 @router.message(Command("help"))
-async def handle_help(message: Message):
+async def handle_help(message: Message, state: FSMContext):
     text = (
         "📖 *Команды бота:*\n\n"
         "/start — Главное меню\n"
@@ -2073,11 +2186,11 @@ async def handle_help(message: Message):
         "/reset\\_link — Сбросить и обновить ссылку на аналитику\n\n"
         "💡 _Чтобы подключиться к преподавателю, отправьте его 8-значный код сообщением в чат._"
     )
-    await safe_send_markdown(message, text, reply_markup=Keyboards.main_menu())
+    await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
 
 
 # ---------------------------------------------------------------------
-# УЧИТЕЛЬСКАЯ СИСТЕМА И РОТАЦИЯ ТОКЕНОВ
+# УЧИТЕЛЬСКАЯ СИСТЕМА И РОТАЦИЯ ТОКЕНОВ (НА НИЖНЕЙ КЛАВИАТУРЕ)
 # ---------------------------------------------------------------------
 
 def _build_teacher_cabinet_view(
@@ -2087,7 +2200,7 @@ def _build_teacher_cabinet_view(
     token_version: int,
     bot_username: str,
     is_new: bool = False
-) -> Tuple[str, InlineKeyboardMarkup]:
+) -> Tuple[str, ReplyKeyboardMarkup]:
     raw_dash_url = build_teacher_webapp_url(code, token_version)
     invite_url = escape_md(f"https://t.me/{bot_username}?start=t_{code}")
     dash_url = escape_md(raw_dash_url)
@@ -2099,9 +2212,9 @@ def _build_teacher_cabinet_view(
             f"🔑 Ваш личный 8-значный код: `{escape_md(code)}`\n\n"
             f"👥 *Ссылка для учеников (отправьте её классу):*\n"
             f"{invite_url}\n\n"
-            f"📊 *Ваша онлайн-аналитика класса:*\n"
+            f"📊 *Ваша онлайн-аналитика класса (для ПК/браузера):*\n"
             f"{dash_url}\n\n"
-            f"💡 _Ученики могут перейти по ссылке или отправить в чат бота ваш код_ `{escape_md(code)}`."
+            f"💡 _На телефоне нажмите кнопку «📱 Аналитика класса» внизу экрана._"
         )
     else:
         text = (
@@ -2111,20 +2224,17 @@ def _build_teacher_cabinet_view(
             f"👥 Подключено учеников: *{st_count}*\n\n"
             f"🔗 *Ссылка для учеников (отправьте в чат класса):*\n"
             f"{invite_url}\n\n"
-            f"📊 *Ваша онлайн-аналитика класса:*\n"
+            f"📊 *Онлайн-аналитика класса (для ПК/браузера):*\n"
             f"{dash_url}"
         )
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📱 Открыть аналитику класса (Mini App)", web_app=WebAppInfo(url=raw_dash_url))],
-        [InlineKeyboardButton(text="🌐 Открыть в браузере", url=raw_dash_url)],
-        [InlineKeyboardButton(text="🔄 Сбросить ссылку на аналитику класса", callback_data="teacher:reset_prompt")],
-    ])
+    keyboard = Keyboards.teacher_cabinet_reply(raw_dash_url)
     return text, keyboard
 
 
 @router.message(Command("teacher"))
-async def handle_teacher_profile(message: Message):
+@router.message(F.text == BTN_BACK_TEACHER)
+async def handle_teacher_profile(message: Message, state: FSMContext):
     if not message.from_user:
         return
     user_id = message.from_user.id
@@ -2133,6 +2243,8 @@ async def handle_teacher_profile(message: Message):
     bot_info = await message.bot.get_me()
     bot_username = bot_info.username or "obshaga_bot"
 
+    await state.set_state(UserFlow.in_teacher_cabinet)
+
     if existing:
         code = existing["teacher_code"]
         st_count = await asyncio.to_thread(db.get_teacher_students_count, code)
@@ -2140,7 +2252,7 @@ async def handle_teacher_profile(message: Message):
         text, kb = _build_teacher_cabinet_view(
             existing["full_name"], code, st_count, t_ver, bot_username, is_new=False
         )
-        await safe_send_markdown(message, text, reply_markup=kb)
+        await render_single_screen(message, state, text, reply_markup=kb)
         return
 
     user = message.from_user
@@ -2149,78 +2261,61 @@ async def handle_teacher_profile(message: Message):
     text, kb = _build_teacher_cabinet_view(
         full_name, code, 0, 1, bot_username, is_new=True
     )
-    await safe_send_markdown(message, text, reply_markup=kb)
+    await render_single_screen(message, state, text, reply_markup=kb)
 
 
-@router.callback_query(F.data == "teacher:reset_prompt")
-async def handle_teacher_reset_prompt(callback: CallbackQuery):
-    existing = await asyncio.to_thread(db.get_teacher_by_user_id, callback.from_user.id)
+@router.message(StateFilter(UserFlow.in_teacher_cabinet), F.text == BTN_TEACHER_RESET_LINK)
+async def handle_teacher_reset_prompt_reply(message: Message, state: FSMContext):
+    if not message.from_user:
+        return
+    existing = await asyncio.to_thread(db.get_teacher_by_user_id, message.from_user.id)
     if not existing:
-        await callback.answer("Профиль преподавателя не найден.", show_alert=True)
+        await state.clear()
+        await render_single_screen(message, state, "Профиль преподавателя не найден.", reply_markup=Keyboards.main_menu())
         return
 
+    await state.set_state(UserFlow.in_teacher_reset_confirm)
     text = (
         "🔐 *Сброс ссылки на аналитику класса*\n\n"
         "Вы уверены, что хотите выпустить новую ссылку для кабинета преподавателя?\n"
         "Предыдущая ссылка сразу перестанет работать на всех устройствах "
         "(8-значный код класса для учеников останется прежним)."
     )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, выпустить новую ссылку", callback_data="teacher:reset_confirm")],
-        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="teacher:view")],
-    ])
-    await safe_edit_text(callback.message, text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
-    await callback.answer()
+    await render_single_screen(message, state, text, reply_markup=Keyboards.teacher_reset_confirm_reply())
 
 
-@router.callback_query(F.data == "teacher:view")
-async def handle_teacher_view_cb(callback: CallbackQuery):
-    existing = await asyncio.to_thread(db.get_teacher_by_user_id, callback.from_user.id)
-    if not existing:
-        await callback.answer("Профиль преподавателя не найден.", show_alert=True)
+@router.message(StateFilter(UserFlow.in_teacher_reset_confirm), F.text == BTN_CONFIRM_RESET_YES)
+async def handle_teacher_reset_confirm_reply(message: Message, state: FSMContext):
+    if not message.from_user:
         return
-    bot_info = await callback.bot.get_me()
-    bot_username = bot_info.username or "obshaga_bot"
-    code = existing["teacher_code"]
-    st_count = await asyncio.to_thread(db.get_teacher_students_count, code)
-    t_ver = existing.get("token_version", 1)
-    text, kb = _build_teacher_cabinet_view(existing["full_name"], code, st_count, t_ver, bot_username, is_new=False)
-    await safe_edit_text(callback.message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "teacher:reset_confirm")
-async def handle_teacher_reset_confirm(callback: CallbackQuery):
-    res = await asyncio.to_thread(db.rotate_teacher_token, callback.from_user.id)
+    res = await asyncio.to_thread(db.rotate_teacher_token, message.from_user.id)
     if not res:
-        await callback.answer("Профиль преподавателя не найден.", show_alert=True)
+        await state.clear()
+        await render_single_screen(message, state, "Профиль преподавателя не найден.", reply_markup=Keyboards.main_menu())
         return
 
     code, new_ver = res
-    existing = await asyncio.to_thread(db.get_teacher_by_user_id, callback.from_user.id)
-    bot_info = await callback.bot.get_me()
+    existing = await asyncio.to_thread(db.get_teacher_by_user_id, message.from_user.id)
+    bot_info = await message.bot.get_me()
     bot_username = bot_info.username or "obshaga_bot"
     st_count = await asyncio.to_thread(db.get_teacher_students_count, code)
     full_name = existing["full_name"] if existing else f"Преподаватель {code}"
 
+    await state.set_state(UserFlow.in_teacher_cabinet)
     text, kb = _build_teacher_cabinet_view(full_name, code, st_count, new_ver, bot_username, is_new=False)
     text = "✅ *Ссылка на аналитику класса успешно обновлена!*\n\n" + text
-    await safe_edit_text(callback.message, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-    await callback.answer("Новая ссылка выпущена!")
+    await render_single_screen(message, state, text, reply_markup=kb)
 
 
 @router.message(Command("reset_link"))
-async def handle_reset_link_command(message: Message):
+async def handle_reset_link_command(message: Message, state: FSMContext):
     if not message.from_user:
         return
     user_id = message.from_user.id
     new_student_ver = await asyncio.to_thread(db.rotate_user_token, user_id)
+    reminders_on = await asyncio.to_thread(db.get_user_reminders_enabled, user_id)
     student_url = build_student_webapp_url(user_id, new_student_ver)
 
-    buttons = [
-        [InlineKeyboardButton(text="📱 Открыть аналитику в Telegram (Mini App)", web_app=WebAppInfo(url=student_url))],
-        [InlineKeyboardButton(text="🌐 Открыть в браузере", url=student_url)],
-    ]
     lines = [
         "🔐 *Ссылка на аналитику успешно обновлена!*\n",
         "Все старые ссылки отозваны и больше не открываются.\n",
@@ -2232,138 +2327,134 @@ async def handle_reset_link_command(message: Message):
         t_code, new_t_ver = teacher_res
         teacher_url = build_teacher_webapp_url(t_code, new_t_ver)
         lines.append(f"\n👨‍🏫 *Новая ссылка аналитики класса ({escape_md(t_code)}):*\n{escape_md(teacher_url)}")
-        buttons.append([InlineKeyboardButton(text="👨‍🏫 Аналитика класса (Mini App)", web_app=WebAppInfo(url=teacher_url))])
 
-    await safe_send_markdown(
+    await state.set_state(UserFlow.in_stats)
+    await render_single_screen(
         message,
+        state,
         "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        reply_markup=Keyboards.stats_reply(student_url, reminders_on),
+    )
+
+
+async def _show_student_teachers_screen(message: Message, state: FSMContext, user_id: int, prefix_note: str = ""):
+    teachers = await asyncio.to_thread(db.get_student_teachers, user_id)
+    await state.set_state(UserFlow.in_my_teachers)
+    if not teachers:
+        text = (
+            f"{prefix_note}"
+            "ℹ️ *Вы пока не прикреплены ни к одному преподавателю.*\n\n"
+            "Чтобы подключиться, просто отправьте его 8-значный код сообщением в этот чат."
+        )
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=BTN_BACK_STATS), KeyboardButton(text=BTN_BACK_MAIN)]],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
+        await render_single_screen(message, state, text, reply_markup=kb)
+        return
+
+    lines = [f"{prefix_note}👨‍🏫 *Ваши преподаватели:*\n"]
+    for idx, t in enumerate(teachers, 1):
+        lines.append(f"{idx}. *{strip_md_delimiters(t['full_name'])}* (код `{escape_md(t['teacher_code'])}`)")
+    lines.append("\n_Чтобы отключиться от преподавателя, нажмите соответствующую кнопку внизу:_")
+
+    await render_single_screen(
+        message,
+        state,
+        "\n".join(lines),
+        reply_markup=Keyboards.my_teachers_reply(teachers)
     )
 
 
 @router.message(Command("teachers"))
-async def handle_teachers_list(message: Message):
+@router.message(F.text == BTN_STATS_MY_TEACHERS)
+async def handle_teachers_list(message: Message, state: FSMContext):
     if not message.from_user:
         return
-    teachers = await asyncio.to_thread(db.get_student_teachers, message.from_user.id)
-    if not teachers:
-        await safe_send_markdown(
-            message,
-            "ℹ️ Вы пока не прикреплены ни к одному преподавателю.\n\n"
-            "Чтобы подключиться, отправьте его 8-значный код сообщением в этот чат.",
-            reply_markup=Keyboards.main_menu()
-        )
+    await _show_student_teachers_screen(message, state, message.from_user.id)
+
+
+@router.message(F.text.regexp(r"^❌ Отключить (\d{8})$"))
+async def handle_unlink_teacher_reply(message: Message, state: FSMContext):
+    if not message.from_user or not message.text:
         return
+    m = re.match(r"^❌ Отключить (\d{8})$", message.text.strip())
+    if not m:
+        return
+    code = m.group(1)
+    teacher = await asyncio.to_thread(db.get_teacher, code)
+    t_name = teacher["full_name"] if teacher else f"Код {code}"
+    await asyncio.to_thread(db.disconnect_student_from_teacher, message.from_user.id, code)
 
-    buttons = []
-    lines = ["👨‍🏫 *Ваши преподаватели:*\n"]
-    for idx, t in enumerate(teachers, 1):
-        lines.append(f"{idx}. *{strip_md_delimiters(t['full_name'])}* (код `{escape_md(t['teacher_code'])}`)")
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"❌ Отключить: {t['full_name'][:25]}",
-                callback_data=f"teacher:unlink:{t['teacher_code']}"
-            )
-        ])
-
-    text = "\n".join(lines) + "\n\n_Нажмите кнопку ниже, если хотите отключиться от преподавателя:_"
-    await safe_send_markdown(message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    note = f"✅ *Отключено от преподавателя:* {strip_md_delimiters(t_name)} (`{escape_md(code)}`)\n\n"
+    await _show_student_teachers_screen(message, state, message.from_user.id, prefix_note=note)
 
 
 @router.message(F.text.regexp(r"^\s*\d{8}\s*$"))
-async def handle_teacher_code_input(message: Message):
+async def handle_teacher_code_input(message: Message, state: FSMContext):
     if not message.from_user or not message.text:
         return
     code = message.text.strip()
     teacher = await asyncio.to_thread(db.get_teacher, code)
     if not teacher:
-        await safe_send_markdown(
+        await render_single_screen(
             message,
+            state,
             f"❌ Преподаватель с кодом `{escape_md(code)}` не найден.\n"
             f"Проверьте правильность ввода 8 цифр.",
+            reply_markup=Keyboards.main_menu()
         )
         return
 
     if teacher["user_id"] == message.from_user.id:
-        await safe_send_markdown(
+        await render_single_screen(
             message,
+            state,
             "❌ Вы не можете прикрепиться к своему собственному классу в качестве ученика.",
+            reply_markup=Keyboards.main_menu()
         )
         return
 
     if await asyncio.to_thread(db.is_student_connected, message.from_user.id, code):
-        await safe_send_markdown(
+        await render_single_screen(
             message,
+            state,
             f"ℹ️ Вы уже подключены к преподавателю *{strip_md_delimiters(teacher['full_name'])}* (код `{escape_md(code)}`).",
+            reply_markup=Keyboards.main_menu()
         )
         return
 
     await asyncio.to_thread(db.connect_student_to_teacher, message.from_user.id, code)
-    await safe_send_markdown(
+    await render_single_screen(
         message,
+        state,
         f"✅ *Преподаватель найден:*\n"
         f"*{strip_md_delimiters(teacher['full_name'])}* (код `{escape_md(code)}`).\n\n"
         f"Вы успешно подключены! Ваш прогресс теперь отображается в ведомости класса.",
-    )
-
-
-@router.callback_query(F.data.startswith("teacher:unlink:"))
-async def handle_unlink_teacher(callback: CallbackQuery):
-    parts = (callback.data or "").split(":")
-    if len(parts) < 3:
-        await callback.answer("Некорректный код преподавателя.", show_alert=True)
-        return
-    code = parts[2]
-    teacher = await asyncio.to_thread(db.get_teacher, code)
-    t_name = teacher["full_name"] if teacher else f"Код {code}"
-    await asyncio.to_thread(db.disconnect_student_from_teacher, callback.from_user.id, code)
-    await callback.answer(f"Отключено от {t_name}", show_alert=True)
-
-    teachers = await asyncio.to_thread(db.get_student_teachers, callback.from_user.id)
-    if not teachers:
-        await safe_edit_text(
-            callback.message,
-            "ℹ️ Вы отключились от всех преподавателей.\n\n"
-            "Чтобы подключиться снова, просто отправьте 8-значный код преподавателя.",
-            reply_markup=None,
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-
-    buttons = []
-    lines = ["👨‍🏫 *Ваши преподаватели:*\n"]
-    for idx, t in enumerate(teachers, 1):
-        lines.append(f"{idx}. *{strip_md_delimiters(t['full_name'])}* (код `{escape_md(t['teacher_code'])}`)")
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"❌ Отключить: {t['full_name'][:25]}",
-                callback_data=f"teacher:unlink:{t['teacher_code']}"
-            )
-        ])
-    text = "\n".join(lines) + "\n\n_Нажмите кнопку ниже, чтобы отключиться от преподавателя:_"
-    await safe_edit_text(
-        callback.message,
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode=ParseMode.MARKDOWN
+        reply_markup=Keyboards.main_menu()
     )
 
 
 # ---------------------------------------------------------------------
-# СТАТИСТИКА И ОТКРЫТИЕ TELEGRAM MINI APP (WEBAPP)
+# СТАТИСТИКА И TELEGRAM MINI APP (100% НА НИЖНЕЙ КЛАВИАТУРЕ)
 # ---------------------------------------------------------------------
 
-def _build_stats_view_sync(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+def _build_stats_view_sync(user_id: int, prefix_notice: str = "") -> Tuple[str, ReplyKeyboardMarkup]:
     stats = db.get_user_stats(user_id)
     token_ver = db.get_user_token_version(user_id)
     reminders_on = db.get_user_reminders_enabled(user_id)
     student_web_url = build_student_webapp_url(user_id, token_ver)
 
+    rem_status = "Включены 🔔" if reminders_on else "Отключены 🔕"
+
     text = (
+        f"{prefix_notice}"
         "📊 *Ваша статистика изучения*\n\n"
         "🔥 *Регулярность и серия занятий:*\n"
         f"• Текущая серия: *{stats['current_streak']} дн. подряд* (рекорд: *{stats['best_streak']} дн.*)\n"
-        f"• Действий сегодня: *{stats['today_actions']}* | Активных дней за год: *{stats['active_days_year']}*\n\n"
+        f"• Действий сегодня: *{stats['today_actions']}* | Активных дней за год: *{stats['active_days_year']}*\n"
+        f"• Вечерние напоминания: *{rem_status}*\n\n"
         "🗂 *Карточки:*\n"
         f"• Всего ответов: *{stats['cards_count']}*\n"
         f"• 🟢 Выучено надёжно: *{stats['learned']}*\n"
@@ -2372,87 +2463,54 @@ def _build_stats_view_sync(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
         "🎯 *Тесты:*\n"
         f"• Вопросов решено: *{stats['tests_count']}*\n"
         f"• Точность: *{stats['tests_accuracy']}%* ({stats['tests_correct']} верно / {stats['tests_errors']} ошибок)\n"
-        f"• Среднее время: *{stats['tests_avg_time']} сек*"
+        f"• Среднее время: *{stats['tests_avg_time']} сек*\n\n"
+        f"🌐 *Ссылка на веб-аналитику (для ПК и браузера):*\n{escape_md(student_web_url)}"
     )
-    keyboard = Keyboards.stats_inline(student_web_url, reminders_on)
+    keyboard = Keyboards.stats_reply(student_web_url, reminders_on)
     return text, keyboard
 
 
-@router.message(F.text == BTN_MAIN_STATS)
-async def handle_show_stats_msg(message: Message):
+@router.message(F.text.in_({BTN_MAIN_STATS, BTN_BACK_STATS}))
+async def handle_show_stats_msg(message: Message, state: FSMContext):
     if not message.from_user:
         return
-    text, inline_kb = await asyncio.to_thread(_build_stats_view_sync, message.from_user.id)
-    await safe_send_markdown(message, text, reply_markup=inline_kb)
+    await state.set_state(UserFlow.in_stats)
+    text, reply_kb = await asyncio.to_thread(_build_stats_view_sync, message.from_user.id)
+    await render_single_screen(message, state, text, reply_markup=reply_kb)
 
 
-@router.callback_query(F.data == "menu:stats")
-async def handle_show_stats_cb(callback: CallbackQuery):
-    text, inline_kb = await asyncio.to_thread(_build_stats_view_sync, callback.from_user.id)
-    await safe_edit_text(callback.message, text, reply_markup=inline_kb, parse_mode=ParseMode.MARKDOWN)
-    await callback.answer()
+@router.message(F.text.in_({BTN_STATS_REMIND_ON, BTN_STATS_REMIND_OFF}))
+async def handle_toggle_reminder_reply(message: Message, state: FSMContext):
+    if not message.from_user:
+        return
+    new_state = await asyncio.to_thread(db.toggle_user_reminders, message.from_user.id)
+    notice = "🔔 *Ежедневные напоминания включены!*\n\n" if new_state else "🔕 *Ежедневные напоминания отключены.*\n\n"
+    await state.set_state(UserFlow.in_stats)
+    text, reply_kb = await asyncio.to_thread(_build_stats_view_sync, message.from_user.id, notice)
+    await render_single_screen(message, state, text, reply_markup=reply_kb)
 
 
-@router.callback_query(F.data == "stats:toggle_reminder")
-async def handle_toggle_reminder(callback: CallbackQuery):
-    new_state = await asyncio.to_thread(db.toggle_user_reminders, callback.from_user.id)
-    text, keyboard = await asyncio.to_thread(_build_stats_view_sync, callback.from_user.id)
-    await safe_edit_text(callback.message, text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
-    toast = "🔔 Ежедневные напоминания включены" if new_state else "🔕 Напоминания отключены"
-    await callback.answer(toast, show_alert=False)
-
-
-@router.callback_query(F.data == "stats:reset_prompt")
-async def handle_stats_reset_prompt(callback: CallbackQuery):
+@router.message(F.text == BTN_STATS_RESET_LINK)
+async def handle_stats_reset_prompt_reply(message: Message, state: FSMContext):
+    await state.set_state(UserFlow.in_stats_reset_confirm)
     text = (
         "🔐 *Сброс персональной ссылки на аналитику*\n\n"
         "Вы уверены, что хотите выпустить новую ссылку?\n"
         "Предыдущая ссылка сразу перестанет открываться на всех устройствах."
     )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, обновить ссылку", callback_data="stats:reset_confirm")],
-        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="menu:stats")],
-    ])
-    await safe_edit_text(callback.message, text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
-    await callback.answer()
+    await render_single_screen(message, state, text, reply_markup=Keyboards.stats_reset_confirm_reply())
 
 
-@router.callback_query(F.data == "stats:reset_confirm")
-async def handle_stats_reset_confirm(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    await asyncio.to_thread(db.rotate_user_token, user_id)
-    text, keyboard = await asyncio.to_thread(_build_stats_view_sync, user_id)
-    text = "✅ *Ваша ссылка на аналитику успешно обновлена!*\n\n" + text
-    await safe_edit_text(callback.message, text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
-    await callback.answer("Ссылка успешно обновлена!")
-
-
-@router.callback_query(F.data == "menu:my_teachers")
-async def handle_cb_my_teachers(callback: CallbackQuery):
-    teachers = await asyncio.to_thread(db.get_student_teachers, callback.from_user.id)
-    if not teachers:
-        await callback.answer("У вас пока нет прикреплённых преподавателей. Отправьте 8-значный код учителя в чат!", show_alert=True)
+@router.message(StateFilter(UserFlow.in_stats_reset_confirm), F.text == BTN_CONFIRM_RESET_YES)
+async def handle_stats_reset_confirm_reply(message: Message, state: FSMContext):
+    if not message.from_user:
         return
-
-    buttons = []
-    lines = ["👨‍🏫 *Ваши преподаватели:*\n"]
-    for idx, t in enumerate(teachers, 1):
-        lines.append(f"{idx}. *{strip_md_delimiters(t['full_name'])}* (код `{escape_md(t['teacher_code'])}`)")
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"❌ Отключить: {t['full_name'][:25]}",
-                callback_data=f"teacher:unlink:{t['teacher_code']}"
-            )
-        ])
-    buttons.append([InlineKeyboardButton(text="⬅️ К статистике", callback_data="menu:stats")])
-    text = "\n".join(lines) + "\n\n_Нажмите кнопку ниже, чтобы отключить преподавателя:_"
-    await safe_edit_text(
-        callback.message,
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode=ParseMode.MARKDOWN
-    )
-    await callback.answer()
+    user_id = message.from_user.id
+    await asyncio.to_thread(db.rotate_user_token, user_id)
+    await state.set_state(UserFlow.in_stats)
+    notice = "✅ *Ваша ссылка на аналитику успешно обновлена! Старая ссылка больше недействительна.*\n\n"
+    text, reply_kb = await asyncio.to_thread(_build_stats_view_sync, user_id, notice)
+    await render_single_screen(message, state, text, reply_markup=reply_kb)
 
 
 # ---------------------------------------------------------------------
@@ -2463,13 +2521,13 @@ async def handle_cb_my_teachers(callback: CallbackQuery):
 @router.message(F.text == BTN_MAIN_SEARCH)
 async def handle_search_start(message: Message, state: FSMContext):
     await state.set_state(UserFlow.in_search)
-    await state.update_data(search_last_code=None)
+    await state.update_data(search_last_code=None, search_other_codes=[])
     text = (
         "🔎 *Поиск термина*\n\n"
         "Введите название понятия (минимум *3 буквы*).\n"
         "Даже если вы допустите опечатку (например, _«ифлянция»_ или _«стратификацыя»_), бот поймёт вас и найдёт нужный термин:"
     )
-    await safe_send_markdown(message, text, reply_markup=Keyboards.back_to_menu())
+    await render_single_screen(message, state, text, reply_markup=Keyboards.back_to_menu())
 
 
 @router.message(StateFilter(UserFlow.in_search), F.text == BTN_CARD_DETAIL)
@@ -2477,13 +2535,16 @@ async def handle_search_detail_button(message: Message, state: FSMContext):
     data = await state.get_data()
     code = data.get("search_last_code")
     if not code:
-        await safe_send_markdown(message, "Введите название термина для поиска (от 3 букв):", reply_markup=Keyboards.back_to_menu())
+        await render_single_screen(message, state, "Введите название термина для поиска (от 3 букв):", reply_markup=Keyboards.back_to_menu())
         return
     card = catalog.get_by_code(code)
     if not card:
         return
+    other_codes = data.get("search_other_codes") or []
+    other_terms = [catalog.get_by_code(c) for c in other_codes if catalog.get_by_code(c)]
     text = format_card_back(card, show_detail=True)
-    await safe_send_markdown(message, text, reply_markup=Keyboards.back_to_menu())
+    kb = Keyboards.search_results_keyboard(other_terms, show_detail_btn=False)
+    await render_single_screen(message, state, text, reply_markup=kb)
 
 
 @router.message(StateFilter(UserFlow.in_search), F.text)
@@ -2496,8 +2557,9 @@ async def handle_search_query(message: Message, state: FSMContext):
 
     clean_q = _normalize_search_str(raw_q).strip()
     if len(clean_q) < 3:
-        await safe_send_markdown(
+        await render_single_screen(
             message,
+            state,
             "⚠️ Введите хотя бы *3 буквы*, чтобы я мог точно найти термин.",
             reply_markup=Keyboards.back_to_menu()
         )
@@ -2505,8 +2567,9 @@ async def handle_search_query(message: Message, state: FSMContext):
 
     matches = catalog.search_terms_fuzzy(raw_q, limit=6)
     if not matches:
-        await safe_send_markdown(
+        await render_single_screen(
             message,
+            state,
             f"😕 По запросу «*{escape_md(raw_q)}*» ничего не найдено.\nПопробуйте написать слово иначе или введите первые 3–4 буквы корня:",
             reply_markup=Keyboards.back_to_menu()
         )
@@ -2515,8 +2578,10 @@ async def handle_search_query(message: Message, state: FSMContext):
     top_term, top_score = matches[0]
     other_terms = [m[0] for m in matches[1:] if m[1] >= 0.52]
 
-    # Если совпадение уверенное — сразу показываем карточку лучшего термина + кнопки похожих
-    await state.update_data(search_last_code=top_term["code"])
+    await state.update_data(
+        search_last_code=top_term["code"],
+        search_other_codes=[t["code"] for t in other_terms[:4]]
+    )
     typo_note = ""
     if _normalize_search_str(raw_q) not in _normalize_search_str(top_term["term"]):
         typo_note = f"✨ _Найдено с учётом опечатки ({int(top_score * 100)}% совпадение):_\n\n"
@@ -2527,7 +2592,7 @@ async def handle_search_query(message: Message, state: FSMContext):
         card_text += f"\n\n🔎 *Похожие понятия:* {similar_names}"
 
     kb = Keyboards.search_results_keyboard(other_terms, show_detail_btn=True)
-    await safe_send_markdown(message, card_text, reply_markup=kb)
+    await render_single_screen(message, state, card_text, reply_markup=kb)
 
 
 # ---------------------------------------------------------------------
@@ -2570,7 +2635,7 @@ async def handle_work_errors_command(message: Message, state: FSMContext):
     await state.clear()
     text, kb = await asyncio.to_thread(_build_errors_workout_screen_sync, message.from_user.id)
     await state.set_state(UserFlow.in_errors_menu)
-    await safe_send_markdown(message, text, reply_markup=kb)
+    await render_single_screen(message, state, text, reply_markup=kb)
 
 
 @router.message(F.text.in_({BTN_ERR_CARDS, BTN_ERR_TESTS}))
@@ -2581,8 +2646,9 @@ async def handle_errors_start_reply(message: Message, state: FSMContext):
     problem_codes = await asyncio.to_thread(db.get_problem_term_codes, message.from_user.id)
     if not problem_codes:
         await state.clear()
-        await safe_send_markdown(
+        await render_single_screen(
             message,
+            state,
             "🎉 Все проблемные термины уже разобраны!",
             reply_markup=Keyboards.main_menu(),
         )
@@ -2622,7 +2688,7 @@ async def handle_main_mode_reply(message: Message, state: FSMContext):
 
     mode_name = "🗂 Карточки" if mode == "cards" else "🎯 Тесты"
     text = f"*{mode_name}*\n\nВыберите тему кодификатора:"
-    await safe_send_markdown(message, text, reply_markup=Keyboards.topic_selection(mode))
+    await render_single_screen(message, state, text, reply_markup=Keyboards.topic_selection(mode))
 
 
 @router.message(StateFilter(UserFlow.selecting_topic), F.text.in_(set(TOPIC_BUTTONS_MAP.keys())))
@@ -2643,7 +2709,7 @@ async def handle_topic_selection_reply(message: Message, state: FSMContext):
         await state.set_state(UserFlow.in_tests)
         available = catalog.get_terms(module_filter)
         if not available:
-            await safe_send_markdown(message, "❌ В выбранном модуле пока недостаточно терминов.", reply_markup=Keyboards.main_menu())
+            await render_single_screen(message, state, "❌ В выбранном модуле пока недостаточно терминов.", reply_markup=Keyboards.main_menu())
             return
 
         pool = [t["code"] for t in available]
@@ -2659,7 +2725,7 @@ async def handle_topic_selection_reply(message: Message, state: FSMContext):
 
 
 # ---------------------------------------------------------------------
-# КАРТОЧКИ НА НИЖНЕЙ REPLY-КЛАВИАТУРЕ
+# КАРТОЧКИ НА НИЖНЕЙ REPLY-КЛАВИАТУРЕ (В 1 СООБЩЕНИЕ)
 # ---------------------------------------------------------------------
 
 async def send_next_flashcard_msg(message: Message, user_id: int, state: FSMContext):
@@ -2676,13 +2742,13 @@ async def send_next_flashcard_msg(message: Message, user_id: int, state: FSMCont
                 "🎉 *Работа над ошибками завершена!*\n\n"
                 "Вы успешно закрыли все проблемные термины."
             )
-            await safe_send_markdown(message, done_text, reply_markup=Keyboards.main_menu())
+            await render_single_screen(message, state, done_text, reply_markup=Keyboards.main_menu())
             return
 
     card = await asyncio.to_thread(select_next_card, user_id, module_filter, custom_codes)
     if not card:
         await state.clear()
-        await safe_send_markdown(message, "❌ В выбранном модуле пока нет терминов.", reply_markup=Keyboards.main_menu())
+        await render_single_screen(message, state, "❌ В выбранном модуле пока нет терминов.", reply_markup=Keyboards.main_menu())
         return
 
     shown_at = time.time()
@@ -2697,7 +2763,7 @@ async def send_next_flashcard_msg(message: Message, user_id: int, state: FSMCont
         f"✨ *{term_title}*\n\n"
         f"💭 _Вспомните родовое понятие и ключевые признаки термина._"
     )
-    await safe_send_markdown(message, text, reply_markup=Keyboards.flashcard_front(card["code"]))
+    await render_single_screen(message, state, text, reply_markup=Keyboards.flashcard_front(card["code"]))
 
 
 @router.message(StateFilter(UserFlow.in_flashcards), F.text == BTN_CARD_FLIP)
@@ -2719,7 +2785,7 @@ async def handle_card_reveal_reply(message: Message, state: FSMContext):
         await state.update_data(revealed_elapsed=revealed_elapsed)
 
     text = format_card_back(card, show_detail=False)
-    await safe_send_markdown(message, text, reply_markup=Keyboards.flashcard_back(code, has_detail=False))
+    await render_single_screen(message, state, text, reply_markup=Keyboards.flashcard_back(code, has_detail=False))
 
 
 @router.message(StateFilter(UserFlow.in_flashcards), F.text == BTN_CARD_DETAIL)
@@ -2733,7 +2799,7 @@ async def handle_card_detail_reply(message: Message, state: FSMContext):
         return
 
     text = format_card_back(card, show_detail=True)
-    await safe_send_markdown(message, text, reply_markup=Keyboards.flashcard_back(code, has_detail=True))
+    await render_single_screen(message, state, text, reply_markup=Keyboards.flashcard_back(code, has_detail=True))
 
 
 @router.message(StateFilter(UserFlow.in_flashcards), F.text.in_({BTN_CARD_KNOW, BTN_CARD_UNSURE, BTN_CARD_FORGOT}))
@@ -2774,7 +2840,7 @@ async def handle_card_answer_reply(message: Message, state: FSMContext):
 
 
 # ---------------------------------------------------------------------
-# ТЕСТЫ НА НИЖНЕЙ REPLY-КЛАВИАТУРЕ
+# ТЕСТЫ НА НИЖНЕЙ REPLY-КЛАВИАТУРЕ (В 1 СООБЩЕНИЕ)
 # ---------------------------------------------------------------------
 
 async def send_next_test_msg(message: Message, state: FSMContext):
@@ -2787,7 +2853,7 @@ async def send_next_test_msg(message: Message, state: FSMContext):
         total = data.get("test_total_in_session", 0)
         if total <= 0:
             await state.clear()
-            await safe_send_markdown(message, "❌ В выбранном модуле пока недостаточно терминов.", reply_markup=Keyboards.main_menu())
+            await render_single_screen(message, state, "❌ В выбранном модуле пока недостаточно терминов.", reply_markup=Keyboards.main_menu())
             return
 
         correct = data.get("test_session_correct", 0)
@@ -2803,7 +2869,7 @@ async def send_next_test_msg(message: Message, state: FSMContext):
             f"🎯 *Результат:* {correct} верно / {err_count} ошибок (*{pct}%*)\n"
             f"⏱ *Среднее время:* {avg_t} сек"
         )
-        await safe_send_markdown(message, text, reply_markup=Keyboards.test_finish(has_errors=bool(errors)))
+        await render_single_screen(message, state, text, reply_markup=Keyboards.test_finish(has_errors=bool(errors)))
         return
 
     next_code = pool.pop()
@@ -2813,7 +2879,7 @@ async def send_next_test_msg(message: Message, state: FSMContext):
     if not card:
         if not catalog.all_terms:
             await state.clear()
-            await safe_send_markdown(message, "❌ База терминов пуста.", reply_markup=Keyboards.main_menu())
+            await render_single_screen(message, state, "❌ База терминов пуста.", reply_markup=Keyboards.main_menu())
             return
         card = catalog.all_terms[0]
 
@@ -2830,7 +2896,7 @@ async def send_next_test_msg(message: Message, state: FSMContext):
         f"{workout_badge}🎯 *Тест: {mod_title}* `[{curr_num}/{total_num}]`\n\n"
         f"{test_data['question_text']}"
     )
-    await safe_send_markdown(message, text, reply_markup=Keyboards.test_options(card["code"], test_data["options"]))
+    await render_single_screen(message, state, text, reply_markup=Keyboards.test_options(card["code"], test_data["options"]))
 
 
 @router.message(StateFilter(UserFlow.in_tests), F.text.in_({"1", "2", "3", "4"}))
@@ -2909,7 +2975,7 @@ async def handle_test_answer_reply(message: Message, state: FSMContext):
     if elapsed < SpacedRepetitionAlgorithm.MIN_TIME_WINDOW:
         text += "\n\n⚡️ _Ответ < 3 сек (мисклик) — не учтён в общей статистике._"
 
-    await safe_send_markdown(message, text, reply_markup=Keyboards.test_next())
+    await render_single_screen(message, state, text, reply_markup=Keyboards.test_next())
 
 
 @router.message(StateFilter(UserFlow.in_tests), F.text == BTN_TEST_NEXT)
@@ -2922,7 +2988,7 @@ async def handle_test_show_errors_reply(message: Message, state: FSMContext):
     data = await state.get_data()
     errors = data.get("test_session_errors", [])
     if not errors:
-        await safe_send_markdown(message, "🎉 Ошибок нет — 100% результат!", reply_markup=Keyboards.test_finish(has_errors=False))
+        await render_single_screen(message, state, "🎉 Ошибок нет — 100% результат!", reply_markup=Keyboards.test_finish(has_errors=False))
         return
 
     lines = ["📝 *Разбор ваших ошибок в этом тесте:*\n"]
@@ -2941,7 +3007,7 @@ async def handle_test_show_errors_reply(message: Message, state: FSMContext):
         lines.append(f"_...и ещё {len(errors) - 8} ошибок._")
 
     text = "\n".join(lines)
-    await safe_send_markdown(message, text, reply_markup=Keyboards.test_finish(has_errors=False))
+    await render_single_screen(message, state, text, reply_markup=Keyboards.test_finish(has_errors=False))
 
 
 @router.message(StateFilter(UserFlow.in_tests), F.text == BTN_TEST_RESTART)
@@ -2956,14 +3022,14 @@ async def handle_test_restart_reply(message: Message, state: FSMContext):
         custom_codes = await asyncio.to_thread(db.get_problem_term_codes, message.from_user.id)
         if not custom_codes:
             await state.clear()
-            await safe_send_markdown(message, "🎉 Все проблемные термины уже разобраны!", reply_markup=Keyboards.main_menu())
+            await render_single_screen(message, state, "🎉 Все проблемные термины уже разобраны!", reply_markup=Keyboards.main_menu())
             return
         pool = list(custom_codes)
     else:
         available = catalog.get_terms(module_filter)
         if not available:
             await state.clear()
-            await safe_send_markdown(message, "❌ В выбранном модуле пока недостаточно терминов.", reply_markup=Keyboards.main_menu())
+            await render_single_screen(message, state, "❌ В выбранном модуле пока недостаточно терминов.", reply_markup=Keyboards.main_menu())
             return
         pool = [t["code"] for t in available]
 
@@ -2978,23 +3044,26 @@ async def handle_test_restart_reply(message: Message, state: FSMContext):
     await send_next_test_msg(message, state)
 
 
-# Свободный текстовый ввод вне режимов — работает как мгновенный нечёткий поиск
-@router.message(StateFilter(None), F.text)
-async def handle_free_text_search_fallback(message: Message, state: FSMContext):
+# Универсальный перехватчик текстового ввода в любом состоянии:
+# если пользователь написал слово от 3 букв — запускаем нечёткий поиск (с удалением сообщения юзера)
+@router.message(F.text)
+async def handle_universal_text_fallback(message: Message, state: FSMContext):
     txt = (message.text or "").strip()
     if len(txt) >= 3 and not txt.startswith("/"):
         await state.set_state(UserFlow.in_search)
         await handle_search_query(message, state)
     else:
-        await safe_send_markdown(
+        await state.clear()
+        await render_single_screen(
             message,
+            state,
             "🏠 *Главное меню*\n\nВыберите формат тренировки:",
             reply_markup=Keyboards.main_menu()
         )
 
 
 # =====================================================================
-# 11. ФОНОВЫЕ ЗАДАЧИ С РЕЖИМОМ СНА NEON (SCALE-TO-ZERO) И RENDER PORT
+# 12. ФОНОВЫЕ ЗАДАЧИ С РЕЖИМОМ СНА NEON (SCALE-TO-ZERO) И RENDER PORT
 # =====================================================================
 
 async def process_daily_reminders(bot_instance: Bot, reference_date: Optional[date] = None) -> int:
@@ -3014,12 +3083,16 @@ async def process_daily_reminders(bot_instance: Bot, reference_date: Optional[da
             f"_Отключить уведомления можно в разделе «📊 Моя статистика»._"
         )
         try:
-            await bot_instance.send_message(
+            prev_id = screen_manager.get_last_id(uid)
+            sent_msg = await bot_instance.send_message(
                 chat_id=uid,
                 text=text,
                 reply_markup=Keyboards.main_menu(),
                 parse_mode=ParseMode.MARKDOWN
             )
+            screen_manager.set_last_id(uid, sent_msg.message_id)
+            if prev_id and prev_id != sent_msg.message_id:
+                await _safe_delete_message(bot_instance, uid, prev_id)
             await asyncio.to_thread(db.mark_reminder_sent, uid, today_iso)
             sent_count += 1
         except TelegramForbiddenError:
@@ -3076,7 +3149,6 @@ async def periodic_background_task(bot_instance: Optional[Bot] = None):
             now_local = datetime.now(TZ)
             today_local = now_local.date()
 
-            # Будим БД для регламентных задач строго 1 раз в сутки вечером (18:00 - 21:00 МСК)
             if 18 <= now_local.hour <= 20 and last_db_maintenance_date != today_local:
                 last_db_maintenance_date = today_local
                 await asyncio.to_thread(db.cleanup_inactive_teachers)
@@ -3111,7 +3183,7 @@ async def main():
 
     bg_task = asyncio.create_task(periodic_background_task(bot))
 
-    logger.info("Бот версии 7.0 успешно запущен.")
+    logger.info("Бот версии 7.1 (Clean Chat) успешно запущен.")
     try:
         await dp.start_polling(bot)
     except Exception as fatal_err:
