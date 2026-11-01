@@ -6,12 +6,14 @@ import json
 import html
 import hmac
 import hashlib
+import difflib
 import sqlite3
+import calendar
 import warnings
 import urllib.parse
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Set
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -26,18 +28,27 @@ except ImportError:
     pass
 
 # =====================================================================
-# 1. НАСТРОЙКА СТРАНИЦЫ, БЕЗОПАСНОСТИ И ТОКЕНОВ (ВЕРСИЯ 6.2)
+# 1. НАСТРОЙКА СТРАНИЦЫ, АВТО-ТЕМЫ УСТРОЙСТВА И БЕЗОПАСНОСТИ (ВЕРСИЯ 7.0)
 # =====================================================================
 
 st.set_page_config(
     page_title="Аналитика терминов по обществознанию",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed"  # Сайдбар полностью скрыт
+    initial_sidebar_state="collapsed"
 )
 
-# Полностью скрываем стандартный сайдбар и меню Streamlit
+# Скрываем служебные элементы Streamlit + адаптивная вёрстка под Telegram Mini App и системную тему
 st.markdown("""
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+try {
+    if (window.Telegram && window.Telegram.WebApp) {
+        window.Telegram.WebApp.ready();
+        window.Telegram.WebApp.expand();
+    }
+} catch (e) {}
+</script>
 <style>
 #MainMenu {visibility: hidden; display: none !important;}
 header {visibility: hidden; display: none !important;}
@@ -45,19 +56,41 @@ footer {visibility: hidden; display: none !important;}
 [data-testid="stToolbar"] {visibility: hidden; display: none !important;}
 [data-testid="stDecoration"] {visibility: hidden; display: none !important;}
 [data-testid="stStatusWidget"] {visibility: hidden; display: none !important;}
-[data-testid="stSidebar"] {display: none !important;} /* Скрываем сайдбар */
+[data-testid="stSidebar"] {display: none !important;}
 .viewerBadge_container__1QSob {display: none !important;}
 div[class*="viewerBadge"] {display: none !important;}
 div[class*="ProfileBadge"] {display: none !important;}
 #manage-app-button {display: none !important;}
+
+/* Компактные отступы для идеального отображения в Telegram Mini App и на мобильных */
+.block-container {
+    padding-top: 1.2rem !important;
+    padding-bottom: 2rem !important;
+}
+
+/* Автоматическая адаптация плашки профиля под тему устройства (светлая / тёмная) */
+.user-avatar-card {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 18px;
+    padding: 12px 16px;
+    border-radius: 12px;
+    background: rgba(148, 163, 184, 0.10);
+    border: 1px solid rgba(148, 163, 184, 0.22);
+}
+.user-avatar-subtitle {
+    font-size: 0.88rem;
+    opacity: 0.72;
+}
 </style>
 """, unsafe_allow_html=True)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 DB_PATH = os.getenv("DB_PATH", "social_bot.db")
 TERMS_JSON_PATH = os.getenv("TERMS_JSON_PATH", "terms.json")
-SECRET_KEY = os.getenv("SECRET_KEY")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+SECRET_KEY = os.getenv("SECRET_KEY", "obshaga_secret_key_2025")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "obshaga_admin_2025")
 TIMEZONE_STR = os.getenv("TIMEZONE", "Europe/Moscow")
 
 try:
@@ -82,10 +115,39 @@ MONTH_SHORT_RU = {
     1: "Янв", 2: "Фев", 3: "Мар", 4: "Апр", 5: "Май", 6: "Июн",
     7: "Июл", 8: "Авг", 9: "Сен", 10: "Окт", 11: "Ноя", 12: "Дек"
 }
+MONTH_FULL_RU = {
+    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель", 5: "Май", 6: "Июнь",
+    7: "Июль", 8: "Август", 9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
+}
+MODULE_SHORT_BADGE = {
+    "1. Человек и общество": "1. Общество",
+    "2. Экономика": "2. Экономика",
+    "3. Социальные отношения": "3. Социум",
+    "4. Политика": "4. Политика",
+    "5. Право": "5. Право",
+}
+
+
+def normalize_neon_pooler_url(db_url: Optional[str]) -> Optional[str]:
+    """Автоматически направляет подключения к Neon через Connection Pooler (-pooler)."""
+    if not db_url or not db_url.startswith("postgres"):
+        return db_url
+    if os.getenv("NEON_USE_POOLER", "1") == "0":
+        return db_url
+    try:
+        parsed = urllib.parse.urlsplit(db_url)
+        host = parsed.hostname or ""
+        if "neon.tech" in host and "-pooler." not in host and host.startswith("ep-"):
+            parts = host.split(".", 1)
+            new_host = f"{parts[0]}-pooler.{parts[1]}"
+            netloc = parsed.netloc.replace(host, new_host, 1)
+            return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    except Exception:
+        pass
+    return db_url
 
 
 def verify_secret(provided: Optional[str], expected: str) -> bool:
-    """Защищённое от timing-атак сравнение секретов и токенов."""
     if not provided or not expected:
         return False
     return hmac.compare_digest(
@@ -95,7 +157,6 @@ def verify_secret(provided: Optional[str], expected: str) -> bool:
 
 
 def _get_query_param(query_params: Any, key: str) -> Optional[str]:
-    """Безопасное извлечение строкового GET-параметра из st.query_params."""
     if query_params is None:
         return None
     val = query_params.get(key)
@@ -108,7 +169,6 @@ def _get_query_param(query_params: Any, key: str) -> Optional[str]:
 
 
 def generate_student_token(user_id: Any, token_version: int = 1, secret_key: Optional[str] = None) -> str:
-    """Генерирует персональный 8-символьный токен доступа ученика к веб-аналитике."""
     key = secret_key if secret_key is not None else os.getenv("SECRET_KEY", SECRET_KEY)
     uid_str = str(user_id).strip()
     ver = int(token_version) if token_version and int(token_version) > 1 else 1
@@ -117,7 +177,6 @@ def generate_student_token(user_id: Any, token_version: int = 1, secret_key: Opt
 
 
 def generate_teacher_token(teacher_code: Any, token_version: int = 1, secret_key: Optional[str] = None) -> str:
-    """Генерирует токен доступа к кабинету преподавателя с поддержкой ротации ссылки."""
     key = secret_key if secret_key is not None else os.getenv("SECRET_KEY", SECRET_KEY)
     code_str = str(teacher_code).strip()
     ver = max(1, int(token_version or 1))
@@ -126,8 +185,54 @@ def generate_teacher_token(teacher_code: Any, token_version: int = 1, secret_key
 
 
 # =====================================================================
-# 2. МЕТАДАННЫЕ ТЕРМИНОВ (JSON ИЛИ РЕЗЕРВ ИЗ SQLITE)
+# 2. МЕТАДАННЫЕ ТЕРМИНОВ И НЕЧЁТКИЙ ПОИСК С ЗАЩИТОЙ ОТ ОПЕЧАТОК
 # =====================================================================
+
+def _normalize_search_str(s: str) -> str:
+    s = str(s or "").lower().replace("ё", "е").strip()
+    return re.sub(r"[^a-zа-я0-9\s-]", " ", s)
+
+
+def _get_trigrams(s: str) -> Set[str]:
+    clean = re.sub(r"\s+", " ", _normalize_search_str(s)).strip()
+    if not clean:
+        return set()
+    padded = f"  {clean} "
+    if len(padded) < 3:
+        return {padded}
+    return {padded[i:i + 3] for i in range(len(padded) - 2)}
+
+
+def compute_fuzzy_similarity(query: str, target: str) -> float:
+    q_norm = _normalize_search_str(query)
+    t_norm = _normalize_search_str(target)
+    if not q_norm or not t_norm:
+        return 0.0
+    if q_norm == t_norm:
+        return 1.0
+    if t_norm.startswith(q_norm):
+        return 0.96
+    if q_norm in t_norm:
+        return 0.90
+
+    q_tri = _get_trigrams(q_norm)
+    t_tri = _get_trigrams(t_norm)
+    tri_score = len(q_tri & t_tri) / max(1, len(q_tri | t_tri)) if (q_tri and t_tri) else 0.0
+    seq_full = difflib.SequenceMatcher(None, q_norm, t_norm).ratio()
+
+    t_words = [w for w in re.split(r"[\s-]+", t_norm) if len(w) >= 3]
+    word_best = 0.0
+    for w in t_words:
+        if w.startswith(q_norm):
+            word_best = max(word_best, 0.93)
+        else:
+            r = difflib.SequenceMatcher(None, q_norm, w).ratio()
+            w_tri = _get_trigrams(w)
+            w_tri_score = len(q_tri & w_tri) / max(1, len(q_tri | w_tri)) if (q_tri and w_tri) else 0.0
+            word_best = max(word_best, (r * 0.65) + (w_tri_score * 0.35))
+
+    return round(max((seq_full * 0.6) + (tri_score * 0.4), word_best), 4)
+
 
 @st.cache_data
 def load_terms_metadata() -> Dict[str, Dict[str, str]]:
@@ -206,12 +311,13 @@ def load_terms_metadata() -> Dict[str, Dict[str, str]]:
 
 TERMS_MAP = load_terms_metadata()
 
+
 # =====================================================================
-# 3. ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ И ПРОВЕРКА ВЕРСИЙ ТОКЕНОВ
+# 3. ПОДКЛЮЧЕНИЕ К БД И КЭШИРОВАНИЕ ТОКЕНОВ В STREAMLIT (ЭКОНОМИЯ NEON)
 # =====================================================================
 
 def get_db_connection():
-    db_url = os.getenv("DATABASE_URL")
+    db_url = normalize_neon_pooler_url(os.getenv("DATABASE_URL"))
     if db_url and db_url.startswith("postgres"):
         import psycopg2
         return psycopg2.connect(db_url, connect_timeout=10), True
@@ -221,8 +327,9 @@ def get_db_connection():
         return conn, False
 
 
+@st.cache_data(ttl=60)
 def get_current_student_token_version(student_id: str) -> int:
-    """Получает актуальную версию токена ученика напрямую из БД (без кэша)."""
+    """Кэшированная на 60 сек проверка версии токена ученика (экономит Compute Hours Neon)."""
     uid_clean = str(student_id or "").strip()
     if not uid_clean.isdigit():
         return 1
@@ -252,8 +359,9 @@ def get_current_student_token_version(student_id: str) -> int:
                 pass
 
 
+@st.cache_data(ttl=60)
 def get_current_teacher_token_version(teacher_code: str) -> int:
-    """Получает актуальную версию токена преподавателя напрямую из БД (без кэша)."""
+    """Кэшированная на 60 сек проверка версии токена преподавателя."""
     conn = None
     cur = None
     try:
@@ -281,7 +389,6 @@ def get_current_teacher_token_version(teacher_code: str) -> int:
 
 
 def verify_student_access(student_id: str, provided_token: Optional[str]) -> bool:
-    """Проверяет токен ученика с учётом актуальной версии token_version."""
     uid_clean = str(student_id or "").strip()
     if not uid_clean.isdigit():
         return False
@@ -291,7 +398,6 @@ def verify_student_access(student_id: str, provided_token: Optional[str]) -> boo
 
 
 def verify_teacher_access(teacher_code: str, provided_token: Optional[str]) -> bool:
-    """Проверяет доступ к кабинету преподавателя по защищённому токену версии token_version."""
     code_clean = str(teacher_code or "").strip()
     if not code_clean or not provided_token:
         return False
@@ -300,9 +406,9 @@ def verify_teacher_access(teacher_code: str, provided_token: Optional[str]) -> b
     return verify_secret(provided_token, expected)
 
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=60)
 def fetch_all_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Загружает логи ответов, список учителей и связи ученик-учитель с нормализацией типов."""
+    """Загружает данные с 60-секундным кэшем, чтобы не будить Neon при каждом клике по фильтрам."""
     COLUMNS = [
         "user_id", "username", "full_name", "mode", "code", "term",
         "module", "delta_ans", "delta_time", "time_sec", "status",
@@ -396,7 +502,6 @@ def fetch_all_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                 continue
 
             raw_mode = parts[4].strip() if len(parts) >= 5 else "card"
-            # Единообразие с ботом: в режиме тестов ответы быстрее 3.0 сек считаются мискликами и не учитываются
             if raw_mode == "test" and sec < 3.0:
                 continue
 
@@ -450,13 +555,11 @@ def fetch_all_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 
 # =====================================================================
-# 4. ФИЛЬТРАЦИЯ ПО ВРЕМЕННОМУ ОКНУ И КАЛЕНДАРЬ АКТИВНОСТИ
+# 4. ФИЛЬТРАЦИЯ ПО ВРЕМЕННОМУ ОКНУ И КАЛЕНДАРЬ АКТИВНОСТИ (ВАРИАНТ Б + ГОД)
 # =====================================================================
 
 def _normalize_timestamps(series: pd.Series) -> pd.Series:
-    """Безопасно приводит столбец created_at к Timestamp в целевом часовом поясе."""
     parsed = pd.to_datetime(series, utc=True, errors="coerce")
-    # Конвертируем в локальный пояс и убираем tzinfo для совместимости с наивными датами
     return parsed.dt.tz_convert(TZ).dt.tz_localize(None)
 
 
@@ -466,7 +569,6 @@ def filter_df_by_time_window(
     custom_dates: Optional[Any] = None,
     reference_now: Optional[datetime] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
-    """Фильтрует DataFrame по выбранному временному окну."""
     if df.empty or period_choice == "За всё время":
         return df.copy(), pd.DataFrame(columns=df.columns), "За всё время"
 
@@ -557,7 +659,13 @@ def build_calendar_data(
     counter_mode: str = "Все режимы",
     end_date: Optional[date] = None
 ) -> Dict[str, Any]:
-    """Формирует полную 53-недельную сетку активности за последние 365 дней."""
+    """
+    Формирует данные календаря активности:
+    1. Исправлен баг пропущенных месяцев (больше никаких «12 недель в октябре»):
+       теперь месяц определяется по любому дню недели, на который пришлось 1-е число месяца.
+    2. Подготавливает помесячные данные за последние 12 месяцев для мобильного вида (Вариант Б)
+       со стрелочками переключения месяцев без горизонтального скролла!
+    """
     today_d = end_date or datetime.now(TZ).date()
     if isinstance(today_d, datetime):
         today_d = today_d.date()
@@ -648,16 +756,30 @@ def build_calendar_data(
     hover_matrix = [["" for _ in range(weeks_count)] for _ in range(7)]
     cells: List[Dict[str, Any]] = []
     month_labels: Dict[int, str] = {}
-    last_month = None
+    last_labeled_ym: Optional[Tuple[int, int]] = None
+    last_label_w_idx = -10
 
     for w_idx in range(weeks_count):
         week_monday = start_monday + timedelta(weeks=w_idx)
-        for d_idx in range(7):
-            cur_d = week_monday + timedelta(days=d_idx)
-            if cur_d.day <= 7 and cur_d.month != last_month and d_idx == 0:
-                month_labels[w_idx] = MONTH_SHORT_RU.get(cur_d.month, "")
-                last_month = cur_d.month
+        # Ищем, есть ли в этой неделе 1-е число нового месяца (или это самая первая колонка)
+        week_dates = [week_monday + timedelta(days=i) for i in range(7)]
+        first_of_month = next((d for d in week_dates if d.day == 1), None)
+        if w_idx == 0:
+            ym = (week_monday.year, week_monday.month)
+            month_labels[w_idx] = MONTH_SHORT_RU.get(week_monday.month, "")
+            last_labeled_ym = ym
+            last_label_w_idx = w_idx
+        elif first_of_month is not None:
+            ym = (first_of_month.year, first_of_month.month)
+            if ym != last_labeled_ym:
+                # Защита от наложения подписей на соседних колонках
+                if w_idx - last_label_w_idx >= 2:
+                    month_labels[w_idx] = MONTH_SHORT_RU.get(first_of_month.month, "")
+                    last_label_w_idx = w_idx
+                last_labeled_ym = ym
 
+        for d_idx in range(7):
+            cur_d = week_dates[d_idx]
             is_future = cur_d > today_d
             cnt = 0 if is_future else daily_counts.get(cur_d, 0)
             c_cards = 0 if is_future else daily_cards.get(cur_d, 0)
@@ -672,7 +794,7 @@ def build_calendar_data(
             if is_future:
                 tooltip = f"{d_fmt} ({w_name}) — будущая дата"
             elif cnt == 0:
-                tooltip = f"{d_fmt} ({w_name}): 0 действий ({mode_label})"
+                tooltip = f"{d_fmt} ({w_name}): 0 действий"
             else:
                 if mode_label == "Все действия":
                     tooltip = (
@@ -704,6 +826,58 @@ def build_calendar_data(
                 "tooltip": tooltip,
             })
 
+    # Формируем помесячные сетки за последние 12 месяцев для мобильного вида (Вариант Б)
+    months_data: List[Dict[str, Any]] = []
+    cur_y, cur_m = today_d.year, today_d.month
+    ym_list: List[Tuple[int, int]] = []
+    for _ in range(12):
+        ym_list.append((cur_y, cur_m))
+        cur_m -= 1
+        if cur_m == 0:
+            cur_m = 12
+            cur_y -= 1
+    ym_list.reverse()
+
+    cal_obj = calendar.Calendar(firstweekday=0)
+    for y_val, m_val in ym_list:
+        m_weeks = cal_obj.monthdatescalendar(y_val, m_val)
+        m_rows = []
+        m_total_actions = 0
+        m_active_days = 0
+        for wk in m_weeks:
+            wk_cells = []
+            for d_obj in wk:
+                in_month = (d_obj.month == m_val)
+                is_fut = d_obj > today_d
+                cnt = 0 if (not in_month or is_fut) else daily_counts.get(d_obj, 0)
+                c_cards = 0 if (not in_month or is_fut) else daily_cards.get(d_obj, 0)
+                c_tests = 0 if (not in_month or is_fut) else daily_tests.get(d_obj, 0)
+                c_err = 0 if (not in_month or is_fut) else daily_errors.get(d_obj, 0)
+                acc = round((1 - c_err / cnt) * 100, 1) if cnt > 0 else 0.0
+                if in_month and not is_fut:
+                    m_total_actions += cnt
+                    if cnt > 0:
+                        m_active_days += 1
+                lvl = _get_level(cnt) if (in_month and not is_fut) else (-2 if not in_month else -1)
+                wk_cells.append({
+                    "day": d_obj.day if in_month else "",
+                    "date_fmt": d_obj.strftime("%d.%m.%Y"),
+                    "in_month": in_month,
+                    "is_today": (d_obj == today_d and in_month),
+                    "count": cnt,
+                    "cards": c_cards,
+                    "tests": c_tests,
+                    "acc": acc,
+                    "level": lvl,
+                })
+            m_rows.append(wk_cells)
+        months_data.append({
+            "title": f"{MONTH_FULL_RU.get(m_val, '')} {y_val}",
+            "total_actions": m_total_actions,
+            "active_days": m_active_days,
+            "weeks": m_rows,
+        })
+
     return {
         "mode_label": mode_label,
         "start_date": start_monday.isoformat(),
@@ -717,32 +891,32 @@ def build_calendar_data(
         "hover_matrix": hover_matrix,
         "cells": cells,
         "month_labels": month_labels,
+        "months_data": months_data,
     }
 
 
 def build_calendar_html(cal_data: Dict[str, Any]) -> str:
-    """Генерирует адаптивную сетку календаря активности (HTML/CSS) с всплывающими подсказками."""
-    level_colors = {
-        -1: "rgba(255, 255, 255, 0.02)",
-        0: "#161b22",
-        1: "#0e4429",
-        2: "#006d32",
-        3: "#26a641",
-        4: "#39d353",
-    }
+    """
+    Генерирует адаптивный виджет календаря активности v7.0:
+    1. На компьютерах (> 720px): сбалансированная центрированная годовая сетка (53 недели)
+       с точными подписями всех 12 месяцев и привязанной к сетке легендой «Меньше — Больше».
+    2. На телефонах (<= 720px, Вариант Б): удобный помесячный календарь (Пн–Вс) со стрелочками
+       «‹ Месяц ›» — крупные ячейки с числами, 0 горизонтального скролла!
+    3. Автоматическая смена темы (светлая / тёмная) по системной настройке устройства (prefers-color-scheme).
+    """
     weeks_count = cal_data["weeks_count"]
     month_labels = cal_data["month_labels"]
+    safe_mode = html.escape(cal_data["mode_label"], quote=True)
 
-    cell_size = 11
-    gap = 2
-    label_width = 24
-    total_width = label_width + (cell_size + gap) * weeks_count
+    cell_size = 13
+    gap = 3
+    label_width = 28
 
-    month_cells_html = [f'<div style="width: {label_width}px;"></div>']
+    month_cells_html = [f'<div style="width:{label_width}px;flex-shrink:0;"></div>']
     for w_idx in range(weeks_count):
         m_txt = html.escape(month_labels.get(w_idx, ""))
         month_cells_html.append(
-            f'<div style="width: {cell_size}px; font-size: 9px; color: #94a3b8; text-align: left; overflow: visible; white-space: nowrap;">{m_txt}</div>'
+            f'<div class="gh-month-lbl" style="width:{cell_size}px;">{m_txt}</div>'
         )
 
     grid_by_pos = {(c["weekday_idx"], c["week_idx"]): c for c in cal_data["cells"]}
@@ -750,80 +924,350 @@ def build_calendar_html(cal_data: Dict[str, Any]) -> str:
     for d_idx in range(7):
         day_label = WEEKDAY_SHORT_RU[d_idx] if d_idx in (0, 2, 4, 6) else ""
         row_squares = [
-            f'<div style="width: {label_width}px; font-size: 9px; color: #94a3b8; line-height: {cell_size}px; padding-right: 4px; flex-shrink: 0;">{day_label}</div>'
+            f'<div class="gh-day-lbl" style="width:{label_width}px;height:{cell_size}px;line-height:{cell_size}px;">{day_label}</div>'
         ]
         for w_idx in range(weeks_count):
             cell = grid_by_pos[(d_idx, w_idx)]
-            color = level_colors.get(cell["level"], "#161b22")
-            border = "1px solid rgba(255,255,255,0.06)" if cell["level"] <= 0 else "1px solid rgba(255,255,255,0.15)"
+            lvl = cell["level"]
+            lvl_cls = f"lvl-{lvl}" if lvl >= 0 else "lvl-future"
             safe_tip = html.escape(cell["tooltip"], quote=True)
-            
-            safe_mode = html.escape(cal_data['mode_label'], quote=True)
-            click_action = f"showCalInfo('{cell['date_formatted']}', '{cell['count']}', '{cell['cards_count']}', '{cell['tests_count']}', '{cell['accuracy']}', '{safe_mode}')"
-            
-            row_squares.append(
-                f'<div title="{safe_tip}" data-date="{cell["date"]}" data-count="{cell["count"]}" '
-                f'onclick="{click_action}" '
-                f'style="width: {cell_size}px; height: {cell_size}px; border-radius: 2px; background: {color}; border: {border}; cursor: pointer; flex-shrink: 0;"></div>'
+            click_js = (
+                f"showCalDetail('{cell['date_formatted']}', {cell['count']}, "
+                f"{cell['cards_count']}, {cell['tests_count']}, '{cell['accuracy']}', '{safe_mode}')"
             )
-        rows_html.append(
-            f'<div style="display: flex; gap: {gap}px; align-items: center; margin-bottom: {gap}px;">{"".join(row_squares)}</div>'
-        )
+            row_squares.append(
+                f'<div class="gh-cell {lvl_cls}" title="{safe_tip}" '
+                f'data-date="{cell["date"]}" data-count="{cell["count"]}" '
+                f'onclick="{click_js}"></div>'
+            )
+        rows_html.append(f'<div class="gh-row">{"".join(row_squares)}</div>')
 
     legend_squares = "".join([
-        f'<span style="display:inline-block; width:{cell_size}px; height:{cell_size}px; border-radius:2px; background:{level_colors[lvl]}; border:1px solid rgba(255,255,255,0.1);"></span>'
+        f'<span class="gh-cell lvl-{lvl}" style="cursor:default;"></span>'
         for lvl in [0, 1, 2, 3, 4]
     ])
 
-    html_template = """
-    <div style="padding: 12px; background: rgba(15, 23, 42, 0.65); border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.1); overflow-x: auto; margin-top: 8px; font-family: sans-serif;">
-        <div style="min-width: {{TOTAL_WIDTH}}px;">
-            <div style="display: flex; gap: {{GAP}}px; margin-bottom: 4px;">
-                {{MONTH_CELLS}}
-            </div>
-            <div>
-                {{ROWS_HTML}}
-            </div>
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 8px; font-size: 11px; color: #94a3b8; flex-wrap: wrap; gap: 4px;">
-                <div>Нажмите или наведите на ячейку, чтобы увидеть детали.</div>
-                <div style="display: flex; align-items: center; gap: 4px;">
-                    <span>Меньше</span>
-                    {{LEGEND_SQUARES}}
-                    <span>Больше</span>
+    months_json = json.dumps(cal_data.get("months_data", []), ensure_ascii=False)
+
+    return f"""
+    <style>
+        :root {{
+            --cal-bg: #ffffff;
+            --cal-border: #e2e8f0;
+            --cal-text: #0f172a;
+            --cal-muted: #64748b;
+            --cal-bar-bg: #f8fafc;
+            --cal-btn-bg: #f1f5f9;
+            --cal-btn-hover: #e2e8f0;
+            --lvl-future: rgba(148, 163, 184, 0.08);
+            --lvl-0: #ebedf0;
+            --lvl-1: #9be9a8;
+            --lvl-2: #40c463;
+            --lvl-3: #30a14e;
+            --lvl-4: #216e39;
+            --lvl-text-active: #ffffff;
+        }}
+        @media (prefers-color-scheme: dark) {{
+            :root {{
+                --cal-bg: #0f172a;
+                --cal-border: rgba(255, 255, 255, 0.10);
+                --cal-text: #f1f5f9;
+                --cal-muted: #94a3b8;
+                --cal-bar-bg: rgba(255, 255, 255, 0.05);
+                --cal-btn-bg: rgba(255, 255, 255, 0.08);
+                --cal-btn-hover: rgba(255, 255, 255, 0.15);
+                --lvl-future: rgba(255, 255, 255, 0.02);
+                --lvl-0: #161b22;
+                --lvl-1: #0e4429;
+                --lvl-2: #006d32;
+                --lvl-3: #26a641;
+                --lvl-4: #39d353;
+                --lvl-text-active: #ffffff;
+            }}
+        }}
+        * {{ box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
+        body {{ margin: 0; padding: 0; background: transparent; color: var(--cal-text); }}
+        .cal-card {{
+            background: var(--cal-bg);
+            border: 1px solid var(--cal-border);
+            border-radius: 14px;
+            padding: 16px;
+            width: 100%;
+        }}
+        /* Десктопная годовая сетка */
+        .desktop-year-wrap {{
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 100%;
+            overflow-x: auto;
+        }}
+        .gh-grid-inner {{
+            display: inline-block;
+        }}
+        .gh-months-row {{
+            display: flex;
+            gap: {gap}px;
+            margin-bottom: 6px;
+            height: 14px;
+        }}
+        .gh-month-lbl {{
+            font-size: 10px;
+            font-weight: 500;
+            color: var(--cal-muted);
+            text-align: left;
+            overflow: visible;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }}
+        .gh-row {{
+            display: flex;
+            gap: {gap}px;
+            align-items: center;
+            margin-bottom: {gap}px;
+        }}
+        .gh-day-lbl {{
+            font-size: 10px;
+            color: var(--cal-muted);
+            padding-right: 6px;
+            flex-shrink: 0;
+            text-align: right;
+        }}
+        .gh-cell {{
+            width: {cell_size}px;
+            height: {cell_size}px;
+            border-radius: 3px;
+            cursor: pointer;
+            flex-shrink: 0;
+            transition: transform 0.1s ease;
+        }}
+        .gh-cell:hover {{
+            transform: scale(1.22);
+            outline: 1.5px solid var(--cal-text);
+            z-index: 2;
+        }}
+        .lvl-future {{ background: var(--lvl-future); opacity: 0.35; cursor: default; }}
+        .lvl-0 {{ background: var(--lvl-0); }}
+        .lvl-1 {{ background: var(--lvl-1); }}
+        .lvl-2 {{ background: var(--lvl-2); }}
+        .lvl-3 {{ background: var(--lvl-3); }}
+        .lvl-4 {{ background: var(--lvl-4); }}
+
+        .gh-footer {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            width: 100%;
+            margin-top: 10px;
+            font-size: 12px;
+            color: var(--cal-muted);
+            gap: 12px;
+            flex-wrap: wrap;
+        }}
+        .gh-legend {{
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }}
+
+        /* Мобильный помесячный календарь (Вариант Б) без горизонтального скролла */
+        .mobile-month-wrap {{
+            display: none;
+            width: 100%;
+            max-width: 420px;
+            margin: 0 auto;
+        }}
+        .mob-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }}
+        .mob-nav-btn {{
+            background: var(--cal-btn-bg);
+            color: var(--cal-text);
+            border: 1px solid var(--cal-border);
+            border-radius: 8px;
+            width: 36px;
+            height: 34px;
+            font-size: 18px;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+        .mob-nav-btn:hover {{ background: var(--cal-btn-hover); }}
+        .mob-nav-btn:disabled {{ opacity: 0.35; cursor: default; }}
+        .mob-title {{
+            font-size: 15px;
+            font-weight: 700;
+            text-align: center;
+        }}
+        .mob-sub {{
+            font-size: 11px;
+            color: var(--cal-muted);
+            text-align: center;
+            margin-top: 2px;
+        }}
+        .mob-weekdays {{
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 5px;
+            text-align: center;
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--cal-muted);
+            margin-bottom: 6px;
+        }}
+        .mob-grid {{
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 5px;
+        }}
+        .mob-day {{
+            height: 36px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            user-select: none;
+            border: 1px solid transparent;
+        }}
+        .mob-day.empty {{
+            background: transparent;
+            cursor: default;
+        }}
+        .mob-day.today {{
+            border: 2px solid #6366f1;
+        }}
+        .mob-day.lvl-1, .mob-day.lvl-2, .mob-day.lvl-3, .mob-day.lvl-4 {{
+            color: var(--lvl-text-active);
+        }}
+
+        .cal-detail-pill {{
+            margin-top: 10px;
+            padding: 8px 12px;
+            background: var(--cal-bar-bg);
+            border: 1px solid var(--cal-border);
+            border-radius: 8px;
+            font-size: 12.5px;
+            color: var(--cal-text);
+            text-align: center;
+        }}
+
+        @media (max-width: 720px) {{
+            .desktop-year-wrap {{ display: none !important; }}
+            .mobile-month-wrap {{ display: block !important; }}
+        }}
+    </style>
+
+    <div class="cal-card">
+        <!-- Десктопный годовой календарь -->
+        <div class="desktop-year-wrap">
+            <div class="gh-grid-inner">
+                <div class="gh-months-row">
+                    {"".join(month_cells_html)}
+                </div>
+                <div>
+                    {"".join(rows_html)}
+                </div>
+                <div class="gh-footer">
+                    <div id="cal-info-desktop">Наведите или нажмите на ячейку, чтобы увидеть статистику дня</div>
+                    <div class="gh-legend">
+                        <span>Меньше</span>
+                        {legend_squares}
+                        <span>Больше</span>
+                    </div>
                 </div>
             </div>
         </div>
-        
-        <div id="cal-info" style="margin-top: 12px; padding: 10px; background: rgba(255,255,255,0.05); border-radius: 8px; font-size: 13px; color: #e2e8f0; display: none;">
-            Нажмите на клетку, чтобы увидеть детали.
+
+        <!-- Мобильный помесячный календарь (Вариант Б) -->
+        <div class="mobile-month-wrap">
+            <div class="mob-header">
+                <button class="mob-nav-btn" id="mob-prev" onclick="changeMobMonth(-1)">‹</button>
+                <div>
+                    <div class="mob-title" id="mob-month-title">Месяц</div>
+                    <div class="mob-sub" id="mob-month-sub"></div>
+                </div>
+                <button class="mob-nav-btn" id="mob-next" onclick="changeMobMonth(1)">›</button>
+            </div>
+            <div class="mob-weekdays">
+                <div>Пн</div><div>Вт</div><div>Ср</div><div>Чт</div><div>Пт</div><div>Сб</div><div>Вс</div>
+            </div>
+            <div class="mob-grid" id="mob-days-grid"></div>
+            <div class="cal-detail-pill" id="cal-info-mobile">Нажмите на день для просмотра деталей</div>
         </div>
-
-        <script>
-            function showCalInfo(date, count, cards, tests, acc, mode) {
-                var infoBox = document.getElementById('cal-info');
-                if (infoBox) {
-                    if (count === '0') {
-                        infoBox.innerHTML = '📅 <b>' + date + '</b> | ⚡️ Пройдено: <b>0</b> действий (' + mode + ')';
-                    } else if (mode === 'Все действия') {
-                        infoBox.innerHTML = '📅 <b>' + date + '</b> | ⚡️ Пройдено: <b>' + count + '</b> (Карточек: ' + cards + ', Тестов: ' + tests + ' | Точность: ' + acc + '%)';
-                    } else {
-                        infoBox.innerHTML = '📅 <b>' + date + '</b> | ⚡️ Пройдено: <b>' + count + '</b> (' + mode + ' | Точность: ' + acc + '%)';
-                    }
-                    infoBox.style.display = 'block';
-                }
-            }
-        </script>
     </div>
-    """
 
-    return (
-        html_template
-        .replace("{{TOTAL_WIDTH}}", str(total_width))
-        .replace("{{GAP}}", str(gap))
-        .replace("{{MONTH_CELLS}}", "".join(month_cells_html))
-        .replace("{{ROWS_HTML}}", "".join(rows_html))
-        .replace("{{LEGEND_SQUARES}}", legend_squares)
-    )
+    <script>
+        var MONTHS_DATA = {months_json};
+        var curMonthIdx = MONTHS_DATA.length > 0 ? MONTHS_DATA.length - 1 : 0;
+        var MODE_LABEL = "{safe_mode}";
+
+        function formatDayMessage(dateStr, count, cards, tests, acc, mode) {{
+            if (Number(count) === 0) {{
+                return "📅 <b>" + dateStr + "</b> — 0 действий (" + mode + ")";
+            }}
+            if (mode === "Все действия") {{
+                return "📅 <b>" + dateStr + "</b>: <b>" + count + "</b> (Карточек: " + cards + ", Тестов: " + tests + " | Точность: " + acc + "%)";
+            }}
+            return "📅 <b>" + dateStr + "</b>: <b>" + count + "</b> (" + mode + " | Точность: " + acc + "%)";
+        }}
+
+        function showCalDetail(dateStr, count, cards, tests, acc, mode) {{
+            var htmlMsg = formatDayMessage(dateStr, count, cards, tests, acc, mode);
+            var dBox = document.getElementById("cal-info-desktop");
+            if (dBox) dBox.innerHTML = htmlMsg;
+            var mBox = document.getElementById("cal-info-mobile");
+            if (mBox) mBox.innerHTML = htmlMsg;
+        }}
+
+        function renderMobMonth() {{
+            if (!MONTHS_DATA || MONTHS_DATA.length === 0) return;
+            var m = MONTHS_DATA[curMonthIdx];
+            document.getElementById("mob-month-title").textContent = m.title;
+            document.getElementById("mob-month-sub").textContent = "Активных дней: " + m.active_days + " | Ответов: " + m.total_actions;
+            document.getElementById("mob-prev").disabled = (curMonthIdx <= 0);
+            document.getElementById("mob-next").disabled = (curMonthIdx >= MONTHS_DATA.length - 1);
+
+            var grid = document.getElementById("mob-days-grid");
+            grid.innerHTML = "";
+            m.weeks.forEach(function(wk) {{
+                wk.forEach(function(cell) {{
+                    var el = document.createElement("div");
+                    if (!cell.in_month) {{
+                        el.className = "mob-day empty";
+                    }} else {{
+                        var lvlClass = cell.level >= 0 ? ("lvl-" + cell.level) : "lvl-future";
+                        el.className = "mob-day " + lvlClass + (cell.is_today ? " today" : "");
+                        el.textContent = cell.day;
+                        if (cell.level >= 0) {{
+                            el.onclick = function() {{
+                                showCalDetail(cell.date_fmt, cell.count, cell.cards, cell.tests, cell.acc, MODE_LABEL);
+                            }};
+                        }}
+                    }}
+                    grid.appendChild(el);
+                }});
+            }});
+        }}
+
+        function changeMobMonth(delta) {{
+            var nextIdx = curMonthIdx + delta;
+            if (nextIdx >= 0 && nextIdx < MONTHS_DATA.length) {{
+                curMonthIdx = nextIdx;
+                renderMobMonth();
+            }}
+        }}
+
+        renderMobMonth();
+    </script>
+    """
 
 
 def render_activity_calendar(
@@ -831,10 +1275,9 @@ def render_activity_calendar(
     default_mode: str = "Все режимы",
     key_prefix: str = "gh"
 ):
-    """Отрисовывает в нижней части страницы годовой календарь активности."""
     st.divider()
-    st.subheader("🟩 Календарь активности за год")
-    
+    st.subheader("🟩 Календарь активности")
+
     if unfiltered_date_df.empty:
         st.info("ℹ️ Пока нет данных для отображения календаря.")
         return
@@ -842,16 +1285,13 @@ def render_activity_calendar(
     counter_options = ["Все режимы", "Только карточки", "Только тесты"]
     default_idx = counter_options.index(default_mode) if default_mode in counter_options else 0
 
-    if hasattr(st, "radio"):
-        chosen_counter = st.radio(
-            "Счётчик календаря активности:",
-            counter_options,
-            index=default_idx,
-            horizontal=True,
-            key=f"{key_prefix}_calendar_counter"
-        )
-    else:
-        chosen_counter = default_mode
+    chosen_counter = st.radio(
+        "Счётчик календаря активности:",
+        counter_options,
+        index=default_idx,
+        horizontal=True,
+        key=f"{key_prefix}_calendar_counter"
+    )
 
     cal_data = build_calendar_data(unfiltered_date_df, counter_mode=chosen_counter)
 
@@ -861,7 +1301,7 @@ def render_activity_calendar(
     c_s3.metric("🗓 Активных дней за год", f"{cal_data['active_days_year']} из 365")
     c_s4.metric(f"⚡️ Всего за год ({cal_data['mode_label']})", cal_data["total_actions_year"])
 
-    components.html(build_calendar_html(cal_data), height=280, scrolling=False)
+    components.html(build_calendar_html(cal_data), height=320, scrolling=False)
 
 
 # =====================================================================
@@ -869,7 +1309,6 @@ def render_activity_calendar(
 # =====================================================================
 
 def _find_cyrillic_font() -> Optional[str]:
-    """Ищет системный или встроенный в matplotlib TTF-шрифт с поддержкой кириллицы."""
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
@@ -896,7 +1335,6 @@ def generate_pdf_report(
     period_label: str = "За всё время",
     class_summary_df: Optional[pd.DataFrame] = None
 ) -> bytes:
-    """Формирует PDF-отчёт успеваемости (для ученика или класса) с поддержкой кириллицы."""
     total_answers = len(df)
     valid_times = df[(df["time_sec"] >= 0) & (df["time_sec"] <= 180.0)]["time_sec"] if not df.empty else pd.Series(dtype=float)
     avg_time = round(float(valid_times.mean()), 1) if not valid_times.empty else 0.0
@@ -1014,11 +1452,10 @@ def generate_pdf_report(
 
 
 # =====================================================================
-# 6. КОМПОНЕНТЫ ИНТЕРФЕЙСА (ПОВТОРНО ИСПОЛЬЗУЕМЫЙ ВИЗУАЛ)
+# 6. КОМПОНЕНТЫ ИНТЕРФЕЙСА (ТАБЛИЦА БЕЗ СКРОЛЛА + ПОИСК ТЕРМИНОВ)
 # =====================================================================
 
 def build_user_avatar_html(full_name: str, username: Optional[str], user_id: str) -> str:
-    """Формирует безопасный HTML-бейдж пользователя."""
     safe_name = html.escape(str(full_name or "").strip() or f"ID: {user_id}")
     safe_uid = html.escape(str(user_id or "").strip())
     raw_uname = str(username or "").replace("@", "").strip()
@@ -1038,23 +1475,21 @@ def build_user_avatar_html(full_name: str, username: Optional[str], user_id: str
 
     subtitle = f"@{safe_uname}" if safe_uname else f"ID: {safe_uid}"
     return f"""
-    <div style="display: flex; align-items: center; gap: 14px; margin-bottom: 20px; padding: 12px 16px; background: rgba(255, 255, 255, 0.04); border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.1);">
+    <div class="user-avatar-card">
         {img_tag}
         <div>
             <div style="font-size: 1.15rem; font-weight: 600; line-height: 1.2;">{safe_name}</div>
-            <div style="font-size: 0.88rem; color: #94a3b8;">{subtitle}</div>
+            <div class="user-avatar-subtitle">{subtitle}</div>
         </div>
     </div>
     """
 
 
 def render_user_avatar_badge(full_name: str, username: Optional[str], user_id: str):
-    """Отображает компактный аватар из Telegram CDN с fallback на инициалы."""
     st.markdown(build_user_avatar_html(full_name, username, user_id), unsafe_allow_html=True)
 
 
 def build_class_summary_df(class_student_ids: List[str], class_df: pd.DataFrame) -> pd.DataFrame:
-    """Формирует сводную таблицу успеваемости класса по всем прикреплённым ученикам."""
     summary_rows = []
     for uid in class_student_ids:
         u_df = class_df[class_df["user_id"] == uid] if not class_df.empty else pd.DataFrame()
@@ -1078,13 +1513,32 @@ def build_class_summary_df(class_student_ids: List[str], class_df: pd.DataFrame)
     return pd.DataFrame(summary_rows)
 
 
+def _format_compact_terms_df(term_problems_df: pd.DataFrame) -> pd.DataFrame:
+    """Форматирует таблицу терминов компактно (4 колонки без горизонтального скролла)."""
+    if term_problems_df.empty:
+        return pd.DataFrame(columns=["Термин", "Блок", "Ошибки / Попытки", "% ошибок"])
+    out = pd.DataFrame()
+    out["Термин"] = term_problems_df["term"].astype(str)
+    out["Блок"] = term_problems_df["module"].map(lambda m: MODULE_SHORT_BADGE.get(str(m), str(m)))
+    out["Ошибки / Попытки"] = (
+        term_problems_df["errors"].astype(int).astype(str)
+        + " из "
+        + term_problems_df["total_tries"].astype(int).astype(str)
+        + " ("
+        + term_problems_df["avg_seconds"].round(1).astype(str)
+        + " с)"
+    )
+    out["% ошибок"] = term_problems_df["error_rate"].astype(float)
+    return out
+
+
 def render_analytics_dashboard(
     df: pd.DataFrame,
     is_class_view: bool = False,
     prev_df: Optional[pd.DataFrame] = None,
-    period_label: str = "За всё время"
+    period_label: str = "За всё время",
+    key_prefix: str = "main"
 ):
-    """Единый визуальный модуль аналитики (за выбранное временное окно)."""
     if df.empty:
         st.warning("Нет данных за выбранный период.")
         return
@@ -1120,7 +1574,18 @@ def render_analytics_dashboard(
     col_pie1, col_pie2 = st.columns(2)
     with col_pie1:
         st.subheader("🥧 Качество ответов")
-        fig_status = px.pie(df, names="status", color="status", color_discrete_map={"Верно / Знаю": "#2ecc71", "Неуверенно": "#f1c40f", "Ошибка / Не знаю": "#e74c3c"}, hole=0.4)
+        fig_status = px.pie(
+            df,
+            names="status",
+            color="status",
+            color_discrete_map={"Верно / Знаю": "#2ecc71", "Неуверенно": "#f1c40f", "Ошибка / Не знаю": "#e74c3c"},
+            hole=0.42
+        )
+        fig_status.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=20, b=20, l=10, r=10),
+        )
         st.plotly_chart(fig_status, use_container_width=True)
 
     with col_pie2:
@@ -1128,43 +1593,134 @@ def render_analytics_dashboard(
         st.subheader(f"🥧 Ошибки {title_suffix}")
         problem_df = df[df["is_problem"]]
         if not problem_df.empty:
-            fig_modules = px.pie(problem_df, names="module", hole=0.4)
+            fig_modules = px.pie(problem_df, names="module", hole=0.42)
+            fig_modules.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(t=20, b=20, l=10, r=10),
+            )
             st.plotly_chart(fig_modules, use_container_width=True)
         else:
             st.success("🎉 Затруднений и ошибок за выбранный период нет — все ответы уверенные!")
 
     st.divider()
 
-    col_bar1, col_bar2 = st.columns(2)
     df_calc = df.copy()
     df_calc["time_sec_clamped"] = df_calc["time_sec"].clip(0, 180)
+    term_problems = df_calc.groupby(["code", "term", "module"]).agg(
+        total_tries=("status", "count"),
+        errors=("is_problem", "sum"),
+        avg_seconds=("time_sec_clamped", "mean")
+    ).reset_index()
+    term_problems["error_rate"] = (term_problems["errors"] / term_problems["total_tries"] * 100).round(1)
+    term_problems["avg_seconds"] = term_problems["avg_seconds"].round(1)
+
+    col_bar1, col_bar2 = st.columns([1.15, 0.85])
 
     with col_bar1:
         table_title = "⚠️ Топ-10 трудных терминов для класса" if is_class_view else "⚠️ Ваши трудные термины"
         st.subheader(table_title)
-        term_problems = df_calc.groupby(["code", "term", "module"]).agg(
-            total_tries=("status", "count"), errors=("is_problem", "sum"), avg_seconds=("time_sec_clamped", "mean")
-        ).reset_index()
-        term_problems["error_rate"] = (term_problems["errors"] / term_problems["total_tries"] * 100).round(1)
-        term_problems["avg_seconds"] = term_problems["avg_seconds"].round(1)
         top_problematic = term_problems.sort_values(by=["errors", "error_rate"], ascending=False).head(10)
+        compact_top_df = _format_compact_terms_df(top_problematic)
 
         st.dataframe(
-            top_problematic[["code", "term", "module", "errors", "total_tries", "error_rate", "avg_seconds"]].rename(
-                columns={"code": "Код", "term": "Термин", "module": "Модуль", "errors": "Ошибок", "total_tries": "Попыток", "error_rate": "% ошибок", "avg_seconds": "Ср. время (с)"}
-            ),
-            use_container_width=True, hide_index=True
+            compact_top_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Термин": st.column_config.TextColumn("Термин", width="medium"),
+                "Блок": st.column_config.TextColumn("Блок", width="small"),
+                "Ошибки / Попытки": st.column_config.TextColumn("Ошибки (Время)", width="small"),
+                "% ошибок": st.column_config.ProgressColumn(
+                    "% ошибок",
+                    format="%.0f%%",
+                    min_value=0,
+                    max_value=100,
+                    width="small",
+                ),
+            }
         )
 
     with col_bar2:
         st.subheader("⏱ Скорость ответа по блокам")
         module_time = df_calc.groupby("module")["time_sec_clamped"].mean().round(1).reset_index()
-        fig_time = px.bar(module_time, x="module", y="time_sec_clamped", labels={"module": "Модуль", "time_sec_clamped": "Секунды"}, color="time_sec_clamped", color_continuous_scale="Blues")
+        module_time["module_short"] = module_time["module"].map(lambda m: MODULE_SHORT_BADGE.get(str(m), str(m)))
+        fig_time = px.bar(
+            module_time,
+            x="module_short",
+            y="time_sec_clamped",
+            labels={"module_short": "Блок", "time_sec_clamped": "Секунды"},
+            color="time_sec_clamped",
+            color_continuous_scale="Blues"
+        )
+        fig_time.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=20, b=20, l=10, r=10),
+            coloraxis_showscale=False,
+        )
         st.plotly_chart(fig_time, use_container_width=True)
+
+    # --- УМНЫЙ ПОИСК ТЕРМИНОВ ПО НАЗВАНИЮ (ОТ 3 БУКВ, С ЗАЩИТОЙ ОТ ОПЕЧАТОК) ---
+    st.divider()
+    st.subheader("🔎 Поиск статистики по конкретному термину")
+    search_q = st.text_input(
+        "Введите название термина (от 3 букв, можно с опечатками — например «ифлянция»):",
+        key=f"{key_prefix}_term_fuzzy_search",
+        placeholder="Например: инфляция, государство, стратификация..."
+    ).strip()
+
+    if search_q:
+        clean_q = _normalize_search_str(search_q).strip()
+        if len(clean_q) < 3:
+            st.info("Введите минимум 3 буквы для запуска умного поиска.")
+        else:
+            scored_rows = []
+            for idx_row, r in term_problems.iterrows():
+                sc = compute_fuzzy_similarity(clean_q, str(r["term"]))
+                if clean_q == str(r["code"]).lower():
+                    sc = 1.0
+                if sc >= 0.45:
+                    row_copy = r.copy()
+                    row_copy["_score"] = sc
+                    scored_rows.append(row_copy)
+
+            if scored_rows:
+                matched_df = pd.DataFrame(scored_rows).sort_values(by=["_score", "total_tries"], ascending=False).head(10)
+                st.dataframe(
+                    _format_compact_terms_df(matched_df),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Термин": st.column_config.TextColumn("Термин", width="medium"),
+                        "Блок": st.column_config.TextColumn("Блок", width="small"),
+                        "Ошибки / Попытки": st.column_config.TextColumn("Ошибки (Время)", width="small"),
+                        "% ошибок": st.column_config.ProgressColumn(
+                            "% ошибок",
+                            format="%.0f%%",
+                            min_value=0,
+                            max_value=100,
+                            width="small",
+                        ),
+                    }
+                )
+            else:
+                # Проверяем, есть ли такой термин в общем справочнике кодификатора
+                cat_matches = []
+                for c_code, c_info in TERMS_MAP.items():
+                    sc = compute_fuzzy_similarity(clean_q, c_info["term"])
+                    if sc >= 0.50:
+                        cat_matches.append((c_info["term"], c_info["module"], sc))
+                cat_matches.sort(key=lambda x: x[2], reverse=True)
+                if cat_matches:
+                    best_name, best_mod, _ = cat_matches[0]
+                    st.info(f"Термин **«{best_name}»** ({best_mod}) найден в кодификаторе, но за выбранный период ответов по нему ещё не было.")
+                else:
+                    st.warning("Термин не найден. Проверьте написание.")
 
 
 # =====================================================================
-# 7. ИНТЕРФЕЙС И РОУТИНГ ПО РОЛЯМ (ВЕРСИЯ 6.2)
+# 7. ИНТЕРФЕЙС И РОУТИНГ ПО РОЛЯМ (ВЕРСИЯ 7.0)
 # =====================================================================
 
 def run_dashboard_app():
@@ -1177,7 +1733,7 @@ def run_dashboard_app():
     admin_param = _get_query_param(query_params, "admin")
 
     # -----------------------------------------------------------------
-    # СЦЕНАРИЙ 1: ПЕРСОНАЛЬНЫЙ КАБИНЕТ УЧЕНИКА
+    # СЦЕНАРИЙ 1: ПЕРСОНАЛЬНЫЙ КАБИНЕТ УЧЕНИКА (И TELEGRAM MINI APP)
     # -----------------------------------------------------------------
     if student_param:
         student_id_str = str(student_param).strip()
@@ -1202,19 +1758,18 @@ def run_dashboard_app():
         sample_row = student_df.iloc[0]
         render_user_avatar_badge(sample_row["full_name"], sample_row["username"], student_id_str)
 
-        # --- ВЕРХНЕЕ ОКНО С ФИЛЬТРАМИ ---
         with st.popover("⚙️ Параметры и фильтры", use_container_width=True):
             st.subheader("Настройки отображения")
             mode_options = ["Все режимы", "Только карточки", "Только тесты"]
             selected_mode = st.selectbox("Режим тренировки:", mode_options, key="student_mode")
-            
+
             st.divider()
             period_choice = st.selectbox("Период для графиков:", TIME_WINDOW_OPTIONS, key="student_period")
             custom_dates = None
             if period_choice == "Свой диапазон дат":
                 today_d = datetime.now(TZ).date()
                 custom_dates = st.date_input("Выберите даты:", value=(today_d - timedelta(days=14), today_d), key="student_custom_dates")
-            
+
             st.divider()
             if selected_mode == "Только карточки":
                 mode_filtered_df = student_df[student_df["mode"] == "Карточки"]
@@ -1224,19 +1779,21 @@ def run_dashboard_app():
                 mode_filtered_df = student_df
 
             window_df, prev_window_df, period_label = filter_df_by_time_window(mode_filtered_df, period_choice, custom_dates)
-            
+
             pdf_bytes = generate_pdf_report(
                 title=f"Отчёт успеваемости: {sample_row['full_name']}",
                 subtitle=f"ID: {student_id_str} | Режим: {selected_mode}",
                 df=window_df, period_label=period_label,
             )
             st.download_button("📄 Скачать PDF-отчёт", data=pdf_bytes, file_name=f"Отчет_{student_id_str}.pdf", mime="application/pdf", use_container_width=True)
+            if st.button("🔄 Обновить данные", key="student_refresh_btn", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
 
-        # --- ОСНОВНОЙ КОНТЕНТ ---
         if window_df.empty:
             st.warning(f"За выбранный период («{period_label}») по режиму «{selected_mode}» у вас пока нет ответов.")
         else:
-            render_analytics_dashboard(window_df, is_class_view=False, prev_df=prev_window_df, period_label=period_label)
+            render_analytics_dashboard(window_df, is_class_view=False, prev_df=prev_window_df, period_label=period_label, key_prefix="student")
 
         render_activity_calendar(unfiltered_date_df=student_df, default_mode=selected_mode, key_prefix="student_gh")
         st.stop()
@@ -1255,29 +1812,30 @@ def run_dashboard_app():
             return
 
         teacher_name = f"Код класса: {teacher_code}"
-        teacher_exists = False
         if not teachers_df.empty:
             t_match = teachers_df[teachers_df["teacher_code"].astype(str) == teacher_code]
             if not t_match.empty:
-                teacher_exists = True
                 t_full = str(t_match.iloc[0]["full_name"]).strip() or f"Учитель {teacher_code}"
                 teacher_name = f"{t_full} (Класс `{teacher_code}`)"
 
         st.caption(f"Просмотр: **{teacher_name}**")
 
-        if st_teachers_df.empty or not class_student_ids:
-            class_student_ids = st_teachers_df[st_teachers_df["teacher_code"].astype(str) == teacher_code]["student_id"].astype(str).unique().tolist() if not st_teachers_df.empty else []
-            if not class_student_ids:
-                st.info(f"ℹ️ К классу `{teacher_code}` пока не прикрепился ни один ученик.")
-                st.stop()
-                return
+        # ИСПРАВЛЕН БАГ NameError: сначала инициализируем class_student_ids, затем проверяем
+        class_student_ids: List[str] = (
+            st_teachers_df[st_teachers_df["teacher_code"].astype(str) == teacher_code]["student_id"].astype(str).unique().tolist()
+            if not st_teachers_df.empty
+            else []
+        )
+        if not class_student_ids:
+            st.info(f"ℹ️ К классу `{teacher_code}` пока не прикрепился ни один ученик.")
+            st.stop()
+            return
 
         class_df = raw_df[raw_df["user_id"].isin(class_student_ids)] if not raw_df.empty else pd.DataFrame(columns=raw_df.columns)
-        
-        # --- ВЕРХНЕЕ ОКНО С ФИЛЬТРАМИ ---
+
         with st.popover("⚙️ Параметры и фильтры", use_container_width=True):
             st.subheader("Настройки отображения")
-            
+
             student_labels = {"👥 Весь класс (Сводка)": "ALL"}
             for uid in class_student_ids:
                 sub = class_df[class_df["user_id"] == uid]
@@ -1288,13 +1846,13 @@ def run_dashboard_app():
                 else:
                     label = f"ID: {uid} (0 ответов)"
                 student_labels[label] = uid
-            
+
             selected_student_label = st.selectbox("Выберите ученика:", list(student_labels.keys()), key="teacher_student_sel")
             selected_uid = student_labels[selected_student_label]
-            
+
             mode_options = ["Все режимы", "Только карточки", "Только тесты"]
             selected_mode = st.selectbox("Режим тренировки:", mode_options, key="teacher_mode")
-            
+
             st.divider()
             period_choice = st.selectbox("Период для графиков:", TIME_WINDOW_OPTIONS, key="teacher_period")
             custom_dates = None
@@ -1304,7 +1862,7 @@ def run_dashboard_app():
 
             st.divider()
             entity_unfiltered_df = class_df if selected_uid == "ALL" else class_df[class_df["user_id"] == selected_uid]
-            
+
             if selected_mode == "Только карточки":
                 mode_entity_df = entity_unfiltered_df[entity_unfiltered_df["mode"] == "Карточки"]
             elif selected_mode == "Только тесты":
@@ -1313,17 +1871,19 @@ def run_dashboard_app():
                 mode_entity_df = entity_unfiltered_df
 
             active_window_df, prev_window_df, period_label = filter_df_by_time_window(mode_entity_df, period_choice, custom_dates)
-            
+
             report_df = build_class_summary_df(class_student_ids, active_window_df)
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                 report_df.to_excel(writer, index=False, sheet_name="Ведомость класса")
             st.download_button("📥 Скачать ведомость (.xlsx)", data=buffer.getvalue(), file_name=f"Класс_{teacher_code}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-            
+
             pdf_class_bytes = generate_pdf_report(title=f"Ведомость класса {teacher_code}", subtitle=teacher_name, df=active_window_df, period_label=period_label, class_summary_df=report_df)
             st.download_button("📄 Скачать PDF-отчёт (.pdf)", data=pdf_class_bytes, file_name=f"Класс_{teacher_code}.pdf", mime="application/pdf", use_container_width=True)
+            if st.button("🔄 Обновить данные", key="teacher_refresh_btn", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
 
-        # --- ОСНОВНОЙ КОНТЕНТ ---
         if selected_uid != "ALL" and not entity_unfiltered_df.empty:
             s_row = entity_unfiltered_df.iloc[0]
             render_user_avatar_badge(s_row["full_name"], s_row["username"], selected_uid)
@@ -1331,30 +1891,36 @@ def run_dashboard_app():
         if active_window_df.empty:
             st.warning(f"За выбранный период («{period_label}») пока нет данных.")
         else:
-            render_analytics_dashboard(active_window_df, is_class_view=(selected_uid == "ALL"), prev_df=prev_window_df, period_label=period_label)
+            render_analytics_dashboard(active_window_df, is_class_view=(selected_uid == "ALL"), prev_df=prev_window_df, period_label=period_label, key_prefix="teacher")
 
         render_activity_calendar(unfiltered_date_df=entity_unfiltered_df, default_mode=selected_mode, key_prefix="teacher_gh")
         st.stop()
         return
 
     # -----------------------------------------------------------------
-    # СЦЕНАРИЙ 3: АДМИН-ПАНЕЛЬ И ГЛАВНАЯ
+    # СЦЕНАРИЙ 3: АДМИН-ПАНЕЛЬ И ГЛАВНАЯ (ИСПРАВЛЕН ВЫХОД ИЗ ПАНЕЛИ)
     # -----------------------------------------------------------------
     else:
         if "is_admin_authed" not in st.session_state:
             st.session_state["is_admin_authed"] = False
 
+        # Если параметр ?admin= передан в URL, авторизуем и сразу очищаем URL,
+        # чтобы кнопка «Выйти из панели» работала с первого клика и не зацикливалась!
         if admin_param and verify_secret(admin_param, ADMIN_PASSWORD):
             st.session_state["is_admin_authed"] = True
+            try:
+                if "admin" in st.query_params:
+                    del st.query_params["admin"]
+            except Exception:
+                pass
 
-        # --- ГЛАВНАЯ СТРАНИЦА (ДЛЯ ГОСТЕЙ) ---
         if not st.session_state["is_admin_authed"]:
             st.title("📊 Аналитический портал тренажера")
             st.write("Добро пожаловать! Выберите свой раздел или войдите как администратор.")
-            
+
             c_info1, c_info2 = st.columns(2)
             with c_info1:
-                st.info("🎓 **Для учеников:**\nОткройте Telegram-бот и перейдите по кнопке «🌐 Открыть подробную веб-аналитику».")
+                st.info("🎓 **Для учеников:**\nОткройте Telegram-бот и нажмите «📊 Моя статистика» → «📱 Открыть аналитику в Telegram».")
             with c_info2:
                 st.success("👨‍🏫 **Для преподавателей:**\nИспользуйте персональную ссылку, которую бот выдал по команде `/teacher`.")
 
@@ -1369,10 +1935,13 @@ def run_dashboard_app():
             st.stop()
             return
 
-        # --- АДМИН-ПАНЕЛЬ ---
         st.title("🛡 Глобальная панель администратора")
-        if st.button("🚪 Выйти из панели"):
+        if st.button("🚪 Выйти из панели", key="admin_logout_btn"):
             st.session_state["is_admin_authed"] = False
+            try:
+                st.query_params.clear()
+            except Exception:
+                pass
             st.rerun()
             return
 
@@ -1390,16 +1959,15 @@ def run_dashboard_app():
             uname = f"@{uname_clean}" if uname_clean else f"ID: {uid}"
             user_labels_map[f"{fname} ({uname})"] = uid
 
-        # --- ВЕРХНЕЕ ОКНО С ФИЛЬТРАМИ ---
         with st.popover("⚙️ Параметры и фильтры", use_container_width=True):
             st.subheader("Настройки отображения")
-            
+
             users_options = ["Все пользователи"] + sorted(list(user_labels_map.keys()))
             selected_option = st.selectbox("Выберите пользователя:", users_options, key="admin_user_sel")
-            
+
             mode_options = ["Все режимы", "Только карточки", "Только тесты"]
             selected_mode = st.selectbox("Режим тренировки:", mode_options, key="admin_mode")
-            
+
             st.divider()
             period_choice = st.selectbox("Период для графиков:", TIME_WINDOW_OPTIONS, key="admin_period")
             custom_dates = None
@@ -1427,7 +1995,6 @@ def run_dashboard_app():
 
             window_df, prev_window_df, period_label = filter_df_by_time_window(mode_df, period_choice, custom_dates)
 
-        # --- ОСНОВНОЙ КОНТЕНТ ---
         if selected_option != "Все пользователи" and not entity_df.empty:
             s_row = entity_df.iloc[0]
             render_user_avatar_badge(s_row["full_name"], s_row["username"], s_row["user_id"])
@@ -1435,7 +2002,7 @@ def run_dashboard_app():
         if window_df.empty:
             st.warning(f"За выбранный период («{period_label}») пока нет данных.")
         else:
-            render_analytics_dashboard(window_df, is_class_view=(selected_option == "Все пользователи"), prev_df=prev_window_df, period_label=period_label)
+            render_analytics_dashboard(window_df, is_class_view=(selected_option == "Все пользователи"), prev_df=prev_window_df, period_label=period_label, key_prefix="admin")
 
         render_activity_calendar(unfiltered_date_df=entity_df, default_mode=selected_mode, key_prefix="admin_gh")
 
