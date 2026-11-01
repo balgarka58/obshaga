@@ -1807,7 +1807,7 @@ BTN_ERR_CARDS = "🗂 Проработать в карточках"
 BTN_ERR_TESTS = "🎯 Проверить в тесте"
 
 # Кнопки раздела «Моя статистика» и «Кабинет преподавателя» (полностью на нижней клавиатуре)
-BTN_STATS_WEBAPP = "📱 Открыть веб-аналитику"
+BTN_STATS_WEBAPP = "📱 Открыть аналитику"
 BTN_STATS_REMIND_ON = "🔔 Напоминания: Вкл"
 BTN_STATS_REMIND_OFF = "🔕 Напоминания: Выкл"
 BTN_STATS_RESET_LINK = "🔄 Сбросить ссылку"
@@ -1951,7 +1951,7 @@ class Keyboards:
             keyboard=rows,
             resize_keyboard=True,
             is_persistent=True,
-            input_field_placeholder="Введите название термина (от 3 букв)..."
+            input_field_placeholder="Введите название термина..."
         )
 
     @staticmethod
@@ -2172,22 +2172,6 @@ async def handle_reply_back_to_main(message: Message, state: FSMContext):
     await state.clear()
     text = "🏠 *Главное меню*\n\nВыберите формат тренировки:"
     await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
-
-
-@router.message(Command("help"))
-async def handle_help(message: Message, state: FSMContext):
-    text = (
-        "📖 *Команды бота:*\n\n"
-        "/start — Главное меню\n"
-        "/search — Умный поиск термина (с защитой от опечаток)\n"
-        "/work\\_errors — Работа над ошибками\n"
-        "/teacher — Кабинет преподавателя (код класса и аналитика)\n"
-        "/teachers — Мои преподаватели\n"
-        "/reset\\_link — Сбросить и обновить ссылку на аналитику\n\n"
-        "💡 _Чтобы подключиться к преподавателю, отправьте его 8-значный код сообщением в чат._"
-    )
-    await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
-
 
 # ---------------------------------------------------------------------
 # УЧИТЕЛЬСКАЯ СИСТЕМА И РОТАЦИЯ ТОКЕНОВ (НА НИЖНЕЙ КЛАВИАТУРЕ)
@@ -2454,7 +2438,6 @@ def _build_stats_view_sync(user_id: int, prefix_notice: str = "") -> Tuple[str, 
         "🔥 *Регулярность и серия занятий:*\n"
         f"• Текущая серия: *{stats['current_streak']} дн. подряд* (рекорд: *{stats['best_streak']} дн.*)\n"
         f"• Действий сегодня: *{stats['today_actions']}* | Активных дней за год: *{stats['active_days_year']}*\n"
-        f"• Вечерние напоминания: *{rem_status}*\n\n"
         "🗂 *Карточки:*\n"
         f"• Всего ответов: *{stats['cards_count']}*\n"
         f"• 🟢 Выучено надёжно: *{stats['learned']}*\n"
@@ -2464,7 +2447,6 @@ def _build_stats_view_sync(user_id: int, prefix_notice: str = "") -> Tuple[str, 
         f"• Вопросов решено: *{stats['tests_count']}*\n"
         f"• Точность: *{stats['tests_accuracy']}%* ({stats['tests_correct']} верно / {stats['tests_errors']} ошибок)\n"
         f"• Среднее время: *{stats['tests_avg_time']} сек*\n\n"
-        f"🌐 *Ссылка на веб-аналитику (для ПК и браузера):*\n{escape_md(student_web_url)}"
     )
     keyboard = Keyboards.stats_reply(student_web_url, reminders_on)
     return text, keyboard
