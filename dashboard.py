@@ -306,11 +306,11 @@ MONTH_FULL_RU = {
     7: "Июль", 8: "Август", 9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
 }
 MODULE_SHORT_BADGE = {
-    "1. Человек и общество": "1. Общество",
-    "2. Экономика": "2. Экономика",
-    "3. Социальные отношения": "3. Социум",
-    "4. Политика": "4. Политика",
-    "5. Право": "5. Право",
+    "1. Человек и общество": "Общество",
+    "2. Экономика": "Экономика",
+    "3. Социальные отношения": "Социум",
+    "4. Политика": "Политика",
+    "5. Право": "Право",
 }
 
 
@@ -1515,17 +1515,19 @@ def build_calendar_html(cal_data: Dict[str, Any]) -> str:
             margin-top: 8px;
             padding: 8px 10px;
             min-height: 36px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            display: block;
             background: var(--cal-bar-bg);
             border: 1px solid var(--cal-border);
             border-radius: 8px;
             font-size: 12px;
-            line-height: 1.3;
+            line-height: 1.4;
             color: var(--cal-text);
             text-align: center;
-            word-break: break-word;
+            overflow-wrap: break-word;
+        }}
+        .cal-date-nowrap {{
+            white-space: nowrap;
+            font-weight: 700;
         }}
 
         @media (max-width: 720px) {{
@@ -1581,12 +1583,12 @@ def build_calendar_html(cal_data: Dict[str, Any]) -> str:
 
         function formatDayMessage(dateStr, count, cards, tests, acc, mode) {{
             if (Number(count) === 0) {{
-                return "📅 <b>" + dateStr + "</b> — 0 действий (" + mode + ")";
+                return "<span class='cal-date-nowrap'>📅 " + dateStr + "</span> — 0 действий (" + mode + ")";
             }}
             if (mode === "Все действия") {{
-                return "📅 <b>" + dateStr + "</b>: <b>" + count + "</b> (Карточек: " + cards + ", Тестов: " + tests + " | Точность: " + acc + "%)";
+                return "<span class='cal-date-nowrap'>📅 " + dateStr + ": " + count + "</span> (Карточек: " + cards + ", Тестов: " + tests + " | Точность: " + acc + "%)";
             }}
-            return "📅 <b>" + dateStr + "</b>: <b>" + count + "</b> (" + mode + " | Точность: " + acc + "%)";
+            return "<span class='cal-date-nowrap'>📅 " + dateStr + ": " + count + "</span> (" + mode + " | Точность: " + acc + "%)";
         }}
 
         function showCalDetail(dateStr, count, cards, tests, acc, mode) {{
@@ -1657,18 +1659,7 @@ def render_activity_calendar(
         st.info("ℹ️ Пока нет данных для отображения календаря.")
         return
 
-    counter_options = ["Все режимы", "Только карточки", "Только тесты"]
-    default_idx = counter_options.index(default_mode) if default_mode in counter_options else 0
-
-    chosen_counter = st.radio(
-        "Счётчик календаря активности:",
-        counter_options,
-        index=default_idx,
-        horizontal=True,
-        key=f"{key_prefix}_calendar_counter"
-    )
-
-    cal_data = build_calendar_data(unfiltered_date_df, counter_mode=chosen_counter)
+    cal_data = build_calendar_data(unfiltered_date_df, counter_mode=default_mode)
 
     c_s1, c_s2, c_s3, c_s4 = st.columns(4)
     c_s1.metric("🔥 Текущая серия", f"{cal_data['current_streak']} дн.")
@@ -1991,12 +1982,21 @@ def render_analytics_dashboard(
 
     st.divider()
 
-    plotly_cfg = {"displayModeBar": False, "responsive": True}
+    plotly_cfg = {
+        "displayModeBar": False,
+        "responsive": True,
+        "staticPlot": True,
+        "scrollZoom": False,
+        "doubleClick": False,
+        "showAxisDragHandles": False,
+    }
     pie_common_layout = dict(
         height=235,
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(t=6, b=36, l=8, r=8),
+        hovermode=False,
+        dragmode=False,
         legend=dict(
             orientation="h",
             yanchor="top",
@@ -2004,6 +2004,8 @@ def render_analytics_dashboard(
             xanchor="center",
             x=0.5,
             font=dict(size=12),
+            itemclick=False,
+            itemdoubleclick=False,
         ),
     )
 
@@ -2021,6 +2023,8 @@ def render_analytics_dashboard(
             domain=dict(x=[0.08, 0.92], y=[0.08, 0.96]),
             textposition="inside",
             textinfo="percent",
+            hoverinfo="skip",
+            hovertemplate=None,
         )
         fig_status.update_layout(**pie_common_layout)
         st.plotly_chart(fig_status, use_container_width=True, config=plotly_cfg)
@@ -2036,6 +2040,8 @@ def render_analytics_dashboard(
                 domain=dict(x=[0.08, 0.92], y=[0.08, 0.96]),
                 textposition="inside",
                 textinfo="percent",
+                hoverinfo="skip",
+                hovertemplate=None,
             )
             fig_modules.update_layout(**pie_common_layout)
             st.plotly_chart(fig_modules, use_container_width=True, config=plotly_cfg)
@@ -2070,16 +2076,29 @@ def render_analytics_dashboard(
             module_time,
             x="module_short",
             y="time_sec_clamped",
+            text="time_sec_clamped",
             labels={"module_short": "Блок", "time_sec_clamped": "Секунды"},
             color="time_sec_clamped",
             color_continuous_scale="Blues"
         )
+        fig_time.update_traces(
+            texttemplate="%{text}с",
+            textposition="outside",
+            cliponaxis=False,
+            hoverinfo="skip",
+            hovertemplate=None,
+        )
+        max_y = float(module_time["time_sec_clamped"].max()) if not module_time.empty else 10.0
         fig_time.update_layout(
             height=250,
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(t=8, b=20, l=10, r=10),
+            margin=dict(t=22, b=20, l=10, r=10),
             coloraxis_showscale=False,
+            hovermode=False,
+            dragmode=False,
+            xaxis=dict(fixedrange=True, title="Блок"),
+            yaxis=dict(fixedrange=True, title="Секунды", range=[0, max(5.0, max_y * 1.22)]),
         )
         st.plotly_chart(fig_time, use_container_width=True, config=plotly_cfg)
 
@@ -2092,7 +2111,7 @@ def render_analytics_dashboard(
     ).strip()
 
     if search_q:
-        clean_q = _normalize_search_str(search_q).strip()
+        clean_q = _normalize_search_str(search_q[:60]).strip()
         if len(clean_q) < 3:
             st.info("Введите минимум 3 буквы для запуска умного поиска.")
         else:
