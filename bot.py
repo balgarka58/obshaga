@@ -818,6 +818,9 @@ class Database:
         self._user_settings_cache: Dict[int, Tuple[float, int, bool]] = {}
         self._cache_ttl = 600.0  # 10 минут
         self._max_cache_size = 2000
+        self._write_queue_lock = threading.Lock()
+        self._pending_writes: List[Tuple[int, Optional[str], Optional[str], str]] = []
+        self._flush_task: Optional[asyncio.Task] = None
 
     def get_connection(self):
         if self.is_postgres:
@@ -1027,40 +1030,59 @@ class Database:
                 else:
                     self._user_entries_cache.pop(user_id, None)
 
-    def _insert_answer_to_db_sync(self, user_id: int, username: Optional[str], full_name: Optional[str], entry_str: str):
-        """Выполняет физическую запись ответа в БД."""
+    def _insert_batch_to_db_sync(self, batch: List[Tuple[int, Optional[str], Optional[str], str]]):
+        """Выполняет пакетную запись (Batch Insert) всех накопившихся ответов за 1 транзакцию."""
+        if not batch:
+            return
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
             if self.is_postgres:
-                cursor.execute(
+                cursor.executemany(
                     "INSERT INTO user_answers (user_id, username, full_name, entry) VALUES (%s, %s, %s, %s);",
-                    (user_id, username, full_name, entry_str)
+                    batch
                 )
             else:
-                cursor.execute(
+                cursor.executemany(
                     "INSERT INTO user_answers (user_id, username, full_name, entry) VALUES (?, ?, ?, ?);",
-                    (user_id, username, full_name, entry_str)
+                    batch
                 )
             conn.commit()
         except Exception as e:
-            logger.error(f"Ошибка фоновой записи ответа в БД для user_id={user_id}: {e}")
+            logger.error(f"Ошибка пакетной записи ({len(batch)} шт.) в БД: {e}")
         finally:
             cursor.close()
             conn.close()
 
+    def flush_pending_writes_sync(self):
+        """Принудительно сбрасывает буфер ответов на диск в БД (вызывается фоновым воркером и при остановке бота)."""
+        with self._write_queue_lock:
+            if not self._pending_writes:
+                return
+            batch = list(self._pending_writes)
+            self._pending_writes.clear()
+        self._insert_batch_to_db_sync(batch)
+
+    async def _delayed_batch_flush(self):
+        """Копит ответы в течение 0.8 сек и записывает их в БД одним пакетным запросом (разгружает БД в 10-20 раз)."""
+        try:
+            await asyncio.sleep(0.8)
+            await asyncio.to_thread(self.flush_pending_writes_sync)
+        except Exception as e:
+            logger.error(f"Ошибка в _delayed_batch_flush: {e}")
+
     def save_answer_entry(self, user_id: int, username: Optional[str], full_name: Optional[str], entry_str: str):
-        """Синхронное сохранение ответа: обновляет RAM-кэш и пишет в БД."""
+        """Синхронное сохранение ответа: обновляет RAM-кэш и сразу пишет в БД."""
         now_dt = datetime.now(timezone.utc)
         self._update_ram_cache_on_answer(user_id, entry_str, now_dt)
-        self._insert_answer_to_db_sync(user_id, username, full_name, entry_str)
+        self._insert_batch_to_db_sync([(user_id, username, full_name, entry_str)])
 
     async def save_answer_entry_fast(self, user_id: int, username: Optional[str], full_name: Optional[str], entry_str: str):
         """
-        Неблокирующее сохранение ответа (Optimistic UI):
+        Неблокирующее пакетное сохранение ответа (Optimistic UI + Batch Queue):
         1) Если кэш пользователя ещё не прогрет в RAM — прогревает его 1 раз.
         2) Мгновенно обновляет RAM-кэш (следующая карточка выбирается сразу с новым весом за 0.001с).
-        3) Запись в БД отправляется в фоновую задачу, не задерживая отправку следующего сообщения.
+        3) Добавляет ответ в буфер пакетной записи и планирует фоновый сброс через 0.8с.
         """
         with self._cache_lock:
             is_cached = (
@@ -1072,7 +1094,15 @@ class Database:
 
         now_dt = datetime.now(timezone.utc)
         self._update_ram_cache_on_answer(user_id, entry_str, now_dt)
-        asyncio.create_task(asyncio.to_thread(self._insert_answer_to_db_sync, user_id, username, full_name, entry_str))
+
+        with self._write_queue_lock:
+            self._pending_writes.append((user_id, username, full_name, entry_str))
+            should_flush_immediately = len(self._pending_writes) >= 25
+
+        if should_flush_immediately:
+            asyncio.create_task(asyncio.to_thread(self.flush_pending_writes_sync))
+        elif self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._delayed_batch_flush())
 
     def archive_old_answers(self, days_threshold: int = 30) -> int:
         """
@@ -1083,6 +1113,7 @@ class Database:
         Отфильтровывает случайные мисклики в тестах (< 3 сек), ограничивает аномальные AFK-тайминги
         и сохраняет точное число попыток, ошибок, весов и имя пользователя.
         """
+        self.flush_pending_writes_sync()
         cutoff_local_date = get_local_today() - timedelta(days=days_threshold)
         cutoff_dt = datetime(
             cutoff_local_date.year, cutoff_local_date.month, cutoff_local_date.day,
@@ -1367,16 +1398,21 @@ class Database:
         entries = self._fetch_user_entries(user_id)
         return self._compute_progress_from_entries(entries)
 
-    def get_problem_term_codes(self, user_id: int) -> List[str]:
+    def get_problem_term_codes(
+        self,
+        user_id: int,
+        pre_entries: Optional[List[str]] = None,
+        pre_progress: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> List[str]:
         """
-        Возвращает список кодов проблемных терминов:
+        Возвращает список кодов проблемных терминов за 1 проход:
         - Если последнее действие по термину было в режиме теста и ответ верный (is_test_ok),
-          термин считается успешно проработанным (больше не застревает навечно после теста).
+          термин считается успешно проработанным.
         - Если последняя карточка или последний тест были с ошибкой, либо вес карточки >= 7.0
           (при отсутствии более свежего успешного теста), термин включается в список ошибок.
         """
-        entries = self._fetch_user_entries(user_id)
-        progress_map = self._compute_progress_from_entries(entries)
+        entries = pre_entries if pre_entries is not None else self._fetch_user_entries(user_id)
+        progress_map = pre_progress if pre_progress is not None else self._compute_progress_from_entries(entries)
 
         last_card_problem: Dict[str, bool] = {}
         last_test_problem: Dict[str, bool] = {}
@@ -1401,10 +1437,9 @@ class Database:
                         last_test_problem[code] = is_err
                         last_action_mode[code] = "test"
                         if not is_err:
-                            # Успешное прохождение термина в тесте снимает старый флаг ошибки карточки
                             last_card_problem[code] = False
                 else:
-                    if sec >= 1.0:
+                    if sec >= 0.0:
                         last_card_problem[code] = (d_ans > 0)
                         last_action_mode[code] = "card"
 
@@ -1472,9 +1507,14 @@ class Database:
                     pass
         return None
 
-    def get_user_streak_info(self, user_id: int, reference_date: Optional[date] = None) -> Dict[str, int]:
+    def get_user_streak_info(
+        self,
+        user_id: int,
+        reference_date: Optional[date] = None,
+        pre_rows: Optional[List[Tuple[str, Any]]] = None,
+    ) -> Dict[str, int]:
         today_dt = reference_date or get_local_today()
-        rows = self._fetch_user_entries_with_timestamps(user_id)
+        rows = pre_rows if pre_rows is not None else self._fetch_user_entries_with_timestamps(user_id)
 
         active_dates_set = set()
         today_actions = 0
@@ -1539,7 +1579,9 @@ class Database:
         }
 
     def get_user_stats(self, user_id: int) -> Dict[str, Any]:
-        entries = self._fetch_user_entries(user_id)
+        """Вычисляет все показатели статистики за один запрос к кэшу/БД без повторного чтения."""
+        rows = self._fetch_user_entries_with_timestamps(user_id)
+        entries = [r[0] for r in rows]
         progress_map = self._compute_progress_from_entries(entries)
 
         cards_count = 0
@@ -1577,8 +1619,8 @@ class Database:
         in_progress = sum(1 for p in progress_map.values() if 3.0 < p["total_weight"] < 7.0)
         needs_review = sum(1 for p in progress_map.values() if p["total_weight"] >= 7.0)
 
-        streak_info = self.get_user_streak_info(user_id)
-        problem_count = len(self.get_problem_term_codes(user_id))
+        streak_info = self.get_user_streak_info(user_id, pre_rows=rows)
+        problem_count = len(self.get_problem_term_codes(user_id, pre_entries=entries, pre_progress=progress_map))
 
         return {
             "cards_count": cards_count,
@@ -3678,14 +3720,49 @@ async def handle_test_restart_reply(message: Message, state: FSMContext):
         await send_next_test_msg(message, state)
 
 
+# Набор служебных кнопок, которые НЕ должны запускать поиск термина, если нажаты после перезапуска сервера
+SYSTEM_UI_BUTTONS_SET = {
+    BTN_CARD_FLIP,
+    BTN_CARD_KNOW,
+    BTN_CARD_UNSURE,
+    BTN_CARD_FORGOT,
+    BTN_CARD_DETAIL,
+    BTN_TEST_NEXT,
+    BTN_TEST_SHOW_ERRORS,
+    BTN_TEST_RESTART,
+    BTN_CONFIRM_RESET_YES,
+    BTN_TEACHER_RESET_LINK,
+    BTN_STATS_WEBAPP,
+    BTN_TEACHER_WEBAPP,
+    "1", "2", "3", "4",
+} | set(TOPIC_BUTTONS_MAP.keys())
+
+
 # Универсальный перехватчик текстового ввода в любом состоянии:
-# если пользователь написал слово от 3 букв — запускаем нечёткий поиск (с удалением сообщения юзера)
+# если пользователь написал слово от 3 букв — запускаем нечёткий поиск;
+# если нажата кнопка старой сессии после перезапуска сервера — мягко восстанавливаем режим или меню.
 @router.message(F.text)
 async def handle_universal_text_fallback(message: Message, state: FSMContext):
     uid = message.from_user.id if message.from_user else message.chat.id
     async with user_lock_manager.get_lock(uid):
         txt = (message.text or "").strip()
-        if len(txt) >= 3 and not txt.startswith("/"):
+
+        # Если после рестарта сервера пользователь нажал кнопку карточки — бесшовно продолжаем карточки
+        if txt in {BTN_CARD_FLIP, BTN_CARD_KNOW, BTN_CARD_UNSURE, BTN_CARD_FORGOT, BTN_CARD_DETAIL} and message.from_user:
+            await state.set_state(UserFlow.in_flashcards)
+            await send_next_flashcard_msg(message, message.from_user.id, state)
+            return
+
+        # Если после рестарта нажата кнопка выбора темы — запускаем карточки по выбранной теме
+        if txt in TOPIC_BUTTONS_MAP and message.from_user:
+            topic_val = TOPIC_BUTTONS_MAP[txt]
+            mod_filter = None if topic_val == "all" else int(topic_val)
+            await state.update_data(module_filter=mod_filter, mode="cards", custom_codes=None, is_error_workout=False)
+            await state.set_state(UserFlow.in_flashcards)
+            await send_next_flashcard_msg(message, message.from_user.id, state)
+            return
+
+        if len(txt) >= 3 and not txt.startswith("/") and txt not in SYSTEM_UI_BUTTONS_SET:
             await state.set_state(UserFlow.in_search)
             await _process_search_query_unlocked(message, state)
         else:
@@ -3836,6 +3913,7 @@ async def main():
         await live_logger.report_error(bot, fatal_err, context_info="main_polling")
         raise
     finally:
+        await asyncio.to_thread(db.flush_pending_writes_sync)
         bg_task.cancel()
         try:
             await bg_task
