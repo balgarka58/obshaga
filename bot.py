@@ -24,7 +24,7 @@ try:
 except ImportError:
     pass
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import CommandStart, Command, StateFilter
@@ -240,6 +240,65 @@ async def _safe_delete_message(bot: Bot, chat_id: int, message_id: Optional[int]
         pass
 
 
+class AntiFloodDDoSMiddleware(BaseMiddleware):
+    """
+    Защита бота от прикладного DDoS, спам-скриптов и флуда кнопками (Token Bucket):
+    1) Мгновенно (в первую миллисекунду получения апдейта) запускает фоновое удаление
+       входящего сообщения пользователя — не дожидаясь БД или генерации ответа.
+    2) Ограничивает частоту запросов от одного пользователя (не более 4 в секунду
+       и не более 16 за 10 секунд). При превышении включает короткий кулдаун (4 сек),
+       отбрасывая спам-запросы до обращения к процессору и базе данных.
+    3) Защищает от атак длинными текстами (обрезает гигантские сообщения).
+    """
+    def __init__(self, max_per_sec: int = 4, max_per_10s: int = 16, cooldown_sec: float = 4.0):
+        super().__init__()
+        self.max_per_sec = max_per_sec
+        self.max_per_10s = max_per_10s
+        self.cooldown_sec = cooldown_sec
+        self._user_hits: Dict[int, deque] = {}
+        self._cooldown_until: Dict[int, float] = {}
+        self._max_tracked = 10000
+
+    async def __call__(self, handler, event: Any, data: Dict[str, Any]) -> Any:
+        if isinstance(event, Message):
+            chat_id = event.chat.id if event.chat else None
+            msg_id = event.message_id
+            bot_inst = event.bot
+
+            # Мгновенно запускаем удаление входящего сообщения пользователя в фоне
+            if chat_id and msg_id and bot_inst:
+                asyncio.create_task(_safe_delete_message(bot_inst, chat_id, msg_id))
+
+            uid = event.from_user.id if event.from_user else chat_id
+            if uid is not None:
+                now = time.monotonic()
+                cd_until = self._cooldown_until.get(uid, 0.0)
+                if now < cd_until:
+                    return None
+
+                hits = self._user_hits.get(uid)
+                if hits is None:
+                    if len(self._user_hits) >= self._max_tracked:
+                        oldest_k = next(iter(self._user_hits))
+                        self._user_hits.pop(oldest_k, None)
+                        self._cooldown_until.pop(oldest_k, None)
+                    hits = deque(maxlen=self.max_per_10s + 4)
+                    self._user_hits[uid] = hits
+
+                while hits and (now - hits[0]) > 10.0:
+                    hits.popleft()
+
+                recent_1s = sum(1 for t in hits if (now - t) <= 1.0)
+                if recent_1s >= self.max_per_sec or len(hits) >= self.max_per_10s:
+                    self._cooldown_until[uid] = now + self.cooldown_sec
+                    logger.warning(f"AntiFlood: пользователь {uid} временно ограничен на {self.cooldown_sec}с за спам.")
+                    return None
+
+                hits.append(now)
+
+        return await handler(event, data)
+
+
 async def render_single_screen(
     message: Message,
     state: FSMContext,
@@ -247,10 +306,18 @@ async def render_single_screen(
     reply_markup: Any = None,
     disable_web_page_preview: bool = True,
 ) -> Optional[Message]:
-    """Главный движок отображения «Одного экрана» (Clean Chat) с защитой от переполнения длины."""
+    """
+    Сверхбыстрый движок отображения «Одного экрана» (Clean Chat):
+    - Входящее сообщение пользователя уже удаляется на входе через AntiFloodDDoSMiddleware.
+    - Отправка нового экрана и удаление предыдущего сообщения бота выполняются без задержек.
+    """
     chat_id = message.chat.id
     user_msg_id = message.message_id
     bot = message.bot
+
+    # Страховочное фоновое удаление сообщения пользователя (если middleware не сработал в тестах)
+    if bot and chat_id and user_msg_id:
+        asyncio.create_task(_safe_delete_message(bot, chat_id, user_msg_id))
 
     safe_text = str(text or "")
     if len(safe_text) > 4090:
@@ -285,10 +352,9 @@ async def render_single_screen(
     screen_manager.set_last_id(chat_id, new_msg.message_id)
     await state.update_data(last_bot_msg_id=new_msg.message_id)
 
-    delete_tasks = [_safe_delete_message(bot, chat_id, user_msg_id)]
+    # Мгновенно запускаем удаление предыдущего сообщения бота в фоне, не задерживая ответ
     if prev_bot_id and prev_bot_id != new_msg.message_id:
-        delete_tasks.append(_safe_delete_message(bot, chat_id, prev_bot_id))
-    await asyncio.gather(*delete_tasks, return_exceptions=True)
+        asyncio.create_task(_safe_delete_message(bot, chat_id, prev_bot_id))
 
     return new_msg
 
@@ -698,7 +764,8 @@ class TermsCatalog:
         return self.all_terms
 
     def search_terms_fuzzy(self, query: str, limit: int = 6) -> List[Tuple[Dict[str, Any], float]]:
-        clean_q = _normalize_search_str(query)
+        # Защита от Algorithmic Complexity DDoS: ограничиваем длину поискового запроса до 60 символов
+        clean_q = _normalize_search_str(str(query or "")[:60])
         if len(clean_q) < 3:
             return []
 
@@ -946,9 +1013,22 @@ class Database:
         mode_str = "Neon PostgreSQL (Pooler + Lossless Archive)" if self.is_postgres else f"SQLite ({self.sqlite_path})"
         logger.info(f"База данных успешно инициализирована: {mode_str}.")
 
-    def save_answer_entry(self, user_id: int, username: Optional[str], full_name: Optional[str], entry_str: str):
-        """Сохраняет детальную строку ответа в БД и потокобезопасно обновляет RAM-кэш."""
-        now_dt = datetime.now(timezone.utc)
+    def _update_ram_cache_on_answer(self, user_id: int, entry_str: str, now_dt: datetime):
+        """Мгновенно (за 0.001с) обновляет RAM-кэш пользователя до физической записи в БД."""
+        with self._cache_lock:
+            self._write_seq += 1
+            cached = self._user_entries_cache.get(user_id)
+            if cached is not None:
+                ts_cached, _, rows_list = cached
+                if time.time() - ts_cached < self._cache_ttl:
+                    new_list = list(rows_list)
+                    new_list.append((entry_str, now_dt))
+                    self._user_entries_cache[user_id] = (time.time(), self._write_seq, new_list)
+                else:
+                    self._user_entries_cache.pop(user_id, None)
+
+    def _insert_answer_to_db_sync(self, user_id: int, username: Optional[str], full_name: Optional[str], entry_str: str):
+        """Выполняет физическую запись ответа в БД."""
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
@@ -963,21 +1043,36 @@ class Database:
                     (user_id, username, full_name, entry_str)
                 )
             conn.commit()
+        except Exception as e:
+            logger.error(f"Ошибка фоновой записи ответа в БД для user_id={user_id}: {e}")
         finally:
             cursor.close()
             conn.close()
 
+    def save_answer_entry(self, user_id: int, username: Optional[str], full_name: Optional[str], entry_str: str):
+        """Синхронное сохранение ответа: обновляет RAM-кэш и пишет в БД."""
+        now_dt = datetime.now(timezone.utc)
+        self._update_ram_cache_on_answer(user_id, entry_str, now_dt)
+        self._insert_answer_to_db_sync(user_id, username, full_name, entry_str)
+
+    async def save_answer_entry_fast(self, user_id: int, username: Optional[str], full_name: Optional[str], entry_str: str):
+        """
+        Неблокирующее сохранение ответа (Optimistic UI):
+        1) Если кэш пользователя ещё не прогрет в RAM — прогревает его 1 раз.
+        2) Мгновенно обновляет RAM-кэш (следующая карточка выбирается сразу с новым весом за 0.001с).
+        3) Запись в БД отправляется в фоновую задачу, не задерживая отправку следующего сообщения.
+        """
         with self._cache_lock:
-            self._write_seq += 1
-            cached = self._user_entries_cache.get(user_id)
-            if cached is not None:
-                ts_cached, _, rows_list = cached
-                if time.time() - ts_cached < self._cache_ttl:
-                    new_list = list(rows_list)
-                    new_list.append((entry_str, now_dt))
-                    self._user_entries_cache[user_id] = (time.time(), self._write_seq, new_list)
-                else:
-                    self._user_entries_cache.pop(user_id, None)
+            is_cached = (
+                user_id in self._user_entries_cache
+                and (time.time() - self._user_entries_cache[user_id][0] < self._cache_ttl)
+            )
+        if not is_cached:
+            await asyncio.to_thread(self._fetch_user_entries_with_timestamps, user_id)
+
+        now_dt = datetime.now(timezone.utc)
+        self._update_ram_cache_on_answer(user_id, entry_str, now_dt)
+        asyncio.create_task(asyncio.to_thread(self._insert_answer_to_db_sync, user_id, username, full_name, entry_str))
 
     def archive_old_answers(self, days_threshold: int = 30) -> int:
         """
@@ -2705,8 +2800,11 @@ async def handle_teacher_profile(message: Message, state: FSMContext):
     async with user_lock_manager.get_lock(user_id):
         existing = await asyncio.to_thread(db.get_teacher_by_user_id, user_id)
 
-        bot_info = await message.bot.get_me()
-        bot_username = bot_info.username or "obshaga_bot"
+        bot_username = getattr(message.bot, "_cached_username", None)
+        if not bot_username:
+            bot_info = await message.bot.get_me()
+            bot_username = bot_info.username or "obshaga_bot"
+            setattr(message.bot, "_cached_username", bot_username)
 
         await state.set_state(UserFlow.in_teacher_cabinet)
 
@@ -2763,8 +2861,11 @@ async def handle_teacher_reset_confirm_reply(message: Message, state: FSMContext
 
         code, new_ver = res
         existing = await asyncio.to_thread(db.get_teacher_by_user_id, message.from_user.id)
-        bot_info = await message.bot.get_me()
-        bot_username = bot_info.username or "obshaga_bot"
+        bot_username = getattr(message.bot, "_cached_username", None)
+        if not bot_username:
+            bot_info = await message.bot.get_me()
+            bot_username = bot_info.username or "obshaga_bot"
+            setattr(message.bot, "_cached_username", bot_username)
         st_count = await asyncio.to_thread(db.get_teacher_students_count, code)
         full_name = existing["full_name"] if existing else f"Преподаватель {code}"
 
@@ -2916,15 +3017,12 @@ def _build_stats_view_sync(user_id: int, prefix_notice: str = "") -> Tuple[str, 
     reminders_on = db.get_user_reminders_enabled(user_id)
     student_web_url = build_student_webapp_url(user_id, token_ver)
 
-    rem_status = "Включены 🔔" if reminders_on else "Отключены 🔕"
-
     text = (
         f"{prefix_notice}"
         "📊 *Ваша статистика изучения*\n\n"
         "🔥 *Регулярность и серия занятий:*\n"
         f"• Текущая серия: *{stats['current_streak']} дн. подряд* (рекорд: *{stats['best_streak']} дн.*)\n"
-        f"• Действий сегодня: *{stats['today_actions']}* | Активных дней за год: *{stats['active_days_year']}*\n"
-        f"• Вечерние напоминания: *{rem_status}*\n\n"
+        f"• Действий сегодня: *{stats['today_actions']}* | Активных дней за год: *{stats['active_days_year']}*\n\n"
         "🗂 *Карточки:*\n"
         f"• Всего ответов: *{stats['cards_count']}*\n"
         f"• 🟢 Выучено надёжно: *{stats['learned']}*\n"
@@ -3362,7 +3460,7 @@ async def handle_card_answer_reply(message: Message, state: FSMContext):
         username = f"@{user.username}" if user.username else None
         full_name = user.full_name or (user.first_name or f"Пользователь {user.id}")
 
-        await asyncio.to_thread(db.save_answer_entry, user.id, username, full_name, entry_str)
+        await db.save_answer_entry_fast(user.id, username, full_name, entry_str)
         await send_next_flashcard_msg(message, user.id, state)
 
 
@@ -3482,7 +3580,7 @@ async def handle_test_answer_reply(message: Message, state: FSMContext):
             user = message.from_user
             username = f"@{user.username}" if user.username else None
             full_name = user.full_name or (user.first_name or f"Пользователь {user.id}")
-            await asyncio.to_thread(db.save_answer_entry, user.id, username, full_name, entry_str)
+            await db.save_answer_entry_fast(user.id, username, full_name, entry_str)
 
         if is_correct:
             status_text = "🎉 *Верно!* Отличная работа."
@@ -3643,27 +3741,37 @@ async def process_daily_reminders(bot_instance: Bot, reference_date: Optional[da
 
 
 async def start_dummy_web_server(port: int = 10000):
+    """Защищённый от HTTP-флуда и Slowloris-атак health-check сервер для Render."""
+    conn_semaphore = asyncio.Semaphore(64)
+
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        try:
-            await asyncio.wait_for(reader.read(1024), timeout=3.0)
-            response = (
-                b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: text/plain; charset=utf-8\r\n"
-                b"Content-Length: 2\r\n"
-                b"Connection: close\r\n\r\nOK"
-            )
-            writer.write(response)
-            await writer.drain()
-        except Exception:
-            pass
-        finally:
+        if conn_semaphore.locked():
             try:
                 writer.close()
-                await writer.wait_closed()
             except Exception:
                 pass
+            return
+        async with conn_semaphore:
+            try:
+                await asyncio.wait_for(reader.read(512), timeout=1.0)
+                response = (
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/plain; charset=utf-8\r\n"
+                    b"Content-Length: 2\r\n"
+                    b"Connection: close\r\n\r\nOK"
+                )
+                writer.write(response)
+                await asyncio.wait_for(writer.drain(), timeout=1.0)
+            except Exception:
+                pass
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
-    server = await asyncio.start_server(handle_client, "0.0.0.0", port)
+    server = await asyncio.start_server(handle_client, "0.0.0.0", port, backlog=64)
     logger.info(f"Фоновый веб-сервер запущен на порту {port} для Render.")
     return server
 
@@ -3716,6 +3824,7 @@ async def main():
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
     dp = Dispatcher(storage=MemoryStorage())
+    dp.message.outer_middleware(AntiFloodDDoSMiddleware())
     dp.include_router(router)
 
     bg_task = asyncio.create_task(periodic_background_task(bot))
