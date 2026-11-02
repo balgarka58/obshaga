@@ -523,11 +523,6 @@ def _compute_similarity_preindexed(
     return round(max(full_combined, word_best), 4)
 
 
-def SequenceMatcher_quick_reject(a: str, b: str) -> bool:
-    """Быстрая проверка: если нет общих символов, SequenceMatcher не даст >= 0.45."""
-    return not (set(a) & set(b))
-
-
 def compute_fuzzy_similarity(query: str, target: str) -> float:
     q_norm = _normalize_search_str(query)
     t_norm = _normalize_search_str(target)
@@ -988,10 +983,16 @@ class Database:
         """
         Фоновое сжатие (Lossless Rollup):
         Схлопывает ответы старше 30 дней в компактную таблицу user_daily_archive.
+        Граница cutoff_dt выравнивается строго по полуночи локального часового пояса (TZ),
+        чтобы календарные сутки никогда не дробились на части между user_answers и user_daily_archive.
         Отфильтровывает случайные мисклики в тестах (< 3 сек), ограничивает аномальные AFK-тайминги
         и сохраняет точное число попыток, ошибок, весов и имя пользователя.
         """
-        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=days_threshold)
+        cutoff_local_date = get_local_today() - timedelta(days=days_threshold)
+        cutoff_dt = datetime(
+            cutoff_local_date.year, cutoff_local_date.month, cutoff_local_date.day,
+            0, 0, 0, tzinfo=TZ
+        ).astimezone(timezone.utc)
         conn = self.get_connection()
         cursor = conn.cursor()
         compressed_count = 0
@@ -1169,7 +1170,7 @@ class Database:
                     a_date = ar[0]
                     a_mode = str(ar[1]).strip()
                     a_code = str(ar[2]).strip()
-                    a_tries = max(1, min(500, int(ar[3] or 1)))
+                    a_tries = max(1, int(ar[3] or 1))
                     a_err = max(0, min(a_tries, int(ar[4] or 0)))
                     a_ok = a_tries - a_err
                     a_sec = round(max(0.0, float(ar[5] or 0.0)) / a_tries, 1)
@@ -1650,7 +1651,7 @@ class Database:
                     if r and r[0] is not None:
                         recent_uids_set.add(int(r[0]))
             else:
-                cutoff_str = (yesterday_dt - timedelta(days=1)).isoformat()
+                cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
                 cursor.execute("SELECT DISTINCT user_id FROM user_answers WHERE created_at >= ?;", (cutoff_str,))
                 for r in cursor.fetchall():
                     if r and r[0] is not None:
