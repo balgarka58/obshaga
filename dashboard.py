@@ -1820,7 +1820,7 @@ def render_analytics_dashboard(
     st.subheader("🔎 Поиск статистики по конкретному термину")
     search_q = st.text_input(
         "Введите название термина:",
-        key=f"{key_prefix}_term_fuzzy_search",
+        key=f"{key_prefix}_term_fuzzy_search"
     ).strip()
 
     if search_q:
