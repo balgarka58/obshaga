@@ -48,24 +48,95 @@ try {
         window.Telegram.WebApp.expand();
     }
 } catch (e) {}
+
+// Дополнительная зачистка плавающего бейджа Streamlit Cloud и GitHub-аватарки в родительском окне
+(function() {
+    function hideCloudBadges() {
+        try {
+            var docs = [document];
+            try { if (window.parent && window.parent.document) docs.push(window.parent.document); } catch (e) {}
+            docs.forEach(function(doc) {
+                var selectors = [
+                    'div[class*="viewerBadge"]',
+                    'div[class*="ProfileBadge"]',
+                    'div[class*="profileBadge"]',
+                    'a[class*="viewerBadge"]',
+                    'a[href*="streamlit.io/cloud"]',
+                    '#manage-app-button',
+                    '[data-testid="manage-app-button"]',
+                    '[data-testid="stElementToolbar"]',
+                    '.modebar-container',
+                    '.modebar',
+                    'img[src*="githubusercontent.com"]',
+                    'img[src*="avatars.githubusercontent.com"]'
+                ];
+                selectors.forEach(function(sel) {
+                    doc.querySelectorAll(sel).forEach(function(el) {
+                        el.style.setProperty('display', 'none', 'important');
+                        el.style.setProperty('visibility', 'hidden', 'important');
+                        el.style.setProperty('opacity', '0', 'important');
+                        el.style.setProperty('pointer-events', 'none', 'important');
+                    });
+                });
+            });
+        } catch (err) {}
+    }
+    hideCloudBadges();
+    setInterval(hideCloudBadges, 800);
+})();
 </script>
 <style>
-#MainMenu {visibility: hidden; display: none !important;}
-header {visibility: hidden; display: none !important;}
-footer {visibility: hidden; display: none !important;}
-[data-testid="stToolbar"] {visibility: hidden; display: none !important;}
-[data-testid="stDecoration"] {visibility: hidden; display: none !important;}
-[data-testid="stStatusWidget"] {visibility: hidden; display: none !important;}
-[data-testid="stSidebar"] {display: none !important;}
-.viewerBadge_container__1QSob {display: none !important;}
-div[class*="viewerBadge"] {display: none !important;}
-div[class*="ProfileBadge"] {display: none !important;}
-#manage-app-button {display: none !important;}
+/* Полное скрытие шапки, футера, тулбаров, Plotly ModeBar и бейджей Streamlit / GitHub */
+#MainMenu,
+header,
+footer,
+[data-testid="stHeader"],
+[data-testid="stToolbar"],
+[data-testid="stDecoration"],
+[data-testid="stStatusWidget"],
+[data-testid="stSidebar"],
+[data-testid="stElementToolbar"],
+[data-testid="stElementToolbarButton"],
+.stElementToolbar,
+.modebar-container,
+.modebar,
+.modebar-group,
+.viewerBadge_container__1QSob,
+.viewerBadge_link__qRIco,
+.viewerBadge_text__1JaDK,
+div[class*="viewerBadge"],
+a[class*="viewerBadge"],
+div[class*="ProfileBadge"],
+div[class*="profileBadge"],
+div[class*="StatusWidget"],
+a[href*="streamlit.io/cloud"],
+img[src*="githubusercontent.com"],
+img[src*="avatars.githubusercontent.com"],
+#manage-app-button,
+[data-testid="manage-app-button"] {
+    visibility: hidden !important;
+    display: none !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+    width: 0 !important;
+    height: 0 !important;
+}
 
 /* Компактные отступы для идеального отображения в Telegram Mini App и на мобильных */
 .block-container {
-    padding-top: 1.2rem !important;
-    padding-bottom: 2rem !important;
+    padding-top: 1.0rem !important;
+    padding-bottom: 2.0rem !important;
+    max-width: 100% !important;
+}
+
+/* Уменьшаем лишний вертикальный разрыв между заголовками и графиками */
+div[data-testid="stSubheader"], h3 {
+    margin-bottom: 0.25rem !important;
+    padding-bottom: 0 !important;
+}
+div[data-testid="stPlotlyChart"] {
+    margin-top: -0.35rem !important;
+    margin-bottom: -0.25rem !important;
 }
 
 /* Автоматическая адаптация плашки профиля под тему устройства (светлая / тёмная) */
@@ -73,7 +144,7 @@ div[class*="ProfileBadge"] {display: none !important;}
     display: flex;
     align-items: center;
     gap: 14px;
-    margin-bottom: 18px;
+    margin-bottom: 14px;
     padding: 12px 16px;
     border-radius: 12px;
     background: rgba(148, 163, 184, 0.10);
@@ -82,6 +153,121 @@ div[class*="ProfileBadge"] {display: none !important;}
 .user-avatar-subtitle {
     font-size: 0.88rem;
     opacity: 0.72;
+}
+
+/* Адаптивная таблица терминов без горизонтального скролла на любых экранах */
+.terms-table-wrap {
+    width: 100%;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid rgba(148, 163, 184, 0.24);
+    background: rgba(148, 163, 184, 0.05);
+    margin-top: 4px;
+    margin-bottom: 12px;
+}
+.terms-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    font-size: 0.86rem;
+    line-height: 1.3;
+}
+.terms-table th {
+    text-align: left;
+    padding: 9px 10px;
+    font-weight: 600;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    opacity: 0.78;
+    background: rgba(148, 163, 184, 0.12);
+    border-bottom: 1px solid rgba(148, 163, 184, 0.22);
+}
+.terms-table td {
+    padding: 9px 10px;
+    vertical-align: middle;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}
+.terms-table tr:last-child td {
+    border-bottom: none;
+}
+.terms-col-term { width: 42%; font-weight: 600; }
+.terms-col-mod  { width: 22%; opacity: 0.85; font-size: 0.80rem; }
+.terms-col-stat { width: 36%; }
+.terms-stat-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.79rem;
+    margin-bottom: 4px;
+    gap: 4px;
+}
+.terms-pct-badge {
+    font-weight: 700;
+    color: #ef4444;
+}
+.terms-bar-bg {
+    width: 100%;
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.24);
+    overflow: hidden;
+}
+.terms-bar-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #f59e0b, #ef4444);
+}
+
+/* Автоподгонка под мобильные экраны (сетка 2x2 для метрик и компактные поля) */
+@media (max-width: 640px) {
+    .block-container {
+        padding-left: 0.65rem !important;
+        padding-right: 0.65rem !important;
+        padding-top: 0.65rem !important;
+    }
+    div[data-testid="stHorizontalBlock"] {
+        display: flex !important;
+        flex-direction: row !important;
+        flex-wrap: wrap !important;
+        gap: 8px !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"],
+    div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+        flex: 1 1 calc(50% - 8px) !important;
+        min-width: calc(50% - 8px) !important;
+        max-width: calc(50% - 4px) !important;
+    }
+    /* Если в горизонтальном блоке всего 2 колонки (графики/таблицы) — делаем на всю ширину */
+    div[data-testid="stHorizontalBlock"]:has(> div:nth-child(2):last-child) > div[data-testid="column"],
+    div[data-testid="stHorizontalBlock"]:has(> div:nth-child(2):last-child) > div[data-testid="stColumn"] {
+        flex: 1 1 100% !important;
+        min-width: 100% !important;
+        max-width: 100% !important;
+    }
+    div[data-testid="stMetric"] {
+        background: rgba(148, 163, 184, 0.08);
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        border-radius: 10px;
+        padding: 8px 10px !important;
+    }
+    div[data-testid="stMetricLabel"] p {
+        font-size: 0.78rem !important;
+    }
+    div[data-testid="stMetricValue"] {
+        font-size: 1.35rem !important;
+    }
+    .terms-table {
+        font-size: 0.80rem;
+    }
+    .terms-table th, .terms-table td {
+        padding: 7px 6px;
+    }
+    .terms-col-term { width: 41%; }
+    .terms-col-mod  { width: 21%; font-size: 0.75rem; }
+    .terms-col-stat { width: 38%; }
 }
 </style>
 """, unsafe_allow_html=True)
@@ -1277,11 +1463,11 @@ def build_calendar_html(cal_data: Dict[str, Any]) -> str:
         .mob-grid {{
             display: grid;
             grid-template-columns: repeat(7, 1fr);
-            gap: 5px;
+            gap: 4px;
         }}
         .mob-day {{
-            height: 36px;
-            border-radius: 8px;
+            height: 33px;
+            border-radius: 7px;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -1303,17 +1489,24 @@ def build_calendar_html(cal_data: Dict[str, Any]) -> str:
         }}
 
         .cal-detail-pill {{
-            margin-top: 10px;
-            padding: 8px 12px;
+            margin-top: 8px;
+            padding: 8px 10px;
+            min-height: 36px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
             background: var(--cal-bar-bg);
             border: 1px solid var(--cal-border);
             border-radius: 8px;
-            font-size: 12.5px;
+            font-size: 12px;
+            line-height: 1.3;
             color: var(--cal-text);
             text-align: center;
+            word-break: break-word;
         }}
 
         @media (max-width: 720px) {{
+            .cal-card {{ padding: 12px 10px; }}
             .desktop-year-wrap {{ display: none !important; }}
             .mobile-month-wrap {{ display: block !important; }}
         }}
@@ -1389,6 +1582,11 @@ def build_calendar_html(cal_data: Dict[str, Any]) -> str:
             document.getElementById("mob-prev").disabled = (curMonthIdx <= 0);
             document.getElementById("mob-next").disabled = (curMonthIdx >= MONTHS_DATA.length - 1);
 
+            var mBox = document.getElementById("cal-info-mobile");
+            if (mBox) {{
+                mBox.textContent = "Нажмите на день для просмотра деталей";
+            }}
+
             var grid = document.getElementById("mob-days-grid");
             grid.innerHTML = "";
             m.weeks.forEach(function(wk) {{
@@ -1455,7 +1653,7 @@ def render_activity_calendar(
     c_s3.metric("🗓 Активных дней за год", f"{cal_data['active_days_year']} из 365")
     c_s4.metric(f"⚡️ Всего за год ({cal_data['mode_label']})", cal_data["total_actions_year"])
 
-    components.html(build_calendar_html(cal_data), height=320, scrolling=False)
+    components.html(build_calendar_html(cal_data), height=390, scrolling=False)
 
 
 # =====================================================================
@@ -1686,6 +1884,51 @@ def _format_compact_terms_df(term_problems_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _render_responsive_terms_table(term_problems_df: pd.DataFrame):
+    """Рендерит адаптивную таблицу терминов, которая на 100% помещается на экране смартфона без горизонтального скролла."""
+    if term_problems_df.empty:
+        st.info("Нет данных для отображения.")
+        return
+
+    rows_html = []
+    for _, r in term_problems_df.iterrows():
+        term_str = html.escape(str(r.get("term", "")))
+        raw_mod = str(r.get("module", ""))
+        mod_short = html.escape(MODULE_SHORT_BADGE.get(raw_mod, raw_mod))
+        err_cnt = int(r.get("errors", 0))
+        tries_cnt = int(r.get("total_tries", 0))
+        avg_sec = round(float(r.get("avg_seconds", 0.0)), 1)
+        err_rate = max(0.0, min(100.0, round(float(r.get("error_rate", 0.0)), 0)))
+
+        rows_html.append(
+            f"<tr>"
+            f"<td class='terms-col-term'>{term_str}</td>"
+            f"<td class='terms-col-mod'>{mod_short}</td>"
+            f"<td class='terms-col-stat'>"
+            f"<div class='terms-stat-top'>"
+            f"<span>{err_cnt}/{tries_cnt} ({avg_sec}с)</span>"
+            f"<span class='terms-pct-badge'>{int(err_rate)}%</span>"
+            f"</div>"
+            f"<div class='terms-bar-bg'><div class='terms-bar-fill' style='width:{err_rate}%;'></div></div>"
+            f"</td>"
+            f"</tr>"
+        )
+
+    table_html = (
+        "<div class='terms-table-wrap'>"
+        "<table class='terms-table'>"
+        "<thead><tr>"
+        "<th class='terms-col-term'>Термин</th>"
+        "<th class='terms-col-mod'>Блок</th>"
+        "<th class='terms-col-stat'>Ошибки • %</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(rows_html)}</tbody>"
+        "</table>"
+        "</div>"
+    )
+    st.markdown(table_html, unsafe_allow_html=True)
+
+
 def render_analytics_dashboard(
     df: pd.DataFrame,
     is_class_view: bool = False,
@@ -1725,6 +1968,22 @@ def render_analytics_dashboard(
 
     st.divider()
 
+    plotly_cfg = {"displayModeBar": False, "responsive": True}
+    pie_common_layout = dict(
+        height=235,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(t=6, b=36, l=8, r=8),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.04,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=12),
+        ),
+    )
+
     col_pie1, col_pie2 = st.columns(2)
     with col_pie1:
         st.subheader("🥧 Качество ответов")
@@ -1733,27 +1992,30 @@ def render_analytics_dashboard(
             names="status",
             color="status",
             color_discrete_map={"Верно / Знаю": "#2ecc71", "Неуверенно": "#f1c40f", "Ошибка / Не знаю": "#e74c3c"},
-            hole=0.42
+            hole=0.44
         )
-        fig_status.update_layout(
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(t=20, b=20, l=10, r=10),
+        fig_status.update_traces(
+            domain=dict(x=[0.08, 0.92], y=[0.08, 0.96]),
+            textposition="inside",
+            textinfo="percent",
         )
-        st.plotly_chart(fig_status, use_container_width=True)
+        fig_status.update_layout(**pie_common_layout)
+        st.plotly_chart(fig_status, use_container_width=True, config=plotly_cfg)
 
     with col_pie2:
         title_suffix = "для класса" if is_class_view else "по блокам"
         st.subheader(f"🥧 Ошибки {title_suffix}")
-        problem_df = df[df["is_problem"]]
+        problem_df = df[df["is_problem"]].copy()
         if not problem_df.empty:
-            fig_modules = px.pie(problem_df, names="module", hole=0.42)
-            fig_modules.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                margin=dict(t=20, b=20, l=10, r=10),
+            problem_df["module_short"] = problem_df["module"].map(lambda m: MODULE_SHORT_BADGE.get(str(m), str(m)))
+            fig_modules = px.pie(problem_df, names="module_short", hole=0.44)
+            fig_modules.update_traces(
+                domain=dict(x=[0.08, 0.92], y=[0.08, 0.96]),
+                textposition="inside",
+                textinfo="percent",
             )
-            st.plotly_chart(fig_modules, use_container_width=True)
+            fig_modules.update_layout(**pie_common_layout)
+            st.plotly_chart(fig_modules, use_container_width=True, config=plotly_cfg)
         else:
             st.success("🎉 Затруднений и ошибок за выбранный период нет — все ответы уверенные!")
 
@@ -1775,25 +2037,7 @@ def render_analytics_dashboard(
         table_title = "⚠️ Топ-10 трудных терминов для класса" if is_class_view else "⚠️ Ваши трудные термины"
         st.subheader(table_title)
         top_problematic = term_problems.sort_values(by=["errors", "error_rate"], ascending=False).head(10)
-        compact_top_df = _format_compact_terms_df(top_problematic)
-
-        st.dataframe(
-            compact_top_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Термин": st.column_config.TextColumn("Термин", width="medium"),
-                "Блок": st.column_config.TextColumn("Блок", width="small"),
-                "Ошибки / Попытки": st.column_config.TextColumn("Ошибки (Время)", width="small"),
-                "% ошибок": st.column_config.ProgressColumn(
-                    "% ошибок",
-                    format="%.0f%%",
-                    min_value=0,
-                    max_value=100,
-                    width="small",
-                ),
-            }
-        )
+        _render_responsive_terms_table(top_problematic)
 
     with col_bar2:
         st.subheader("⏱ Скорость ответа по блокам")
@@ -1808,19 +2052,20 @@ def render_analytics_dashboard(
             color_continuous_scale="Blues"
         )
         fig_time.update_layout(
+            height=250,
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(t=20, b=20, l=10, r=10),
+            margin=dict(t=8, b=20, l=10, r=10),
             coloraxis_showscale=False,
         )
-        st.plotly_chart(fig_time, use_container_width=True)
+        st.plotly_chart(fig_time, use_container_width=True, config=plotly_cfg)
 
     # --- УМНЫЙ ПОИСК ТЕРМИНОВ ПО НАЗВАНИЮ (ОТ 3 БУКВ, С ЗАЩИТОЙ ОТ ОПЕЧАТОК) ---
     st.divider()
     st.subheader("🔎 Поиск статистики по конкретному термину")
     search_q = st.text_input(
         "Введите название термина:",
-        key=f"{key_prefix}_term_fuzzy_search"
+        key=f"{key_prefix}_term_fuzzy_search",
     ).strip()
 
     if search_q:
@@ -1840,23 +2085,7 @@ def render_analytics_dashboard(
 
             if scored_rows:
                 matched_df = pd.DataFrame(scored_rows).sort_values(by=["_score", "total_tries"], ascending=False).head(10)
-                st.dataframe(
-                    _format_compact_terms_df(matched_df),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Термин": st.column_config.TextColumn("Термин", width="medium"),
-                        "Блок": st.column_config.TextColumn("Блок", width="small"),
-                        "Ошибки / Попытки": st.column_config.TextColumn("Ошибки (Время)", width="small"),
-                        "% ошибок": st.column_config.ProgressColumn(
-                            "% ошибок",
-                            format="%.0f%%",
-                            min_value=0,
-                            max_value=100,
-                            width="small",
-                        ),
-                    }
-                )
+                _render_responsive_terms_table(matched_df)
             else:
                 cat_matches = []
                 for c_code, c_info in TERMS_MAP.items():
