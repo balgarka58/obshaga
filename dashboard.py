@@ -1819,9 +1819,8 @@ def render_analytics_dashboard(
     st.divider()
     st.subheader("🔎 Поиск статистики по конкретному термину")
     search_q = st.text_input(
-        "Введите название термина (от 3 букв, можно с опечатками — например «ифлянция»):",
+        "Введите название термина:",
         key=f"{key_prefix}_term_fuzzy_search",
-        placeholder="Например: инфляция, государство, стратификация..."
     ).strip()
 
     if search_q:
