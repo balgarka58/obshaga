@@ -406,7 +406,9 @@ def _compute_similarity_preindexed(
     t_norm: str,
     t_tri: Set[str],
     t_words_indexed: List[Tuple[str, Set[str]]],
+    threshold: float = 0.0,
 ) -> float:
+    """Сверхбыстрый расчёт нечёткого сходства с отсечением по верхней границе quick_ratio."""
     if not q_norm or not t_norm:
         return 0.0
     if q_norm == t_norm:
@@ -420,28 +422,41 @@ def _compute_similarity_preindexed(
     union_len = len(q_tri) + len(t_tri) - inter_len
     tri_score = inter_len / max(1, union_len)
 
-    if inter_len == 0 and abs(len(q_norm) - len(t_norm)) > 6:
-        for w, _ in t_words_indexed:
-            if w.startswith(q_norm):
-                return 0.93
-        return 0.0
+    sm_full = difflib.SequenceMatcher(None, q_norm, t_norm)
+    if threshold > 0.0 and (sm_full.real_quick_ratio() * 0.6 + tri_score * 0.4) < threshold:
+        seq_full = 0.0
+    elif threshold > 0.0 and (sm_full.quick_ratio() * 0.6 + tri_score * 0.4) < threshold:
+        seq_full = 0.0
+    else:
+        seq_full = sm_full.ratio()
 
-    seq_full = difflib.SequenceMatcher(None, q_norm, t_norm).ratio()
-
+    full_combined = (seq_full * 0.6) + (tri_score * 0.4)
     word_best = 0.0
+    eff_thresh = max(threshold, full_combined)
+
     for w, w_tri in t_words_indexed:
         if w.startswith(q_norm):
             word_best = max(word_best, 0.93)
+            eff_thresh = max(eff_thresh, 0.93)
         else:
             w_inter = len(q_tri & w_tri) if (q_tri and w_tri) else 0
-            if w_inter == 0 and not (set(q_norm) & set(w)):
-                continue
             w_union = len(q_tri) + len(w_tri) - w_inter
             w_tri_score = w_inter / max(1, w_union)
-            r = difflib.SequenceMatcher(None, q_norm, w).ratio()
-            word_best = max(word_best, (r * 0.65) + (w_tri_score * 0.35))
+            if (0.65 + w_tri_score * 0.35) < eff_thresh:
+                continue
+            sm_w = difflib.SequenceMatcher(None, q_norm, w)
+            if (sm_w.real_quick_ratio() * 0.65 + w_tri_score * 0.35) < eff_thresh:
+                continue
+            if (sm_w.quick_ratio() * 0.65 + w_tri_score * 0.35) < eff_thresh:
+                continue
+            r = sm_w.ratio()
+            sc = (r * 0.65) + (w_tri_score * 0.35)
+            if sc > word_best:
+                word_best = sc
+                if sc > eff_thresh:
+                    eff_thresh = sc
 
-    return round(max((seq_full * 0.6) + (tri_score * 0.4), word_best), 4)
+    return round(max(full_combined, word_best), 4)
 
 
 def compute_fuzzy_similarity(query: str, target: str) -> float:
@@ -835,7 +850,7 @@ def fetch_all_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             })
 
             try:
-                tries_cnt = max(1, min(500, int(arow.get("tries_count") or 1)))
+                tries_cnt = max(1, int(arow.get("tries_count") or 1))
                 err_cnt = max(0, min(tries_cnt, int(arow.get("errors_count") or 0)))
                 total_sec = max(0.0, float(arow.get("total_time_sec") or 0.0))
                 last_d_ans = float(arow.get("last_delta_ans") or 0.0)
@@ -848,7 +863,15 @@ def fetch_all_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                 avg_sec = 3.0
 
             arch_date = arow.get("archive_date")
-            created_ts = f"{str(arch_date)[:10]} 12:00:00" if arch_date is not None else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            if arch_date is not None:
+                try:
+                    d_iso = str(arch_date)[:10]
+                    d_obj = date.fromisoformat(d_iso)
+                    created_ts = datetime(d_obj.year, d_obj.month, d_obj.day, 12, 0, 0, tzinfo=TZ).astimezone(timezone.utc).isoformat()
+                except Exception:
+                    created_ts = f"{str(arch_date)[:10]} 12:00:00"
+            else:
+                created_ts = datetime.now(timezone.utc).isoformat()
 
             for _ in range(ok_cnt):
                 parsed_rows.append({
