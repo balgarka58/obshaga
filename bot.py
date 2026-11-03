@@ -5,6 +5,7 @@ import hmac
 import json
 import time
 import random
+import base64
 import hashlib
 import logging
 import sqlite3
@@ -41,7 +42,7 @@ from aiogram.types import (
 from aiogram.client.default import DefaultBotProperties
 
 # =====================================================================
-# 1. КОНФИГУРАЦИЯ, ТОКЕНЫ И БЕЗОПАСНАЯ РАЗМЕТКА (ВЕРСИЯ 7.3 HARDENED)
+# 1. КОНФИГУРАЦИЯ, ТОКЕНЫ И БЕЗОПАСНАЯ РАЗМЕТКА (ВЕРСИЯ 7.4 HARDENED)
 # =====================================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -49,7 +50,9 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 DB_PATH = os.getenv("DB_PATH", "social_bot.db")
 TERMS_JSON_PATH = os.getenv("TERMS_JSON_PATH", "terms.json")
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://obshaga.streamlit.app").rstrip("/")
-SECRET_KEY = os.getenv("SECRET_KEY", "obshaga_secret_key_2025")
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("Переменная окружения SECRET_KEY не задана!")
 TIMEZONE_STR = os.getenv("TIMEZONE", "Europe/Moscow")
 LOG_CHAT_ID = os.getenv("LOG_CHAT_ID")
 
@@ -95,27 +98,27 @@ def normalize_neon_pooler_url(db_url: Optional[str]) -> Optional[str]:
 
 
 def generate_student_token(user_id: Any, token_version: int = 1, secret_key: Optional[str] = None) -> str:
-    """Генерирует персональный 8-символьный токен доступа ученика к веб-аналитике."""
-    key = secret_key if secret_key is not None else os.getenv("SECRET_KEY", SECRET_KEY)
+    """Генерирует защищённый HMAC-SHA256 токен доступа ученика к веб-аналитике."""
+    key = str(secret_key if secret_key is not None else os.getenv("SECRET_KEY", SECRET_KEY))
     uid_str = str(user_id).strip()
     try:
         ver = max(1, int(token_version or 1))
     except (ValueError, TypeError):
         ver = 1
-    payload = f"{uid_str}_{key}" if ver == 1 else f"{uid_str}_{key}_v{ver}"
-    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:8]
+    msg = f"student:{uid_str}:v{ver}".encode("utf-8")
+    return hmac.new(key.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:16]
 
 
 def generate_teacher_token(teacher_code: Any, token_version: int = 1, secret_key: Optional[str] = None) -> str:
-    """Генерирует токен доступа к кабинету преподавателя с поддержкой ротации ссылки."""
-    key = secret_key if secret_key is not None else os.getenv("SECRET_KEY", SECRET_KEY)
+    """Генерирует защищённый HMAC-SHA256 токен доступа к кабинету преподавателя с поддержкой ротации."""
+    key = str(secret_key if secret_key is not None else os.getenv("SECRET_KEY", SECRET_KEY))
     code_str = str(teacher_code).strip()
     try:
         ver = max(1, int(token_version or 1))
     except (ValueError, TypeError):
         ver = 1
-    payload = f"teacher_{code_str}_{key}_v{ver}"
-    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:8]
+    msg = f"teacher:{code_str}:v{ver}".encode("utf-8")
+    return hmac.new(key.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:16]
 
 
 def verify_token_constant_time(provided: Optional[str], expected: str) -> bool:
@@ -128,12 +131,36 @@ def verify_token_constant_time(provided: Optional[str], expected: str) -> bool:
     )
 
 
+def encode_user_id(user_id: int, secret_key: Optional[str] = None) -> str:
+    """Маскирует числовой user_id в компактную строку, безопасную для URL."""
+    key = secret_key or SECRET_KEY
+    salt = hashlib.sha256(key.encode("utf-8")).digest()
+    uid_bytes = str(user_id).encode("utf-8")
+    masked = bytes([b ^ salt[i % len(salt)] for i, b in enumerate(uid_bytes)])
+    return base64.urlsafe_b64encode(masked).decode("utf-8").rstrip("=")
+
+
+def decode_user_id(encoded_str: str, secret_key: Optional[str] = None) -> Optional[int]:
+    """Расшифровывает безопасный строковый токен обратно в Telegram user_id."""
+    key = secret_key or SECRET_KEY
+    if not encoded_str or not key:
+        return None
+    try:
+        salt = hashlib.sha256(key.encode("utf-8")).digest()
+        padded = encoded_str + "=" * (-len(encoded_str) % 4)
+        masked = base64.urlsafe_b64decode(padded.encode("utf-8"))
+        raw_uid = bytes([b ^ salt[i % len(salt)] for i, b in enumerate(masked)]).decode("utf-8")
+        val = int(raw_uid)
+        return val if val > 0 else None
+    except Exception:
+        return None
+
+
 def build_student_webapp_url(user_id: int, token_version: int = 1) -> str:
-    """Формирует защищённую персональную ссылку для открытия аналитики в Telegram Mini App."""
     token = generate_student_token(user_id, token_version)
-    safe_uid = urllib.parse.quote(str(user_id))
+    masked_uid = encode_user_id(user_id)
     safe_token = urllib.parse.quote(token)
-    return f"{DASHBOARD_URL}/?student={safe_uid}&token={safe_token}"
+    return f"{DASHBOARD_URL}/?student={masked_uid}&token={safe_token}"
 
 
 def build_teacher_webapp_url(teacher_code: str, token_version: int = 1) -> str:
@@ -172,6 +199,36 @@ def truncate_plain(text: str, max_len: int) -> str:
     if len(s) <= max_len:
         return s
     return s[: max(0, max_len - 3)].rstrip() + "..."
+
+
+def get_safe_display_name(user: Any) -> str:
+    """
+    Формирует обезличенное имя (например, 'Данил К.' или 'дидригидрон'),
+    чтобы полные паспортные фамилии не сохранялись в БД (Privacy by Design).
+    Корректно обрабатывает смайлики, спецсимволы и двойные/тройные ФИО.
+    """
+    raw_first = (getattr(user, "first_name", "") or "").strip()
+    raw_last = (getattr(user, "last_name", "") or "").strip()
+
+    first_alnum = ["".join(ch for ch in w if ch.isalnum()) for w in raw_first.split()]
+    first_alnum = [w for w in first_alnum if w]
+    last_alnum = ["".join(ch for ch in w if ch.isalnum()) for w in raw_last.split()]
+    last_alnum = [w for w in last_alnum if w]
+
+    if first_alnum and last_alnum:
+        return f"{first_alnum[0]} {last_alnum[0][0].upper()}."
+    if len(first_alnum) >= 2:
+        return f"{first_alnum[0]} {first_alnum[1][0].upper()}."
+    if len(first_alnum) == 1:
+        return first_alnum[0]
+    if raw_first:
+        cleaned_raw = re.sub(r"[\r\n\t=`*_\[\]]+", "", raw_first).lstrip("=+-@")[:24].strip()
+        if cleaned_raw:
+            return cleaned_raw
+    if getattr(user, "username", None):
+        return f"@{user.username}"
+    uid_str = str(getattr(user, "id", "") or "")
+    return f"Ученик #{uid_str[-4:]}" if uid_str else "Ученик"
 
 
 # =====================================================================
@@ -421,7 +478,7 @@ class LiveErrorLogger:
         now_str = datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")
         tb_short = tb_str[-2600:] if len(tb_str) > 2600 else tb_str
         msg_text = (
-            f"🚨 <b>ОШИБКА В БОТЕ v7.3</b>{repeat_badge}\n"
+            f"🚨 <b>ОШИБКА В БОТЕ v7.4</b>{repeat_badge}\n"
             f"⏰ <b>Время:</b> <code>{now_str}</code>\n"
             f"👤 <b>Пользователь:</b> <code>{self._escape_html(user_info)}</code>\n"
             f"📍 <b>Контекст:</b> <code>{self._escape_html(context_info or 'Global')}</code>\n"
@@ -1907,6 +1964,21 @@ class Database:
             }
         return None
 
+    def update_teacher_name(self, user_id: int, full_name: str):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            if self.is_postgres:
+                cursor.execute("UPDATE teachers SET full_name = %s WHERE user_id = %s;", (full_name, user_id))
+            else:
+                cursor.execute("UPDATE teachers SET full_name = ? WHERE user_id = ?;", (full_name, user_id))
+            conn.commit()
+        except Exception:
+            pass
+        finally:
+            cursor.close()
+            conn.close()
+
     def get_teacher_by_user_id(self, user_id: int) -> Optional[Dict[str, Any]]:
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -2108,6 +2180,40 @@ class Database:
 
         return int(row[0]) if row else 0
 
+    def delete_user_data(self, user_id: int):
+        """Полностью стирает историю ответов, настройки и привязки пользователя."""
+        with self._write_queue_lock:
+            self._pending_writes = [item for item in self._pending_writes if item[0] != user_id]
+        self.flush_pending_writes_sync()
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            if self.is_postgres:
+                cursor.execute("DELETE FROM user_answers WHERE user_id = %s;", (user_id,))
+                cursor.execute("DELETE FROM user_daily_archive WHERE user_id = %s;", (user_id,))
+                cursor.execute("DELETE FROM user_settings WHERE user_id = %s;", (user_id,))
+                cursor.execute("DELETE FROM student_teachers WHERE student_id = %s;", (user_id,))
+                cursor.execute(
+                    "DELETE FROM student_teachers WHERE teacher_code IN (SELECT teacher_code FROM teachers WHERE user_id = %s);",
+                    (user_id,)
+                )
+                cursor.execute("DELETE FROM teachers WHERE user_id = %s;", (user_id,))
+            else:
+                cursor.execute("DELETE FROM user_answers WHERE user_id = ?;", (user_id,))
+                cursor.execute("DELETE FROM user_daily_archive WHERE user_id = ?;", (user_id,))
+                cursor.execute("DELETE FROM user_settings WHERE user_id = ?;", (user_id,))
+                cursor.execute("DELETE FROM student_teachers WHERE student_id = ?;", (user_id,))
+                cursor.execute(
+                    "DELETE FROM student_teachers WHERE teacher_code IN (SELECT teacher_code FROM teachers WHERE user_id = ?);",
+                    (user_id,)
+                )
+                cursor.execute("DELETE FROM teachers WHERE user_id = ?;", (user_id,))
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+        self.invalidate_user_cache(user_id)
+
 
 db = Database()
 
@@ -2138,6 +2244,10 @@ class SessionTracker:
             self.last_seen[user_id] = time.time()
             return list(self.recent_history[user_id])
         return []
+
+    def clear_user(self, user_id: int):
+        self.recent_history.pop(user_id, None)
+        self.last_seen.pop(user_id, None)
 
     def cleanup_old_sessions(self, max_age_seconds: int = 172800):
         now = time.time()
@@ -2396,6 +2506,7 @@ class UserFlow(StatesGroup):
     in_my_teachers = State()
     in_teacher_cabinet = State()
     in_teacher_reset_confirm = State()
+    in_delete_me_confirm = State()
 
 
 BTN_MAIN_CARDS = "🗂 Карточки"
@@ -2439,6 +2550,9 @@ BTN_CONFIRM_RESET_YES = "✅ Да, обновить ссылку"
 
 BTN_TEACHER_WEBAPP = "📱 Аналитика класса"
 BTN_TEACHER_RESET_LINK = "🔄 Сбросить ссылку класса"
+
+BTN_CONFIRM_DELETE_DATA = "🗑 Да, стереть все мои данные"
+BTN_CANCEL_DELETE_DATA = "⬅️ Отмена, оставить данные"
 
 
 class Keyboards:
@@ -2642,6 +2756,17 @@ class Keyboards:
             input_field_placeholder="Введите запрос или вернитесь в меню..."
         )
 
+    @staticmethod
+    def delete_confirm_reply() -> ReplyKeyboardMarkup:
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=BTN_CONFIRM_DELETE_DATA)],
+                [KeyboardButton(text=BTN_CANCEL_DELETE_DATA)],
+            ],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
+
 
 # =====================================================================
 # 10. ФОРМАТИРОВАНИЕ КАРТОЧЕК И ТЕОРЕТИЧЕСКОГО ДОСЬЕ
@@ -2738,12 +2863,12 @@ async def global_error_handler(event: ErrorEvent, bot: Bot):
     try:
         if upd.message and upd.message.from_user:
             u = upd.message.from_user
-            user_str = f"ID {u.id} (@{u.username or 'no_username'})"
-            ctx_str = f"Message: {str(upd.message.text or '')[:60]}"
+            user_str = f"User #{str(u.id)[-4:]}"
+            ctx_str = f"Message: {str(upd.message.text or '')[:40]}"
         elif upd.callback_query and upd.callback_query.from_user:
             u = upd.callback_query.from_user
-            user_str = f"ID {u.id} (@{u.username or 'no_username'})"
-            ctx_str = f"Callback: {str(upd.callback_query.data or '')[:60]}"
+            user_str = f"User #{str(u.id)[-4:]}"
+            ctx_str = f"Callback: {str(upd.callback_query.data or '')[:40]}"
     except Exception:
         pass
 
@@ -2852,6 +2977,10 @@ async def handle_teacher_profile(message: Message, state: FSMContext):
 
         if existing:
             code = existing["teacher_code"]
+            safe_t_name = get_safe_display_name(message.from_user)
+            if existing.get("full_name") != safe_t_name:
+                await asyncio.to_thread(db.update_teacher_name, user_id, safe_t_name)
+                existing["full_name"] = safe_t_name
             st_count = await asyncio.to_thread(db.get_teacher_students_count, code)
             t_ver = existing.get("token_version", 1)
             text, kb = _build_teacher_cabinet_view(
@@ -2861,7 +2990,7 @@ async def handle_teacher_profile(message: Message, state: FSMContext):
             return
 
         user = message.from_user
-        full_name = user.full_name or (f"@{user.username}" if user.username else f"Преподаватель {user.id}")
+        full_name = get_safe_display_name(user)
         code = await asyncio.to_thread(db.register_teacher, user_id, full_name)
         text, kb = _build_teacher_cabinet_view(
             full_name, code, 0, 1, bot_username, is_new=True
@@ -3500,7 +3629,7 @@ async def handle_card_answer_reply(message: Message, state: FSMContext):
         entry_str = f"{safe_code};{delta_ans};{delta_tm};{elapsed};card"
         user = message.from_user
         username = f"@{user.username}" if user.username else None
-        full_name = user.full_name or (user.first_name or f"Пользователь {user.id}")
+        full_name = get_safe_display_name(user)
 
         await db.save_answer_entry_fast(user.id, username, full_name, entry_str)
         await send_next_flashcard_msg(message, user.id, state)
@@ -3621,7 +3750,7 @@ async def handle_test_answer_reply(message: Message, state: FSMContext):
 
             user = message.from_user
             username = f"@{user.username}" if user.username else None
-            full_name = user.full_name or (user.first_name or f"Пользователь {user.id}")
+            full_name = get_safe_display_name(user)
             await db.save_answer_entry_fast(user.id, username, full_name, entry_str)
 
         if is_correct:
@@ -3720,8 +3849,79 @@ async def handle_test_restart_reply(message: Message, state: FSMContext):
         await send_next_test_msg(message, state)
 
 
+@router.message(Command("privacy"))
+async def handle_privacy_command(message: Message, state: FSMContext):
+    uid = message.from_user.id if message.from_user else message.chat.id
+    async with user_lock_manager.get_lock(uid):
+        text = (
+            "🛡 *Политика приватности и защита данных*\n\n"
+            "1. *Что хранится:* бот сохраняет исключительно статистику ответов, "
+            "прогресс карточек и серию занятий для личного кабинета и преподавателя.\n\n"
+            "2. *Обезличивание:* полные фамилии, телефоны, школы, адреса и биометрия "
+            "*не собираются и не сохраняются*. Имена автоматически обезличиваются (например: _Данил К._ или псевдоним).\n\n"
+            "3. *Право на удаление:* вы можете в любой момент безвозвратно стереть "
+            "все свои ответы, статистику и привязки командой /delete_me."
+        )
+        await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
+
+
+@router.message(Command("delete_me"))
+async def handle_delete_me_command(message: Message, state: FSMContext):
+    if not message.from_user:
+        return
+    async with user_lock_manager.get_lock(message.from_user.id):
+        await state.set_state(UserFlow.in_delete_me_confirm)
+        text = (
+            "⚠️ *Удаление учетной записи и истории*\n\n"
+            "Вы собираетесь безвозвратно удалить все свои результаты тестов, "
+            "прогресс интервального повторения карточек, серию занятий и привязку к классам.\n\n"
+            "Это действие *нельзя отменить*. Вы уверены?"
+        )
+        await render_single_screen(message, state, text, reply_markup=Keyboards.delete_confirm_reply())
+
+
+@router.message(StateFilter(UserFlow.in_delete_me_confirm), F.text == BTN_CONFIRM_DELETE_DATA)
+async def handle_confirm_delete_data(message: Message, state: FSMContext):
+    if not message.from_user:
+        return
+    uid = message.from_user.id
+    async with user_lock_manager.get_lock(uid):
+        await asyncio.to_thread(db.delete_user_data, uid)
+        session_tracker.clear_user(uid)
+        await state.clear()
+        text = (
+            "✅ *Все ваши данные успешно удалены из базы.*\n\n"
+            "История ответов, статистика и настройки полностью стёрты. "
+            "Если захотите начать заново — просто выберите режим в меню."
+        )
+        await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
+
+
+@router.message(StateFilter(UserFlow.in_delete_me_confirm), F.text == BTN_CANCEL_DELETE_DATA)
+async def handle_cancel_delete_data(message: Message, state: FSMContext):
+    uid = message.from_user.id if message.from_user else message.chat.id
+    async with user_lock_manager.get_lock(uid):
+        await state.clear()
+        text = "🏠 *Главное меню*\n\nУдаление отменено. Выберите формат тренировки:"
+        await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
+
+
 # Набор служебных кнопок, которые НЕ должны запускать поиск термина, если нажаты после перезапуска сервера
 SYSTEM_UI_BUTTONS_SET = {
+    BTN_MAIN_CARDS,
+    BTN_MAIN_TESTS,
+    BTN_MAIN_ERRORS,
+    BTN_MAIN_SEARCH,
+    BTN_MAIN_STATS,
+    BTN_BACK_MAIN,
+    BTN_BACK_STATS,
+    BTN_BACK_TEACHER,
+    BTN_ERR_CARDS,
+    BTN_ERR_TESTS,
+    BTN_STATS_REMIND_ON,
+    BTN_STATS_REMIND_OFF,
+    BTN_STATS_RESET_LINK,
+    BTN_STATS_MY_TEACHERS,
     BTN_CARD_FLIP,
     BTN_CARD_KNOW,
     BTN_CARD_UNSURE,
@@ -3734,6 +3934,8 @@ SYSTEM_UI_BUTTONS_SET = {
     BTN_TEACHER_RESET_LINK,
     BTN_STATS_WEBAPP,
     BTN_TEACHER_WEBAPP,
+    BTN_CONFIRM_DELETE_DATA,
+    BTN_CANCEL_DELETE_DATA,
     "1", "2", "3", "4",
 } | set(TOPIC_BUTTONS_MAP.keys())
 
@@ -3906,7 +4108,7 @@ async def main():
 
     bg_task = asyncio.create_task(periodic_background_task(bot))
 
-    logger.info("Бот версии 7.3 (Lossless Archive + Concurrency Guard) успешно запущен.")
+    logger.info("Бот версии 7.4 (Lossless Archive + Concurrency Guard) успешно запущен.")
     try:
         await dp.start_polling(bot)
     except Exception as fatal_err:
