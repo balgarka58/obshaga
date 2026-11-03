@@ -55,6 +55,8 @@ if not SECRET_KEY:
     raise RuntimeError("Переменная окружения SECRET_KEY не задана!")
 TIMEZONE_STR = os.getenv("TIMEZONE", "Europe/Moscow")
 LOG_CHAT_ID = os.getenv("LOG_CHAT_ID")
+PRIVACY_URL = os.getenv("PRIVACY_URL", "https://telegra.ph/Politika-konfidencialnosti-i-pravila-trenazhyora-11-03").strip()
+TERMS_URL = os.getenv("TERMS_URL", PRIVACY_URL).strip()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -288,13 +290,20 @@ screen_manager = ScreenManager()
 
 
 async def _safe_delete_message(bot: Bot, chat_id: int, message_id: Optional[int]):
-    """Тихо удаляет сообщение, игнорируя ошибки если оно уже удалено."""
+    """Тихо удаляет сообщение с защитой от сбоев и кратковременного флуд-контроля Telegram."""
     if not message_id or bot is None:
         return
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception:
-        pass
+    except Exception as e:
+        err_msg = str(e).lower()
+        # Если Telegram вернул временный Retry-After (флуд-контроль), повторяем через указанную паузу
+        if "retry after" in err_msg or "flood" in err_msg:
+            try:
+                await asyncio.sleep(1.2)
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except Exception:
+                pass
 
 
 class AntiFloodDDoSMiddleware(BaseMiddleware):
@@ -381,7 +390,14 @@ async def render_single_screen(
         safe_text = safe_text[:4050].rstrip() + "\n\n...[текст сокращён]"
 
     data = await state.get_data()
-    prev_bot_id = data.get("last_bot_msg_id") or screen_manager.get_last_id(chat_id)
+    # screen_manager в RAM всегда содержит самый свежий ID (включая ночные напоминания)
+    prev_bot_id = screen_manager.get_last_id(chat_id) or data.get("last_bot_msg_id")
+
+    # Если после рестарта Render память в RAM очистилась (prev_bot_id пуст),
+    # математически подчищаем веер предыдущих номеров без единого запроса к базе данных!
+    if not prev_bot_id and user_msg_id and user_msg_id > 1 and bot and chat_id:
+        for c_id in range(max(1, user_msg_id - 4), user_msg_id):
+            asyncio.create_task(_safe_delete_message(bot, chat_id, c_id))
 
     try:
         new_msg = await message.answer(
@@ -872,7 +888,7 @@ class Database:
         self._cache_lock = threading.Lock()
         self._write_seq: int = 0
         self._user_entries_cache: Dict[int, Tuple[float, int, List[Tuple[str, Any]]]] = {}
-        self._user_settings_cache: Dict[int, Tuple[float, int, bool]] = {}
+        self._user_settings_cache: Dict[int, Tuple[float, int, bool, bool]] = {}
         self._cache_ttl = 600.0  # 10 минут
         self._max_cache_size = 2000
         self._write_queue_lock = threading.Lock()
@@ -984,9 +1000,11 @@ class Database:
                     user_id BIGINT PRIMARY KEY,
                     token_version INTEGER NOT NULL DEFAULT 1,
                     reminders_enabled INTEGER NOT NULL DEFAULT 1,
+                    policy_accepted INTEGER NOT NULL DEFAULT 0,
                     last_reminder_date TEXT,
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
+                ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS policy_accepted INTEGER NOT NULL DEFAULT 0;
                 """)
             else:
                 cursor.executescript("""
@@ -1043,6 +1061,7 @@ class Database:
                     user_id INTEGER PRIMARY KEY,
                     token_version INTEGER NOT NULL DEFAULT 1,
                     reminders_enabled INTEGER NOT NULL DEFAULT 1,
+                    policy_accepted INTEGER NOT NULL DEFAULT 0,
                     last_reminder_date TEXT,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
@@ -1058,6 +1077,7 @@ class Database:
                     "ALTER TABLE user_daily_archive ADD COLUMN username TEXT;",
                     "ALTER TABLE user_daily_archive ADD COLUMN full_name TEXT;",
                     "ALTER TABLE teachers ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1;",
+                    "ALTER TABLE user_settings ADD COLUMN policy_accepted INTEGER NOT NULL DEFAULT 0;",
                 ]:
                     try:
                         cursor.execute(alter_sql)
@@ -1701,49 +1721,98 @@ class Database:
     def _ensure_user_settings_row(self, cursor, user_id: int):
         if self.is_postgres:
             cursor.execute(
-                "INSERT INTO user_settings (user_id, token_version, reminders_enabled) VALUES (%s, 1, 1) ON CONFLICT (user_id) DO NOTHING;",
+                "INSERT INTO user_settings (user_id, token_version, reminders_enabled, policy_accepted) VALUES (%s, 1, 1, 0) ON CONFLICT (user_id) DO NOTHING;",
                 (user_id,)
             )
         else:
             cursor.execute(
-                "INSERT OR IGNORE INTO user_settings (user_id, token_version, reminders_enabled) VALUES (?, 1, 1);",
+                "INSERT OR IGNORE INTO user_settings (user_id, token_version, reminders_enabled, policy_accepted) VALUES (?, 1, 1, 0);",
                 (user_id,)
             )
 
-    def _load_user_settings_cached(self, user_id: int) -> Tuple[int, bool]:
+    def _load_user_settings_cached(self, user_id: int) -> Tuple[int, bool, bool]:
         now = time.time()
         with self._cache_lock:
             cached = self._user_settings_cache.get(user_id)
             if cached is not None and (now - cached[0] < self._cache_ttl):
-                return cached[1], cached[2]
+                return cached[1], cached[2], cached[3]
 
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
             if self.is_postgres:
-                cursor.execute("SELECT token_version, reminders_enabled FROM user_settings WHERE user_id = %s;", (user_id,))
+                cursor.execute("SELECT token_version, reminders_enabled, COALESCE(policy_accepted, 0) FROM user_settings WHERE user_id = %s;", (user_id,))
             else:
-                cursor.execute("SELECT token_version, reminders_enabled FROM user_settings WHERE user_id = ?;", (user_id,))
+                cursor.execute("SELECT token_version, reminders_enabled, COALESCE(policy_accepted, 0) FROM user_settings WHERE user_id = ?;", (user_id,))
             row = cursor.fetchone()
             t_ver = int(row[0]) if row and row[0] is not None else 1
             rem_on = bool(int(row[1])) if row and row[1] is not None else True
+            pol_ok = bool(int(row[2])) if row and row[2] is not None else False
+
+            # Если пользователь уже активно решал карточки/тесты до обновления, автоматически засчитываем согласие
+            if not pol_ok:
+                if self.is_postgres:
+                    cursor.execute("SELECT 1 FROM user_answers WHERE user_id = %s LIMIT 1;", (user_id,))
+                else:
+                    cursor.execute("SELECT 1 FROM user_answers WHERE user_id = ? LIMIT 1;", (user_id,))
+                if cursor.fetchone():
+                    pol_ok = True
+                    self._ensure_user_settings_row(cursor, user_id)
+                    if self.is_postgres:
+                        cursor.execute("UPDATE user_settings SET policy_accepted = 1 WHERE user_id = %s;", (user_id,))
+                    else:
+                        cursor.execute("UPDATE user_settings SET policy_accepted = 1 WHERE user_id = ?;", (user_id,))
+                    conn.commit()
+
             with self._cache_lock:
                 self._evict_oldest_locked(self._user_settings_cache)
-                self._user_settings_cache[user_id] = (now, t_ver, rem_on)
-            return t_ver, rem_on
+                self._user_settings_cache[user_id] = (now, t_ver, rem_on, pol_ok)
+            return t_ver, rem_on, pol_ok
         except Exception:
-            return 1, True
+            return 1, True, False
         finally:
             cursor.close()
             conn.close()
 
     def get_user_token_version(self, user_id: int) -> int:
-        t_ver, _ = self._load_user_settings_cached(user_id)
+        t_ver, _, _ = self._load_user_settings_cached(user_id)
         return t_ver
 
     def get_user_reminders_enabled(self, user_id: int) -> bool:
-        _, rem_on = self._load_user_settings_cached(user_id)
+        _, rem_on, _ = self._load_user_settings_cached(user_id)
         return rem_on
+
+    def is_user_policy_accepted(self, user_id: int) -> bool:
+        _, _, pol_ok = self._load_user_settings_cached(user_id)
+        return pol_ok
+
+    def accept_user_policy(self, user_id: int):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            self._ensure_user_settings_row(cursor, user_id)
+            if self.is_postgres:
+                cursor.execute(
+                    "UPDATE user_settings SET policy_accepted = 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s;",
+                    (user_id,)
+                )
+                cursor.execute("SELECT token_version, reminders_enabled FROM user_settings WHERE user_id = %s;", (user_id,))
+            else:
+                cursor.execute(
+                    "UPDATE user_settings SET policy_accepted = 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?;",
+                    (user_id,)
+                )
+                cursor.execute("SELECT token_version, reminders_enabled FROM user_settings WHERE user_id = ?;", (user_id,))
+            row = cursor.fetchone()
+            conn.commit()
+            t_ver = int(row[0]) if row and row[0] is not None else 1
+            rem_on = bool(int(row[1])) if row and row[1] is not None else True
+            with self._cache_lock:
+                self._evict_oldest_locked(self._user_settings_cache)
+                self._user_settings_cache[user_id] = (time.time(), t_ver, rem_on, True)
+        finally:
+            cursor.close()
+            conn.close()
 
     def rotate_user_token(self, user_id: int) -> int:
         conn = self.get_connection()
@@ -1752,25 +1821,27 @@ class Database:
             self._ensure_user_settings_row(cursor, user_id)
             if self.is_postgres:
                 cursor.execute(
-                    "UPDATE user_settings SET token_version = token_version + 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s RETURNING token_version, reminders_enabled;",
+                    "UPDATE user_settings SET token_version = token_version + 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s RETURNING token_version, reminders_enabled, COALESCE(policy_accepted, 0);",
                     (user_id,)
                 )
                 row = cursor.fetchone()
                 new_ver = int(row[0]) if row else 2
                 rem_on = bool(int(row[1])) if row and row[1] is not None else True
+                pol_ok = bool(int(row[2])) if row and row[2] is not None else True
             else:
                 cursor.execute(
                     "UPDATE user_settings SET token_version = token_version + 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?;",
                     (user_id,)
                 )
-                cursor.execute("SELECT token_version, reminders_enabled FROM user_settings WHERE user_id = ?;", (user_id,))
+                cursor.execute("SELECT token_version, reminders_enabled, COALESCE(policy_accepted, 0) FROM user_settings WHERE user_id = ?;", (user_id,))
                 row = cursor.fetchone()
                 new_ver = int(row[0]) if row else 2
                 rem_on = bool(int(row[1])) if row and row[1] is not None else True
+                pol_ok = bool(int(row[2])) if row and row[2] is not None else True
             conn.commit()
             with self._cache_lock:
                 self._evict_oldest_locked(self._user_settings_cache)
-                self._user_settings_cache[user_id] = (time.time(), new_ver, rem_on)
+                self._user_settings_cache[user_id] = (time.time(), new_ver, rem_on, pol_ok)
             return new_ver
         finally:
             cursor.close()
@@ -1786,20 +1857,21 @@ class Database:
                     "UPDATE user_settings SET reminders_enabled = CASE WHEN reminders_enabled = 1 THEN 0 ELSE 1 END, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s;",
                     (user_id,)
                 )
-                cursor.execute("SELECT token_version, reminders_enabled FROM user_settings WHERE user_id = %s;", (user_id,))
+                cursor.execute("SELECT token_version, reminders_enabled, COALESCE(policy_accepted, 0) FROM user_settings WHERE user_id = %s;", (user_id,))
             else:
                 cursor.execute(
                     "UPDATE user_settings SET reminders_enabled = CASE WHEN reminders_enabled = 1 THEN 0 ELSE 1 END, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?;",
                     (user_id,)
                 )
-                cursor.execute("SELECT token_version, reminders_enabled FROM user_settings WHERE user_id = ?;", (user_id,))
+                cursor.execute("SELECT token_version, reminders_enabled, COALESCE(policy_accepted, 0) FROM user_settings WHERE user_id = ?;", (user_id,))
             row = cursor.fetchone()
             conn.commit()
             t_ver = int(row[0]) if row and row[0] is not None else 1
             rem_on = bool(int(row[1])) if row and row[1] is not None else True
+            pol_ok = bool(int(row[2])) if row and row[2] is not None else True
             with self._cache_lock:
                 self._evict_oldest_locked(self._user_settings_cache)
-                self._user_settings_cache[user_id] = (time.time(), t_ver, rem_on)
+                self._user_settings_cache[user_id] = (time.time(), t_ver, rem_on, pol_ok)
             return rem_on
         finally:
             cursor.close()
@@ -2507,6 +2579,7 @@ class UserFlow(StatesGroup):
     in_teacher_cabinet = State()
     in_teacher_reset_confirm = State()
     in_delete_me_confirm = State()
+    awaiting_policy_accept = State()
 
 
 BTN_MAIN_CARDS = "🗂 Карточки"
@@ -2553,6 +2626,7 @@ BTN_TEACHER_RESET_LINK = "🔄 Сбросить ссылку класса"
 
 BTN_CONFIRM_DELETE_DATA = "🗑 Да, стереть все мои данные"
 BTN_CANCEL_DELETE_DATA = "⬅️ Отмена, оставить данные"
+BTN_ACCEPT_POLICY = "✅ Принять и начать"
 
 
 class Keyboards:
@@ -2767,6 +2841,17 @@ class Keyboards:
             is_persistent=True,
         )
 
+    @staticmethod
+    def policy_consent_reply() -> ReplyKeyboardMarkup:
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=BTN_ACCEPT_POLICY)],
+            ],
+            resize_keyboard=True,
+            is_persistent=True,
+            input_field_placeholder="Нажмите «✅ Принять и начать»..."
+        )
+
 
 # =====================================================================
 # 10. ФОРМАТИРОВАНИЕ КАРТОЧЕК И ТЕОРЕТИЧЕСКОГО ДОСЬЕ
@@ -2876,36 +2961,93 @@ async def global_error_handler(event: ErrorEvent, bot: Bot):
     return True
 
 
+def _build_policy_consent_text() -> str:
+    safe_priv_url = PRIVACY_URL.replace(")", "%29")
+    safe_terms_url = TERMS_URL.replace(")", "%29")
+    return (
+        "👋 *Добро пожаловать в тренажёр по обществознанию!*\n\n"
+        "Перед началом занятий подтвердите согласие с правилами сервиса.\n\n"
+        f"Нажимая кнопку *«{BTN_ACCEPT_POLICY}»*, вы принимаете "
+        f"[Политику конфиденциальности]({safe_priv_url}) и "
+        f"[Пользовательское соглашение]({safe_terms_url}), а также соглашаетесь на "
+        "сохранение обезличенных учебных результатов для ведения вашей статистики.\n\n"
+        "💡 _Удалить все свои данные можно в любой момент командой /delete\\_me._"
+    )
+
+
+async def _process_teacher_deeplink(user_id: int, teacher_code: str) -> str:
+    teacher = await asyncio.to_thread(db.get_teacher, teacher_code)
+    if not teacher:
+        return f"❌ *Преподаватель по коду* `{escape_md(teacher_code)}` *не найден.*\n\n"
+    if teacher["user_id"] == user_id:
+        return "⚠️ *Вы не можете прикрепиться к своему собственному классу в качестве ученика.*\n\n"
+    if not await asyncio.to_thread(db.is_student_connected, user_id, teacher_code):
+        await asyncio.to_thread(db.connect_student_to_teacher, user_id, teacher_code)
+        return (
+            f"✅ *Вы успешно прикреплены к преподавателю:*\n"
+            f"*{strip_md_delimiters(teacher['full_name'])}* (код `{escape_md(teacher_code)}`).\n\n"
+        )
+    return (
+        f"ℹ️ *Вы уже прикреплены к преподавателю:*\n"
+        f"*{strip_md_delimiters(teacher['full_name'])}* (код `{escape_md(teacher_code)}`).\n\n"
+    )
+
+
 @router.message(CommandStart())
 async def handle_start(message: Message, state: FSMContext):
     if not message.from_user:
         return
-    async with user_lock_manager.get_lock(message.from_user.id):
+    uid = message.from_user.id
+    async with user_lock_manager.get_lock(uid):
+        prev_data = await state.get_data()
+        prev_bot_id = prev_data.get("last_bot_msg_id")
         await state.clear()
+        if prev_bot_id:
+            await state.update_data(last_bot_msg_id=prev_bot_id)
+
+        parts = message.text.split(maxsplit=1) if message.text else []
+        pending_t_code = None
+        if len(parts) > 1 and parts[1].strip().startswith("t_"):
+            pending_t_code = parts[1].strip()[2:].strip()
+
+        policy_ok = await asyncio.to_thread(db.is_user_policy_accepted, uid)
+        if not policy_ok:
+            await state.set_state(UserFlow.awaiting_policy_accept)
+            if pending_t_code:
+                await state.update_data(pending_teacher_code=pending_t_code)
+            await render_single_screen(
+                message,
+                state,
+                _build_policy_consent_text(),
+                reply_markup=Keyboards.policy_consent_reply(),
+            )
+            return
 
         connect_notice = ""
-        parts = message.text.split(maxsplit=1) if message.text else []
-        if len(parts) > 1 and parts[1].strip().startswith("t_"):
-            teacher_code = parts[1].strip()[2:].strip()
-            teacher = await asyncio.to_thread(db.get_teacher, teacher_code)
-            if teacher:
-                if teacher["user_id"] == message.from_user.id:
-                    connect_notice = "⚠️ *Вы не можете прикрепиться к своему собственному классу в качестве ученика.*\n\n"
-                elif not await asyncio.to_thread(db.is_student_connected, message.from_user.id, teacher_code):
-                    await asyncio.to_thread(db.connect_student_to_teacher, message.from_user.id, teacher_code)
-                    connect_notice = (
-                        f"✅ *Вы успешно прикреплены к преподавателю:*\n"
-                        f"*{strip_md_delimiters(teacher['full_name'])}* (код `{escape_md(teacher_code)}`).\n\n"
-                    )
-                else:
-                    connect_notice = (
-                        f"ℹ️ *Вы уже прикреплены к преподавателю:*\n"
-                        f"*{strip_md_delimiters(teacher['full_name'])}* (код `{escape_md(teacher_code)}`).\n\n"
-                    )
-            else:
-                connect_notice = (
-                    f"❌ *Преподаватель по коду* `{escape_md(teacher_code)}` *не найден.*\n\n"
-                )
+        if pending_t_code:
+            connect_notice = await _process_teacher_deeplink(uid, pending_t_code)
+
+        text = f"{connect_notice}🏠 *Главное меню*\n\nВыберите формат тренировки:"
+        await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
+
+
+@router.message(F.text == BTN_ACCEPT_POLICY)
+async def handle_accept_policy_reply(message: Message, state: FSMContext):
+    if not message.from_user:
+        return
+    uid = message.from_user.id
+    async with user_lock_manager.get_lock(uid):
+        data = await state.get_data()
+        pending_t_code = data.get("pending_teacher_code")
+        prev_bot_id = data.get("last_bot_msg_id")
+        await asyncio.to_thread(db.accept_user_policy, uid)
+        await state.clear()
+        if prev_bot_id:
+            await state.update_data(last_bot_msg_id=prev_bot_id)
+
+        connect_notice = ""
+        if pending_t_code:
+            connect_notice = await _process_teacher_deeplink(uid, str(pending_t_code))
 
         text = f"{connect_notice}🏠 *Главное меню*\n\nВыберите формат тренировки:"
         await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
@@ -2915,7 +3057,11 @@ async def handle_start(message: Message, state: FSMContext):
 async def handle_reply_back_to_main(message: Message, state: FSMContext):
     uid = message.from_user.id if message.from_user else message.chat.id
     async with user_lock_manager.get_lock(uid):
+        prev_data = await state.get_data()
+        prev_bot_id = prev_data.get("last_bot_msg_id")
         await state.clear()
+        if prev_bot_id:
+            await state.update_data(last_bot_msg_id=prev_bot_id)
         text = "🏠 *Главное меню*\n\nВыберите формат тренировки:"
         await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
 
@@ -3853,16 +3999,21 @@ async def handle_test_restart_reply(message: Message, state: FSMContext):
 async def handle_privacy_command(message: Message, state: FSMContext):
     uid = message.from_user.id if message.from_user else message.chat.id
     async with user_lock_manager.get_lock(uid):
+        safe_priv_url = PRIVACY_URL.replace(")", "%29")
+        safe_terms_url = TERMS_URL.replace(")", "%29")
         text = (
-            "🛡 *Политика приватности и защита данных*\n\n"
+            "🛡 *Политика конфиденциальности и правила сервиса*\n\n"
             "1. *Что хранится:* бот сохраняет исключительно статистику ответов, "
             "прогресс карточек и серию занятий для личного кабинета и преподавателя.\n\n"
             "2. *Обезличивание:* полные фамилии, телефоны, школы, адреса и биометрия "
-            "*не собираются и не сохраняются*. Имена автоматически обезличиваются (например: _Данил К._ или псевдоним).\n\n"
+            "*не собираются и не сохраняются*. Имена автоматически приводятся к сокращённому виду.\n\n"
             "3. *Право на удаление:* вы можете в любой момент безвозвратно стереть "
-            "все свои ответы, статистику и привязки командой /delete_me."
+            "все свои ответы, статистику и привязки командой /delete\\_me.\n\n"
+            f"📄 Полный текст: [Политика конфиденциальности]({safe_priv_url}) и [Пользовательское соглашение]({safe_terms_url})."
         )
-        await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
+        policy_ok = await asyncio.to_thread(db.is_user_policy_accepted, uid)
+        kb = Keyboards.main_menu() if policy_ok else Keyboards.policy_consent_reply()
+        await render_single_screen(message, state, text, reply_markup=kb)
 
 
 @router.message(Command("delete_me"))
@@ -3936,6 +4087,7 @@ SYSTEM_UI_BUTTONS_SET = {
     BTN_TEACHER_WEBAPP,
     BTN_CONFIRM_DELETE_DATA,
     BTN_CANCEL_DELETE_DATA,
+    BTN_ACCEPT_POLICY,
     "1", "2", "3", "4",
 } | set(TOPIC_BUTTONS_MAP.keys())
 
@@ -3948,6 +4100,15 @@ async def handle_universal_text_fallback(message: Message, state: FSMContext):
     uid = message.from_user.id if message.from_user else message.chat.id
     async with user_lock_manager.get_lock(uid):
         txt = (message.text or "").strip()
+        cur_state = await state.get_state()
+        if cur_state == UserFlow.awaiting_policy_accept.state:
+            await render_single_screen(
+                message,
+                state,
+                _build_policy_consent_text(),
+                reply_markup=Keyboards.policy_consent_reply(),
+            )
+            return
 
         # Если после рестарта сервера пользователь нажал кнопку карточки — бесшовно продолжаем карточки
         if txt in {BTN_CARD_FLIP, BTN_CARD_KNOW, BTN_CARD_UNSURE, BTN_CARD_FORGOT, BTN_CARD_DETAIL} and message.from_user:
