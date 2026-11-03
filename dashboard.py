@@ -5,6 +5,7 @@ import sys
 import json
 import html
 import hmac
+import base64
 import hashlib
 import difflib
 import sqlite3
@@ -28,7 +29,7 @@ except ImportError:
     pass
 
 # =====================================================================
-# 1. НАСТРОЙКА СТРАНИЦЫ, АВТО-ТЕМЫ УСТРОЙСТВА И БЕЗОПАСНОСТИ (ВЕРСИЯ 7.3)
+# 1. НАСТРОЙКА СТРАНИЦЫ, АВТО-ТЕМЫ УСТРОЙСТВА И БЕЗОПАСНОСТИ (ВЕРСИЯ 7.4)
 # =====================================================================
 
 st.set_page_config(
@@ -275,8 +276,12 @@ div[data-testid="stPlotlyChart"] {
 DATABASE_URL = os.getenv("DATABASE_URL")
 DB_PATH = os.getenv("DB_PATH", "social_bot.db")
 TERMS_JSON_PATH = os.getenv("TERMS_JSON_PATH", "terms.json")
-SECRET_KEY = os.getenv("SECRET_KEY", "obshaga_secret_key_2025")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "obshaga_admin_2025")
+SECRET_KEY = os.getenv("SECRET_KEY")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+if not SECRET_KEY:
+    raise RuntimeError("Переменная окружения SECRET_KEY не задана!")
+if not ADMIN_PASSWORD:
+    raise RuntimeError("Переменная окружения ADMIN_PASSWORD не задана!")
 TIMEZONE_STR = os.getenv("TIMEZONE", "Europe/Moscow")
 
 try:
@@ -355,25 +360,41 @@ def _get_query_param(query_params: Any, key: str) -> Optional[str]:
 
 
 def generate_student_token(user_id: Any, token_version: int = 1, secret_key: Optional[str] = None) -> str:
-    key = secret_key if secret_key is not None else os.getenv("SECRET_KEY", SECRET_KEY)
+    key = str(secret_key if secret_key is not None else os.getenv("SECRET_KEY", SECRET_KEY))
     uid_str = str(user_id).strip()
     try:
         ver = max(1, int(token_version or 1))
     except (ValueError, TypeError):
         ver = 1
-    payload = f"{uid_str}_{key}" if ver == 1 else f"{uid_str}_{key}_v{ver}"
-    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:8]
+    msg = f"student:{uid_str}:v{ver}".encode("utf-8")
+    return hmac.new(key.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:16]
 
 
 def generate_teacher_token(teacher_code: Any, token_version: int = 1, secret_key: Optional[str] = None) -> str:
-    key = secret_key if secret_key is not None else os.getenv("SECRET_KEY", SECRET_KEY)
+    key = str(secret_key if secret_key is not None else os.getenv("SECRET_KEY", SECRET_KEY))
     code_str = str(teacher_code).strip()
     try:
         ver = max(1, int(token_version or 1))
     except (ValueError, TypeError):
         ver = 1
-    payload = f"teacher_{code_str}_{key}_v{ver}"
-    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:8]
+    msg = f"teacher:{code_str}:v{ver}".encode("utf-8")
+    return hmac.new(key.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:16]
+
+
+def decode_user_id(encoded_str: str, secret_key: Optional[str] = None) -> Optional[int]:
+    """Расшифровывает безопасный строковый токен обратно в Telegram user_id."""
+    key = secret_key or SECRET_KEY
+    if not encoded_str or not key:
+        return None
+    try:
+        salt = hashlib.sha256(key.encode("utf-8")).digest()
+        padded = encoded_str + "=" * (-len(encoded_str) % 4)
+        masked = base64.urlsafe_b64decode(padded.encode("utf-8"))
+        raw_uid = bytes([b ^ salt[i % len(salt)] for i, b in enumerate(masked)]).decode("utf-8")
+        val = int(raw_uid)
+        return val if val > 0 else None
+    except Exception:
+        return None
 
 
 # =====================================================================
@@ -671,6 +692,18 @@ def _parse_answers_and_archive_rows(
 
     user_profiles: Dict[str, Tuple[Optional[str], str]] = {}
 
+    def _anonymize_display_name(raw_name: str) -> str:
+        s = str(raw_name or "").strip().lstrip("=+-@")
+        if not s:
+            return ""
+        words = s.split()
+        if len(words) >= 2:
+            w0 = "".join(ch for ch in words[0] if ch.isalnum()) or words[0]
+            w1_alnum = "".join(ch for ch in words[1] if ch.isalnum())
+            if w1_alnum:
+                return f"{w0} {w1_alnum[0].upper()}."
+        return s[:24]
+
     def _clean_profile_fields(uid_str: str, raw_u: Any, raw_f: Any) -> Tuple[Optional[str], str]:
         u_val = str(raw_u).strip() if raw_u is not None and pd.notna(raw_u) else ""
         if u_val in ("None", "nan", ""):
@@ -678,11 +711,13 @@ def _parse_answers_and_archive_rows(
         f_val = str(raw_f).strip() if raw_f is not None and pd.notna(raw_f) else ""
         if f_val in ("None", "nan", ""):
             f_val = ""
+        f_val = _anonymize_display_name(f_val)
         prev_u, prev_f = user_profiles.get(uid_str, (None, ""))
-        best_u = prev_u or u_val
-        best_f = prev_f or f_val
+        # В выборке ORDER BY created_at DESC первой идёт самая свежая запись, сохраняем её приоритет
+        best_u = prev_u if prev_u is not None else u_val
+        best_f = prev_f if prev_f else f_val
         user_profiles[uid_str] = (best_u, best_f)
-        return best_u, (best_f or best_u or f"ID: {uid_str}")
+        return best_u, (best_f or best_u or f"Ученик #{uid_str[-4:]}")
 
     parsed_rows = []
 
@@ -913,7 +948,13 @@ def fetch_teacher_class_data(teacher_code: str) -> Tuple[str, List[str], pd.Data
                 cur.execute("SELECT full_name FROM teachers WHERE teacher_code = ?;", (code_clean,))
             t_row = cur.fetchone()
             if t_row and t_row[0]:
-                teacher_name = f"{str(t_row[0]).strip()} (Класс `{code_clean}`)"
+                raw_t = str(t_row[0]).strip()
+                t_words = raw_t.split()
+                if len(t_words) >= 2:
+                    w1_clean = "".join(ch for ch in t_words[1] if ch.isalnum())
+                    if w1_clean:
+                        raw_t = f"{t_words[0]} {w1_clean[0].upper()}."
+                teacher_name = f"{raw_t} (Класс `{code_clean}`)"
         except Exception:
             pass
 
@@ -1395,7 +1436,7 @@ def build_calendar_data(
 
 
 def build_calendar_html(cal_data: Dict[str, Any]) -> str:
-    """Генерирует адаптивный виджет календаря активности v7.3 с защитой от XSS."""
+    """Генерирует адаптивный виджет календаря активности v7.4 с защитой от XSS."""
     weeks_count = cal_data["weeks_count"]
     month_labels = cal_data["month_labels"]
     safe_mode = html.escape(cal_data["mode_label"], quote=True)
@@ -1800,178 +1841,38 @@ def render_activity_calendar(
 
 
 # =====================================================================
-# 5. ГЕНЕРАЦИЯ PDF-ОТЧЁТА УСПЕВАЕМОСТИ
-# =====================================================================
-
-def _find_cyrillic_font() -> Optional[str]:
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "C:/Windows/Fonts/arial.ttf",
-    ]
-    try:
-        import matplotlib
-        mpl_ttf = os.path.join(os.path.dirname(matplotlib.__file__), "mpl-data", "fonts", "ttf", "DejaVuSans.ttf")
-        candidates.insert(0, mpl_ttf)
-    except Exception:
-        pass
-
-    for path in candidates:
-        if path and os.path.exists(path):
-            return path
-    return None
-
-
-def generate_pdf_report(
-    title: str,
-    subtitle: str,
-    df: pd.DataFrame,
-    period_label: str = "За всё время",
-    class_summary_df: Optional[pd.DataFrame] = None
-) -> bytes:
-    total_answers = len(df)
-    valid_times = df[(df["time_sec"] >= 0) & (df["time_sec"] <= 180.0)]["time_sec"] if not df.empty else pd.Series(dtype=float)
-    avg_time = round(float(valid_times.mean()), 1) if not valid_times.empty else 0.0
-    errors_count = int(df["is_problem"].sum()) if not df.empty else 0
-    accuracy = round((1 - (errors_count / total_answers)) * 100, 1) if total_answers > 0 else 0.0
-
-    try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib import colors
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-
-        buf = io.BytesIO()
-        doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
-
-        font_path = _find_cyrillic_font()
-        font_name = "Helvetica"
-        if font_path:
-            try:
-                pdfmetrics.registerFont(TTFont("CyrillicSans", font_path))
-                font_name = "CyrillicSans"
-            except Exception:
-                font_name = "Helvetica"
-
-        styles = getSampleStyleSheet()
-        title_style = ParagraphStyle(
-            "RepTitle", parent=styles["Normal"], fontName=font_name, fontSize=16, leading=20, spaceAfter=6, textColor=colors.HexColor("#1e293b")
-        )
-        sub_style = ParagraphStyle(
-            "RepSub", parent=styles["Normal"], fontName=font_name, fontSize=10, leading=14, spaceAfter=14, textColor=colors.HexColor("#475569")
-        )
-        h2_style = ParagraphStyle(
-            "RepH2", parent=styles["Normal"], fontName=font_name, fontSize=12, leading=16, spaceBefore=12, spaceAfter=8, textColor=colors.HexColor("#0f172a")
-        )
-        cell_style = ParagraphStyle(
-            "RepCell", parent=styles["Normal"], fontName=font_name, fontSize=9, leading=11
-        )
-
-        story = []
-        story.append(Paragraph(html.escape(title), title_style))
-        story.append(Paragraph(html.escape(f"{subtitle} | Период: {period_label}"), sub_style))
-
-        story.append(Paragraph("1. Ключевые показатели успеваемости", h2_style))
-        kpi_data = [
-            ["Всего ответов", "Точность (%)", "Среднее время", "Ошибок / затруднений"],
-            [str(total_answers), f"{accuracy}%", f"{avg_time} сек", str(errors_count)]
-        ]
-        kpi_table = Table(kpi_data, colWidths=[125, 125, 125, 140])
-        kpi_table.setStyle(TableStyle([
-            ("FONTNAME", (0, 0), (-1, -1), font_name), ("FONTSIZE", (0, 0), (-1, -1), 10),
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"), ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 6), ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ]))
-        story.append(kpi_table)
-        story.append(Spacer(1, 14))
-
-        if not df.empty:
-            story.append(Paragraph("2. Топ трудных терминов (требующих повторения)", h2_style))
-            df_calc = df.copy()
-            df_calc["time_sec_clamped"] = df_calc["time_sec"].clip(0, 180)
-            term_problems = df_calc.groupby(["code", "term", "module"]).agg(
-                total_tries=("status", "count"), errors=("is_problem", "sum"), avg_seconds=("time_sec_clamped", "mean")
-            ).reset_index()
-            term_problems["error_rate"] = (term_problems["errors"] / term_problems["total_tries"] * 100).round(1)
-            term_problems["avg_seconds"] = term_problems["avg_seconds"].round(1)
-            top_prob = term_problems.sort_values(by=["errors", "error_rate"], ascending=False).head(10)
-
-            prob_rows = [["Код", "Термин", "Модуль", "Ошибок", "Попыток", "% ошибок"]]
-            for _, r in top_prob.iterrows():
-                prob_rows.append([
-                    str(r["code"]), Paragraph(html.escape(str(r["term"])[:60]), cell_style),
-                    Paragraph(html.escape(str(r["module"])[:35]), cell_style), str(int(r["errors"])), str(int(r["total_tries"])), f"{r['error_rate']}%",
-                ])
-            prob_table = Table(prob_rows, colWidths=[45, 165, 130, 55, 60, 60])
-            prob_table.setStyle(TableStyle([
-                ("FONTNAME", (0, 0), (-1, -1), font_name), ("FONTSIZE", (0, 0), (-1, -1), 9),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f1f5f9")), ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("BOTTOMPADDING", (0, 0), (-1, -1), 5), ("TOPPADDING", (0, 0), (-1, -1), 5),
-            ]))
-            story.append(prob_table)
-            story.append(Spacer(1, 14))
-
-        if class_summary_df is not None and not class_summary_df.empty:
-            story.append(Paragraph("3. Сводная ведомость учеников класса", h2_style))
-            cls_rows = [["Ученик", "Юзернейм", "Ответов", "Точность (%)", "Ошибок", "Ср. время (с)"]]
-            for _, r in class_summary_df.iterrows():
-                cls_rows.append([
-                    Paragraph(html.escape(str(r.get("Ученик", ""))[:45]), cell_style), str(r.get("Юзернейм", "—")),
-                    str(r.get("Всего ответов", 0)), f"{r.get('Точность (%)', 0.0)}%", str(r.get("Ошибок", 0)), str(r.get("Ср. время (сек)", 0.0)),
-                ])
-            cls_table = Table(cls_rows, colWidths=[150, 90, 65, 75, 60, 75])
-            cls_table.setStyle(TableStyle([
-                ("FONTNAME", (0, 0), (-1, -1), font_name), ("FONTSIZE", (0, 0), (-1, -1), 9),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f1f5f9")), ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("BOTTOMPADDING", (0, 0), (-1, -1), 5), ("TOPPADDING", (0, 0), (-1, -1), 5),
-            ]))
-            story.append(cls_table)
-
-        doc.build(story)
-        return buf.getvalue()
-    except Exception:
-        fallback_pdf = (
-            b"%PDF-1.4\n"
-            b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n"
-            b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n"
-            b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >> endobj\n"
-            b"xref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n"
-            b"0000000058 00000 n \n0000000115 00000 n \n"
-            b"trailer << /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n"
-        )
-        return fallback_pdf
-
-
-# =====================================================================
 # 6. КОМПОНЕНТЫ ИНТЕРФЕЙСА (ТАБЛИЦА БЕЗ СКРОЛЛА + ПОИСК ТЕРМИНОВ)
 # =====================================================================
 
 def build_user_avatar_html(full_name: str, username: Optional[str], user_id: str) -> str:
-    safe_name = html.escape(str(full_name or "").strip() or f"ID: {user_id}")
-    safe_uid = html.escape(str(user_id or "").strip())
+    short_uid = html.escape(str(user_id or "").strip()[-4:] or "0000")
+    safe_name = html.escape(str(full_name or "").strip() or f"Ученик #{short_uid}")
     raw_uname = str(username or "").replace("@", "").strip()
     clean_uname = raw_uname if re.match(r"^[A-Za-z0-9_]{3,32}$", raw_uname) else ""
     safe_uname = html.escape(clean_uname)
+
     alnum_words = ["".join(ch for ch in part if ch.isalnum()) for part in str(full_name or "").split()]
     alnum_words = [w for w in alnum_words if w]
-    initials = "".join(w[0].upper() for w in alnum_words[:2]) if alnum_words else "УЧ"
-    encoded_initials = urllib.parse.quote(initials, safe="")
-    fallback_url = f"https://ui-avatars.com/api/?name={encoded_initials}&background=4f46e5&color=fff&size=128"
+    initials = "".join(w[0].upper() for w in alnum_words[:2]) if alnum_words else ""
 
-    if clean_uname:
-        primary_url = f"https://t.me/i/userpic/320/{clean_uname}.jpg"
-        img_tag = f'<img src="{primary_url}" onerror="this.onerror=null; this.src=\'{fallback_url}\';" style="width: 48px; height: 48px; border-radius: 50%; object-fit: cover; border: 2px solid #6366f1;" />'
-    else:
-        img_tag = f'<img src="{fallback_url}" style="width: 48px; height: 48px; border-radius: 50%; object-fit: cover; border: 2px solid #6366f1;" />'
+    if not initials:
+        raw_first = str(full_name or "").strip()
+        initials = raw_first[:2] if raw_first else "УЧ"
 
-    subtitle = f"@{safe_uname}" if safe_uname else f"ID: {safe_uid}"
+    initials_safe = html.escape(initials)
+
+    avatar_badge = (
+        f'<div style="width: 48px; height: 48px; border-radius: 50%; '
+        f'background: linear-gradient(135deg, #4f46e5, #6366f1); color: #ffffff; '
+        f'display: flex; align-items: center; justify-content: center; '
+        f'font-weight: 700; font-size: 1.05rem; border: 2px solid #818cf8; '
+        f'flex-shrink: 0; box-shadow: 0 2px 8px rgba(79, 70, 229, 0.25);">'
+        f'{initials_safe}</div>'
+    )
+    subtitle = f"@{safe_uname}" if safe_uname else f"Профиль #{short_uid}"
     return f"""
     <div class="user-avatar-card">
-        {img_tag}
+        {avatar_badge}
         <div>
             <div style="font-size: 1.15rem; font-weight: 600; line-height: 1.2;">{safe_name}</div>
             <div class="user-avatar-subtitle">{subtitle}</div>
@@ -1996,14 +1897,24 @@ def build_class_summary_df(class_student_ids: List[str], class_df: pd.DataFrame)
             u_valid_time = u_df[(u_df["time_sec"] >= 0) & (u_df["time_sec"] <= 180.0)]["time_sec"]
             u_time = round(float(u_valid_time.mean()), 1) if not u_valid_time.empty else 0.0
             uname_raw = str(r0["username"]).lstrip("@") if r0["username"] else ""
+            safe_excel_name = str(r0["full_name"] or "").strip().lstrip("=+-@") or f"Ученик #{str(uid)[-4:]}"
+            safe_excel_uname = f"@{uname_raw}" if uname_raw else "—"
             summary_rows.append({
-                "Ученик": r0["full_name"], "Юзернейм": f"@{uname_raw}" if uname_raw else "—",
-                "ID Telegram": uid, "Всего ответов": u_total, "Точность (%)": u_acc, "Ошибок": u_err, "Ср. время (сек)": u_time
+                "Ученик": safe_excel_name,
+                "Юзернейм": safe_excel_uname,
+                "Всего ответов": u_total,
+                "Точность (%)": u_acc,
+                "Ошибок": u_err,
+                "Ср. время (сек)": u_time
             })
         else:
             summary_rows.append({
-                "Ученик": f"ID: {uid}", "Юзернейм": "—", "ID Telegram": uid,
-                "Всего ответов": 0, "Точность (%)": 0.0, "Ошибок": 0, "Ср. время (сек)": 0.0
+                "Ученик": f"Ученик #{str(uid)[-4:]}",
+                "Юзернейм": "—",
+                "Всего ответов": 0,
+                "Точность (%)": 0.0,
+                "Ошибок": 0,
+                "Ср. время (сек)": 0.0
             })
     return pd.DataFrame(summary_rows)
 
@@ -2272,7 +2183,7 @@ def render_analytics_dashboard(
 
 
 # =====================================================================
-# 7. ИНТЕРФЕЙС И РОУТИНГ ПО РОЛЯМ (ВЕРСИЯ 7.3)
+# 7. ИНТЕРФЕЙС И РОУТИНГ ПО РОЛЯМ (ВЕРСИЯ 7.4)
 # =====================================================================
 
 def run_dashboard_app():
@@ -2286,7 +2197,13 @@ def run_dashboard_app():
     # СЦЕНАРИЙ 1: ПЕРСОНАЛЬНЫЙ КАБИНЕТ УЧЕНИКА (И TELEGRAM MINI APP)
     # -----------------------------------------------------------------
     if student_param:
-        student_id_str = str(student_param).strip()
+        real_uid = decode_user_id(str(student_param).strip())
+        if not real_uid:
+            st.error("🔒 Ошибка расшифровки идентификатора: неверная ссылка.")
+            st.stop()
+            return
+
+        student_id_str = str(real_uid)
         st.title("🎓 Личный кабинет ученика")
 
         if not verify_student_access(student_id_str, token_param):
@@ -2296,7 +2213,7 @@ def run_dashboard_app():
 
         student_df = fetch_student_data(student_id_str)
         if student_df.empty:
-            st.warning(f"Ученик с ID `{student_id_str}` пока не совершил ни одного действия.")
+            st.warning("Вы пока не совершили ни одного действия в тренажёре.")
             st.stop()
             return
 
@@ -2325,12 +2242,6 @@ def run_dashboard_app():
 
             window_df, prev_window_df, period_label = filter_df_by_time_window(mode_filtered_df, period_choice, custom_dates)
 
-            pdf_bytes = generate_pdf_report(
-                title=f"Отчёт успеваемости: {sample_row['full_name']}",
-                subtitle=f"ID: {student_id_str} | Режим: {selected_mode}",
-                df=window_df, period_label=period_label,
-            )
-            st.download_button("📄 Скачать PDF-отчёт", data=pdf_bytes, file_name=f"Отчет_{student_id_str}.pdf", mime="application/pdf", use_container_width=True)
             if st.button("🔄 Обновить данные", key="student_refresh_btn", use_container_width=True):
                 st.cache_data.clear()
                 st.rerun()
@@ -2373,9 +2284,9 @@ def run_dashboard_app():
                 if not sub.empty:
                     row_s = sub.iloc[0]
                     uname_clean = str(row_s["username"]).lstrip("@") if row_s["username"] else ""
-                    label = f"{row_s['full_name']} ({'@' + uname_clean if uname_clean else 'ID: ' + uid})"
+                    label = f"{row_s['full_name']} ({'@' + uname_clean if uname_clean else '#' + str(uid)[-4:]})"
                 else:
-                    label = f"ID: {uid} (0 ответов)"
+                    label = f"Ученик #{str(uid)[-4:]} (0 ответов)"
                 student_labels[label] = uid
 
             selected_student_label = st.selectbox("Выберите ученика:", list(student_labels.keys()), key="teacher_student_sel")
@@ -2414,15 +2325,16 @@ def run_dashboard_app():
                 report_df.to_excel(writer, index=False, sheet_name="Ведомость класса")
             st.download_button("📥 Скачать ведомость (.xlsx)", data=buffer.getvalue(), file_name=f"Класс_{teacher_code}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
-            pdf_class_bytes = generate_pdf_report(title=f"Ведомость класса {teacher_code}", subtitle=teacher_name, df=active_window_df, period_label=period_label, class_summary_df=report_df)
-            st.download_button("📄 Скачать PDF-отчёт (.pdf)", data=pdf_class_bytes, file_name=f"Класс_{teacher_code}.pdf", mime="application/pdf", use_container_width=True)
             if st.button("🔄 Обновить данные", key="teacher_refresh_btn", use_container_width=True):
                 st.cache_data.clear()
                 st.rerun()
 
-        if selected_uid != "ALL" and not entity_unfiltered_df.empty:
-            s_row = entity_unfiltered_df.iloc[0]
-            render_user_avatar_badge(s_row["full_name"], s_row["username"], selected_uid)
+        if selected_uid != "ALL":
+            if not entity_unfiltered_df.empty:
+                s_row = entity_unfiltered_df.iloc[0]
+                render_user_avatar_badge(s_row["full_name"], s_row["username"], selected_uid)
+            else:
+                render_user_avatar_badge(f"Ученик #{str(selected_uid)[-4:]}", None, selected_uid)
 
         if active_window_df.empty:
             st.warning(f"За выбранный период («{period_label}») пока нет данных.")
@@ -2492,7 +2404,7 @@ def run_dashboard_app():
             r0 = sub_df.iloc[0]
             fname = r0["full_name"]
             uname_clean = str(r0["username"]).lstrip("@") if r0["username"] else ""
-            uname = f"@{uname_clean}" if uname_clean else f"ID: {uid}"
+            uname = f"@{uname_clean}" if uname_clean else f"Профиль #{str(uid)[-4:]}"
             user_labels_map[f"{fname} ({uname})"] = uid
 
         with st.popover("⚙️ Параметры и фильтры", use_container_width=True):
