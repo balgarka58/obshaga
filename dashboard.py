@@ -2160,7 +2160,7 @@ def render_analytics_dashboard(
                 sc = compute_fuzzy_similarity(clean_q, str(r["term"]))
                 if clean_q == str(r["code"]).lower():
                     sc = 1.0
-                if sc >= 0.45:
+                if sc >= 0.55:
                     row_copy = r.copy()
                     row_copy["_score"] = sc
                     scored_rows.append(row_copy)
@@ -2172,7 +2172,7 @@ def render_analytics_dashboard(
                 cat_matches = []
                 for c_code, c_info in TERMS_MAP.items():
                     sc = compute_fuzzy_similarity(clean_q, c_info["term"])
-                    if sc >= 0.50:
+                    if sc >= 0.55:
                         cat_matches.append((c_info["term"], c_info["module"], sc))
                 cat_matches.sort(key=lambda x: x[2], reverse=True)
                 if cat_matches:
