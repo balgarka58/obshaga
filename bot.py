@@ -851,14 +851,14 @@ class TermsCatalog:
                     score = 1.0
                 else:
                     score = _compute_similarity_preindexed(clean_q, q_tri, t_norm, t_tri, t_words, threshold=0.45)
-                if score >= 0.45:
+                if score >= 0.55:
                     scored.append((t, score))
         else:
             for t in self.all_terms:
                 score = compute_fuzzy_similarity(clean_q, t["term"])
                 if clean_q == t["code"].lower():
                     score = 1.0
-                if score >= 0.45:
+                if score >= 0.55:
                     scored.append((t, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
