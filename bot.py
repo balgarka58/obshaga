@@ -38,11 +38,12 @@ from aiogram.types import (
     KeyboardButton,
     WebAppInfo,
     ErrorEvent,
+    BotCommand,
 )
 from aiogram.client.default import DefaultBotProperties
 
 # =====================================================================
-# 1. КОНФИГУРАЦИЯ, ТОКЕНЫ И БЕЗОПАСНАЯ РАЗМЕТКА (ВЕРСИЯ 7.4 HARDENED)
+# 1. КОНФИГУРАЦИЯ, ТОКЕНЫ И БЕЗОПАСНАЯ РАЗМЕТКА (ВЕРСИЯ 7.5 HARDENED)
 # =====================================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -62,6 +63,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
+logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 logger = logging.getLogger("social_bot")
 
 try:
@@ -196,11 +198,22 @@ def strip_md_delimiters(text: Any) -> str:
 
 
 def truncate_plain(text: str, max_len: int) -> str:
-    """Безопасно обрезает сырой текст ДО применения Markdown-экранирования."""
+    """
+    Безопасно обрезает сырой текст ДО применения Markdown-экранирования
+    строго по границе целых слов (по пробелу перед лимитом), исключая обрывы на полуслове.
+    """
     s = str(text or "").strip()
     if len(s) <= max_len:
         return s
-    return s[: max(0, max_len - 3)].rstrip() + "..."
+    limit = max(0, max_len - 3)
+    if limit <= 0:
+        return "..."
+    chunk = s[:limit]
+    if len(s) > limit and not s[limit].isspace():
+        last_space = chunk.rfind(" ")
+        if last_space > 0:
+            chunk = chunk[:last_space]
+    return chunk.rstrip(" ,;:-—–.") + "..."
 
 
 def get_safe_display_name(user: Any) -> str:
@@ -344,7 +357,7 @@ class AntiFloodDDoSMiddleware(BaseMiddleware):
 
                 hits = self._user_hits.get(uid)
                 if hits is None:
-                    if len(self._user_hits) >= self._max_tracked:
+                    if len(self._user_hits) >= self.max_per_10s and len(self._user_hits) >= self._max_tracked:
                         oldest_k = next(iter(self._user_hits))
                         self._user_hits.pop(oldest_k, None)
                         self._cooldown_until.pop(oldest_k, None)
@@ -494,7 +507,7 @@ class LiveErrorLogger:
         now_str = datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S")
         tb_short = tb_str[-2600:] if len(tb_str) > 2600 else tb_str
         msg_text = (
-            f"🚨 <b>ОШИБКА В БОТЕ v7.4</b>{repeat_badge}\n"
+            f"🚨 <b>ОШИБКА В БОТЕ v7.5</b>{repeat_badge}\n"
             f"⏰ <b>Время:</b> <code>{now_str}</code>\n"
             f"👤 <b>Пользователь:</b> <code>{self._escape_html(user_info)}</code>\n"
             f"📍 <b>Контекст:</b> <code>{self._escape_html(context_info or 'Global')}</code>\n"
@@ -644,7 +657,6 @@ def _compute_similarity_preindexed(
             w_inter = len(q_tri & w_tri) if (q_tri and w_tri) else 0
             w_union = len(q_tri) + len(w_tri) - w_inter
             w_tri_score = w_inter / max(1, w_union)
-            # Даже если r == 1.0, максимум равен 0.65 + w_tri_score * 0.35
             if (0.65 + w_tri_score * 0.35) < eff_thresh:
                 continue
             sm_w = difflib.SequenceMatcher(None, q_norm, w)
@@ -888,7 +900,7 @@ class Database:
         self._cache_lock = threading.Lock()
         self._write_seq: int = 0
         self._user_entries_cache: Dict[int, Tuple[float, int, List[Tuple[str, Any]]]] = {}
-        self._user_settings_cache: Dict[int, Tuple[float, int, bool, bool]] = {}
+        self._user_settings_cache: Dict[int, Tuple[float, int, bool, bool, str]] = {}
         self._cache_ttl = 600.0  # 10 минут
         self._max_cache_size = 2000
         self._write_queue_lock = threading.Lock()
@@ -1001,10 +1013,12 @@ class Database:
                     token_version INTEGER NOT NULL DEFAULT 1,
                     reminders_enabled INTEGER NOT NULL DEFAULT 1,
                     policy_accepted INTEGER NOT NULL DEFAULT 0,
+                    exam_level VARCHAR(8) NOT NULL DEFAULT 'ege',
                     last_reminder_date TEXT,
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
                 ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS policy_accepted INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS exam_level VARCHAR(8) NOT NULL DEFAULT 'ege';
                 """)
             else:
                 cursor.executescript("""
@@ -1062,6 +1076,7 @@ class Database:
                     token_version INTEGER NOT NULL DEFAULT 1,
                     reminders_enabled INTEGER NOT NULL DEFAULT 1,
                     policy_accepted INTEGER NOT NULL DEFAULT 0,
+                    exam_level TEXT NOT NULL DEFAULT 'ege',
                     last_reminder_date TEXT,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
@@ -1078,6 +1093,7 @@ class Database:
                     "ALTER TABLE user_daily_archive ADD COLUMN full_name TEXT;",
                     "ALTER TABLE teachers ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1;",
                     "ALTER TABLE user_settings ADD COLUMN policy_accepted INTEGER NOT NULL DEFAULT 0;",
+                    "ALTER TABLE user_settings ADD COLUMN exam_level TEXT NOT NULL DEFAULT 'ege';",
                 ]:
                     try:
                         cursor.execute(alter_sql)
@@ -1404,8 +1420,6 @@ class Database:
                         else:
                             step_dw = round(a_total_dw / a_tries, 2)
                             err_ans_val = a_last_ans if a_last_ans > 0 else 2.0
-                            # Распределяем попытки так, чтобы суммарный сдвиг веса равнялся a_total_dw,
-                            # а последняя запись имела точный знак a_last_ans
                             for i in range(a_tries - 1):
                                 is_step_err = (i < a_err) if a_last_ans <= 0 else (i >= a_ok)
                                 step_ans = err_ans_val if is_step_err else -1.0
@@ -1716,38 +1730,47 @@ class Database:
             "problem_count": problem_count,
         }
 
-    # --- НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ, ТОКЕНЫ И НАПОМИНАНИЯ ---
+    # --- НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ, УРОВЕНЬ ЭКЗАМЕНА, ТОКЕНЫ И НАПОМИНАНИЯ ---
 
     def _ensure_user_settings_row(self, cursor, user_id: int):
         if self.is_postgres:
             cursor.execute(
-                "INSERT INTO user_settings (user_id, token_version, reminders_enabled, policy_accepted) VALUES (%s, 1, 1, 0) ON CONFLICT (user_id) DO NOTHING;",
+                "INSERT INTO user_settings (user_id, token_version, reminders_enabled, policy_accepted, exam_level) VALUES (%s, 1, 1, 0, 'ege') ON CONFLICT (user_id) DO NOTHING;",
                 (user_id,)
             )
         else:
             cursor.execute(
-                "INSERT OR IGNORE INTO user_settings (user_id, token_version, reminders_enabled, policy_accepted) VALUES (?, 1, 1, 0);",
+                "INSERT OR IGNORE INTO user_settings (user_id, token_version, reminders_enabled, policy_accepted, exam_level) VALUES (?, 1, 1, 0, 'ege');",
                 (user_id,)
             )
 
-    def _load_user_settings_cached(self, user_id: int) -> Tuple[int, bool, bool]:
+    def _load_user_settings_cached(self, user_id: int) -> Tuple[int, bool, bool, str]:
         now = time.time()
         with self._cache_lock:
             cached = self._user_settings_cache.get(user_id)
             if cached is not None and (now - cached[0] < self._cache_ttl):
-                return cached[1], cached[2], cached[3]
+                return cached[1], cached[2], cached[3], cached[4]
+            seq_before = self._write_seq
 
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
             if self.is_postgres:
-                cursor.execute("SELECT token_version, reminders_enabled, COALESCE(policy_accepted, 0) FROM user_settings WHERE user_id = %s;", (user_id,))
+                cursor.execute(
+                    "SELECT token_version, reminders_enabled, COALESCE(policy_accepted, 0), COALESCE(exam_level, 'ege') FROM user_settings WHERE user_id = %s;",
+                    (user_id,)
+                )
             else:
-                cursor.execute("SELECT token_version, reminders_enabled, COALESCE(policy_accepted, 0) FROM user_settings WHERE user_id = ?;", (user_id,))
+                cursor.execute(
+                    "SELECT token_version, reminders_enabled, COALESCE(policy_accepted, 0), COALESCE(exam_level, 'ege') FROM user_settings WHERE user_id = ?;",
+                    (user_id,)
+                )
             row = cursor.fetchone()
             t_ver = int(row[0]) if row and row[0] is not None else 1
             rem_on = bool(int(row[1])) if row and row[1] is not None else True
             pol_ok = bool(int(row[2])) if row and row[2] is not None else False
+            raw_lvl = str(row[3] if row and len(row) > 3 and row[3] is not None else "ege").strip().lower()
+            exam_lvl = "oge" if raw_lvl == "oge" else "ege"
 
             # Если пользователь уже активно решал карточки/тесты до обновления, автоматически засчитываем согласие
             if not pol_ok:
@@ -1755,7 +1778,17 @@ class Database:
                     cursor.execute("SELECT 1 FROM user_answers WHERE user_id = %s LIMIT 1;", (user_id,))
                 else:
                     cursor.execute("SELECT 1 FROM user_answers WHERE user_id = ? LIMIT 1;", (user_id,))
-                if cursor.fetchone():
+                has_ans = bool(cursor.fetchone())
+                if not has_ans:
+                    try:
+                        if self.is_postgres:
+                            cursor.execute("SELECT 1 FROM user_daily_archive WHERE user_id = %s LIMIT 1;", (user_id,))
+                        else:
+                            cursor.execute("SELECT 1 FROM user_daily_archive WHERE user_id = ? LIMIT 1;", (user_id,))
+                        has_ans = bool(cursor.fetchone())
+                    except Exception:
+                        pass
+                if has_ans:
                     pol_ok = True
                     self._ensure_user_settings_row(cursor, user_id)
                     if self.is_postgres:
@@ -1765,26 +1798,87 @@ class Database:
                     conn.commit()
 
             with self._cache_lock:
-                self._evict_oldest_locked(self._user_settings_cache)
-                self._user_settings_cache[user_id] = (now, t_ver, rem_on, pol_ok)
-            return t_ver, rem_on, pol_ok
+                if self._write_seq == seq_before:
+                    self._evict_oldest_locked(self._user_settings_cache)
+                    self._user_settings_cache[user_id] = (now, t_ver, rem_on, pol_ok, exam_lvl)
+            return t_ver, rem_on, pol_ok, exam_lvl
         except Exception:
-            return 1, True, False
+            return 1, True, False, "ege"
         finally:
             cursor.close()
             conn.close()
 
     def get_user_token_version(self, user_id: int) -> int:
-        t_ver, _, _ = self._load_user_settings_cached(user_id)
+        t_ver, _, _, _ = self._load_user_settings_cached(user_id)
         return t_ver
 
     def get_user_reminders_enabled(self, user_id: int) -> bool:
-        _, rem_on, _ = self._load_user_settings_cached(user_id)
+        _, rem_on, _, _ = self._load_user_settings_cached(user_id)
         return rem_on
 
     def is_user_policy_accepted(self, user_id: int) -> bool:
-        _, _, pol_ok = self._load_user_settings_cached(user_id)
+        _, _, pol_ok, _ = self._load_user_settings_cached(user_id)
         return pol_ok
+
+    def get_user_exam_level(self, user_id: int) -> str:
+        _, _, _, exam_lvl = self._load_user_settings_cached(user_id)
+        return "oge" if exam_lvl == "oge" else "ege"
+
+    def set_user_exam_level(self, user_id: int, level: str):
+        clean_level = "oge" if str(level or "").strip().lower() == "oge" else "ege"
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            self._ensure_user_settings_row(cursor, user_id)
+            if self.is_postgres:
+                cursor.execute(
+                    "UPDATE user_settings SET exam_level = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s;",
+                    (clean_level, user_id)
+                )
+            else:
+                cursor.execute(
+                    "UPDATE user_settings SET exam_level = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?;",
+                    (clean_level, user_id)
+                )
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+        with self._cache_lock:
+            self._write_seq += 1
+            self._user_settings_cache.pop(user_id, None)
+
+    def toggle_user_exam_level(self, user_id: int) -> str:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            self._ensure_user_settings_row(cursor, user_id)
+            if self.is_postgres:
+                cursor.execute(
+                    "UPDATE user_settings SET exam_level = CASE WHEN COALESCE(exam_level, 'ege') = 'oge' THEN 'ege' ELSE 'oge' END, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s RETURNING exam_level;",
+                    (user_id,)
+                )
+                row = cursor.fetchone()
+                new_level = str(row[0]).strip().lower() if row and row[0] else "ege"
+            else:
+                cursor.execute(
+                    "UPDATE user_settings SET exam_level = CASE WHEN COALESCE(exam_level, 'ege') = 'oge' THEN 'ege' ELSE 'oge' END, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?;",
+                    (user_id,)
+                )
+                cursor.execute("SELECT COALESCE(exam_level, 'ege') FROM user_settings WHERE user_id = ?;", (user_id,))
+                row = cursor.fetchone()
+                new_level = str(row[0]).strip().lower() if row and row[0] else "ege"
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+        clean_new = "oge" if new_level == "oge" else "ege"
+        with self._cache_lock:
+            self._write_seq += 1
+            self._user_settings_cache.pop(user_id, None)
+        return clean_new
 
     def accept_user_policy(self, user_id: int):
         conn = self.get_connection()
@@ -1796,20 +1890,29 @@ class Database:
                     "UPDATE user_settings SET policy_accepted = 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s;",
                     (user_id,)
                 )
-                cursor.execute("SELECT token_version, reminders_enabled FROM user_settings WHERE user_id = %s;", (user_id,))
+                cursor.execute(
+                    "SELECT token_version, reminders_enabled, COALESCE(exam_level, 'ege') FROM user_settings WHERE user_id = %s;",
+                    (user_id,)
+                )
             else:
                 cursor.execute(
                     "UPDATE user_settings SET policy_accepted = 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?;",
                     (user_id,)
                 )
-                cursor.execute("SELECT token_version, reminders_enabled FROM user_settings WHERE user_id = ?;", (user_id,))
+                cursor.execute(
+                    "SELECT token_version, reminders_enabled, COALESCE(exam_level, 'ege') FROM user_settings WHERE user_id = ?;",
+                    (user_id,)
+                )
             row = cursor.fetchone()
             conn.commit()
             t_ver = int(row[0]) if row and row[0] is not None else 1
             rem_on = bool(int(row[1])) if row and row[1] is not None else True
+            raw_lvl = str(row[2] if row and len(row) > 2 and row[2] is not None else "ege").strip().lower()
+            exam_lvl = "oge" if raw_lvl == "oge" else "ege"
             with self._cache_lock:
+                self._write_seq += 1
                 self._evict_oldest_locked(self._user_settings_cache)
-                self._user_settings_cache[user_id] = (time.time(), t_ver, rem_on, True)
+                self._user_settings_cache[user_id] = (time.time(), t_ver, rem_on, True, exam_lvl)
         finally:
             cursor.close()
             conn.close()
@@ -1821,27 +1924,30 @@ class Database:
             self._ensure_user_settings_row(cursor, user_id)
             if self.is_postgres:
                 cursor.execute(
-                    "UPDATE user_settings SET token_version = token_version + 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s RETURNING token_version, reminders_enabled, COALESCE(policy_accepted, 0);",
+                    "UPDATE user_settings SET token_version = token_version + 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s RETURNING token_version, reminders_enabled, COALESCE(policy_accepted, 0), COALESCE(exam_level, 'ege');",
                     (user_id,)
                 )
                 row = cursor.fetchone()
-                new_ver = int(row[0]) if row else 2
-                rem_on = bool(int(row[1])) if row and row[1] is not None else True
-                pol_ok = bool(int(row[2])) if row and row[2] is not None else True
             else:
                 cursor.execute(
                     "UPDATE user_settings SET token_version = token_version + 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?;",
                     (user_id,)
                 )
-                cursor.execute("SELECT token_version, reminders_enabled, COALESCE(policy_accepted, 0) FROM user_settings WHERE user_id = ?;", (user_id,))
+                cursor.execute(
+                    "SELECT token_version, reminders_enabled, COALESCE(policy_accepted, 0), COALESCE(exam_level, 'ege') FROM user_settings WHERE user_id = ?;",
+                    (user_id,)
+                )
                 row = cursor.fetchone()
-                new_ver = int(row[0]) if row else 2
-                rem_on = bool(int(row[1])) if row and row[1] is not None else True
-                pol_ok = bool(int(row[2])) if row and row[2] is not None else True
+            new_ver = int(row[0]) if row else 2
+            rem_on = bool(int(row[1])) if row and row[1] is not None else True
+            pol_ok = bool(int(row[2])) if row and row[2] is not None else True
+            raw_lvl = str(row[3] if row and len(row) > 3 and row[3] is not None else "ege").strip().lower()
+            exam_lvl = "oge" if raw_lvl == "oge" else "ege"
             conn.commit()
             with self._cache_lock:
+                self._write_seq += 1
                 self._evict_oldest_locked(self._user_settings_cache)
-                self._user_settings_cache[user_id] = (time.time(), new_ver, rem_on, pol_ok)
+                self._user_settings_cache[user_id] = (time.time(), new_ver, rem_on, pol_ok, exam_lvl)
             return new_ver
         finally:
             cursor.close()
@@ -1857,21 +1963,30 @@ class Database:
                     "UPDATE user_settings SET reminders_enabled = CASE WHEN reminders_enabled = 1 THEN 0 ELSE 1 END, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s;",
                     (user_id,)
                 )
-                cursor.execute("SELECT token_version, reminders_enabled, COALESCE(policy_accepted, 0) FROM user_settings WHERE user_id = %s;", (user_id,))
+                cursor.execute(
+                    "SELECT token_version, reminders_enabled, COALESCE(policy_accepted, 0), COALESCE(exam_level, 'ege') FROM user_settings WHERE user_id = %s;",
+                    (user_id,)
+                )
             else:
                 cursor.execute(
                     "UPDATE user_settings SET reminders_enabled = CASE WHEN reminders_enabled = 1 THEN 0 ELSE 1 END, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?;",
                     (user_id,)
                 )
-                cursor.execute("SELECT token_version, reminders_enabled, COALESCE(policy_accepted, 0) FROM user_settings WHERE user_id = ?;", (user_id,))
+                cursor.execute(
+                    "SELECT token_version, reminders_enabled, COALESCE(policy_accepted, 0), COALESCE(exam_level, 'ege') FROM user_settings WHERE user_id = ?;",
+                    (user_id,)
+                )
             row = cursor.fetchone()
             conn.commit()
             t_ver = int(row[0]) if row and row[0] is not None else 1
             rem_on = bool(int(row[1])) if row and row[1] is not None else True
             pol_ok = bool(int(row[2])) if row and row[2] is not None else True
+            raw_lvl = str(row[3] if row and len(row) > 3 and row[3] is not None else "ege").strip().lower()
+            exam_lvl = "oge" if raw_lvl == "oge" else "ege"
             with self._cache_lock:
+                self._write_seq += 1
                 self._evict_oldest_locked(self._user_settings_cache)
-                self._user_settings_cache[user_id] = (time.time(), t_ver, rem_on, pol_ok)
+                self._user_settings_cache[user_id] = (time.time(), t_ver, rem_on, pol_ok, exam_lvl)
             return rem_on
         finally:
             cursor.close()
@@ -2416,7 +2531,6 @@ class TestGenerator:
         real_traits = [str(t).strip() for t in (correct_term.get("traits") or []) if str(t).strip()]
         real_traits_lower = {t.lower() for t in real_traits}
 
-        # Выбираем случайную подвыборку дистракторов для быстрого поиска чужих признаков
         sampled_distractors = random.sample(distractors, min(len(distractors), 15)) if distractors else []
         foreign_candidates: List[Tuple[Dict[str, Any], str]] = []
         for d in sampled_distractors:
@@ -2502,7 +2616,6 @@ class TestGenerator:
                 f"Все перечисленные ниже признаки, за исключением одного, относятся к понятию *{term_escaped}*.\n\n"
                 f"Найдите выпадающий (чужой) признак:"
             )
-            # Гарантируем уникальность 3 реальных признаков
             unique_real_traits = []
             seen_rt = set()
             for rt in random.sample(real_traits, len(real_traits)):
@@ -2569,6 +2682,7 @@ class TestGenerator:
 class UserFlow(StatesGroup):
     selecting_mode = State()
     selecting_topic = State()
+    selecting_exam_level = State()
     in_flashcards = State()
     in_tests = State()
     in_errors_menu = State()
@@ -2587,6 +2701,9 @@ BTN_MAIN_TESTS = "🎯 Тесты"
 BTN_MAIN_ERRORS = "🛠 Работа над ошибками"
 BTN_MAIN_SEARCH = "🔎 Поиск термина"
 BTN_MAIN_STATS = "📊 Моя статистика"
+
+BTN_EXAM_OGE = "🎓 ОГЭ"
+BTN_EXAM_EGE = "🏛 ЕГЭ"
 
 BTN_BACK_MAIN = "🏠 В главное меню"
 BTN_BACK_STATS = "⬅️ К статистике"
@@ -2641,6 +2758,17 @@ class Keyboards:
             resize_keyboard=True,
             is_persistent=True,
             input_field_placeholder="Выберите режим или введите термин..."
+        )
+
+    @staticmethod
+    def exam_level_selection() -> ReplyKeyboardMarkup:
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=BTN_EXAM_OGE), KeyboardButton(text=BTN_EXAM_EGE)],
+            ],
+            resize_keyboard=True,
+            is_persistent=True,
+            input_field_placeholder="Выберите экзамен (ОГЭ или ЕГЭ)..."
         )
 
     @staticmethod
@@ -2854,23 +2982,51 @@ class Keyboards:
 
 
 # =====================================================================
-# 10. ФОРМАТИРОВАНИЕ КАРТОЧЕК И ТЕОРЕТИЧЕСКОГО ДОСЬЕ
+# 10. ФОРМАТИРОВАНИЕ КАРТОЧЕК И ТЕОРЕТИЧЕСКОГО ДОСЬЕ (ОГЭ / ЕГЭ)
 # =====================================================================
 
-def format_card_back(card: Dict[str, Any], show_detail: bool = False) -> str:
-    traits = card.get("traits") or []
+def format_card_back(card: Dict[str, Any], show_detail: bool = False, exam_level: str = "ege") -> str:
+    is_oge = (str(exam_level or "ege").strip().lower() == "oge")
+    traits = [str(t).strip() for t in (card.get("traits") or []) if str(t).strip()]
+
+    mod_title = strip_md_delimiters(truncate_plain(card.get("module_title") or "Обществознание", 120))
+    term_title = strip_md_delimiters(truncate_plain(str(card.get("term") or "").upper(), 150))
+
+    if is_oge:
+        genus_text = strip_md_delimiters(truncate_plain(card.get("genus") or "Родовое понятие не указано", 240))
+        traits_formatted = (
+            "\n".join([f"• {escape_md(truncate_plain(t, 220))}" for t in traits[:2]])
+            if traits
+            else "• Признаки уточняются"
+        )
+        base_text = (
+            f"🏷 *{mod_title} (ОГЭ)*\n\n"
+            f"🎓 *{term_title}*\n\n"
+            f"🏛 *Родовое понятие:*\n_{genus_text}_\n\n"
+            f"📌 *Ключевые признаки:*\n{traits_formatted}"
+        )
+        if not show_detail:
+            return base_text
+
+        ege = card.get("ege_context_and_examples") or {}
+        rf_raw = str(ege.get("illustration_rf") or "").strip()
+        if not rf_raw:
+            rf_raw = str(card.get("concept_explanation") or "").strip()
+        if rf_raw:
+            rf_safe = strip_md_delimiters(truncate_plain(rf_raw, 650))
+            return f"{base_text}\n\n🇷🇺 *Пример из реалий РФ:*\n_{rf_safe}_"
+        return base_text
+
+    # Форматирование для ЕГЭ (полное академическое досье)
+    genus_text = strip_md_delimiters(truncate_plain(card.get("genus") or "Родовое понятие не указано", 400))
     traits_formatted = (
-        "\n".join([f"• {escape_md(truncate_plain(t, 300))}" for t in traits[:10] if str(t).strip()])
+        "\n".join([f"• {escape_md(truncate_plain(t, 300))}" for t in traits[:10]])
         if traits
         else "• Признаки уточняются"
     )
 
     if len(traits) > 10:
         traits_formatted += f"\n_...и ещё {len(traits) - 10} признаков_"
-
-    mod_title = strip_md_delimiters(truncate_plain(card.get("module_title") or "Обществознание", 120))
-    term_title = strip_md_delimiters(truncate_plain(str(card.get("term") or "").upper(), 150))
-    genus_text = strip_md_delimiters(truncate_plain(card.get("genus") or "Родовое понятие не указано", 400))
 
     base_text = (
         f"🏷 *{mod_title}*\n\n"
@@ -3040,12 +3196,83 @@ async def handle_accept_policy_reply(message: Message, state: FSMContext):
         await state.clear()
         if prev_bot_id:
             await state.update_data(last_bot_msg_id=prev_bot_id)
+        if pending_t_code:
+            await state.update_data(pending_teacher_code=pending_t_code)
+
+        await state.set_state(UserFlow.selecting_exam_level)
+        await render_single_screen(
+            message,
+            state,
+            "К какому экзамену ты готовишься?",
+            reply_markup=Keyboards.exam_level_selection(),
+        )
+
+
+@router.message(StateFilter(UserFlow.selecting_exam_level), F.text.in_({BTN_EXAM_OGE, BTN_EXAM_EGE}))
+async def handle_select_exam_level_reply(message: Message, state: FSMContext):
+    if not message.from_user or not message.text:
+        return
+    uid = message.from_user.id
+    async with user_lock_manager.get_lock(uid):
+        chosen_level = "oge" if message.text.strip() == BTN_EXAM_OGE else "ege"
+        await asyncio.to_thread(db.set_user_exam_level, uid, chosen_level)
+
+        data = await state.get_data()
+        pending_t_code = data.get("pending_teacher_code")
+        prev_bot_id = data.get("last_bot_msg_id")
+        await state.clear()
+        if prev_bot_id:
+            await state.update_data(last_bot_msg_id=prev_bot_id)
 
         connect_notice = ""
         if pending_t_code:
             connect_notice = await _process_teacher_deeplink(uid, str(pending_t_code))
 
-        text = f"{connect_notice}🏠 *Главное меню*\n\nВыберите формат тренировки:"
+        level_badge = (
+            "🎓 *Выбран режим подготовки: ОГЭ*\n_Карточки адаптированы: базовое определение, 2 главных признака и пример из РФ._\n\n"
+            if chosen_level == "oge"
+            else "🏛 *Выбран режим подготовки: ЕГЭ*\n_Включены полные академические формулировки, классификации и разбор ловушек._\n\n"
+        )
+        text = f"{connect_notice}{level_badge}🏠 *Главное меню*\n\nВыберите формат тренировки:"
+        await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
+
+
+@router.message(Command("change"))
+async def handle_change_exam_command(message: Message, state: FSMContext):
+    if not message.from_user:
+        return
+    uid = message.from_user.id
+    async with user_lock_manager.get_lock(uid):
+        policy_ok = await asyncio.to_thread(db.is_user_policy_accepted, uid)
+        if not policy_ok:
+            await state.set_state(UserFlow.awaiting_policy_accept)
+            await render_single_screen(
+                message,
+                state,
+                _build_policy_consent_text(),
+                reply_markup=Keyboards.policy_consent_reply(),
+            )
+            return
+
+        new_level = await asyncio.to_thread(db.toggle_user_exam_level, uid)
+        prev_data = await state.get_data()
+        prev_bot_id = prev_data.get("last_bot_msg_id")
+        await state.clear()
+        if prev_bot_id:
+            await state.update_data(last_bot_msg_id=prev_bot_id)
+
+        if new_level == "oge":
+            text = (
+                "🎓 *Режим переключен: ОГЭ*\n\n"
+                "_Карточки стали более краткими: базовое определение и ключевые признаки._\n\n"
+                "Для возврата введи /change"
+            )
+        else:
+            text = (
+                "🏛 *Режим переключен: ЕГЭ*\n\n"
+                "_Включены полные академические формулировки, классификации и примеры._\n\n"
+                "Для возврата введи /change"
+            )
         await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
 
 
@@ -3053,6 +3280,17 @@ async def handle_accept_policy_reply(message: Message, state: FSMContext):
 async def handle_reply_back_to_main(message: Message, state: FSMContext):
     uid = message.from_user.id if message.from_user else message.chat.id
     async with user_lock_manager.get_lock(uid):
+        policy_ok = await asyncio.to_thread(db.is_user_policy_accepted, uid)
+        if not policy_ok:
+            await state.set_state(UserFlow.awaiting_policy_accept)
+            await render_single_screen(
+                message,
+                state,
+                _build_policy_consent_text(),
+                reply_markup=Keyboards.policy_consent_reply(),
+            )
+            return
+
         prev_data = await state.get_data()
         prev_bot_id = prev_data.get("last_bot_msg_id")
         await state.clear()
@@ -3100,13 +3338,24 @@ def _build_teacher_cabinet_view(
     return text, keyboard
 
 
-@router.message(Command("teacher"))
+@router.message(Command("teacher", "teachers"))
 @router.message(F.text == BTN_BACK_TEACHER)
 async def handle_teacher_profile(message: Message, state: FSMContext):
     if not message.from_user:
         return
     user_id = message.from_user.id
     async with user_lock_manager.get_lock(user_id):
+        policy_ok = await asyncio.to_thread(db.is_user_policy_accepted, user_id)
+        if not policy_ok:
+            await state.set_state(UserFlow.awaiting_policy_accept)
+            await render_single_screen(
+                message,
+                state,
+                _build_policy_consent_text(),
+                reply_markup=Keyboards.policy_consent_reply(),
+            )
+            return
+
         existing = await asyncio.to_thread(db.get_teacher_by_user_id, user_id)
 
         bot_username = getattr(message.bot, "_cached_username", None)
@@ -3247,7 +3496,6 @@ async def _show_student_teachers_screen(message: Message, state: FSMContext, use
     )
 
 
-@router.message(Command("teachers"))
 @router.message(F.text == BTN_STATS_MY_TEACHERS)
 async def handle_teachers_list(message: Message, state: FSMContext):
     if not message.from_user:
@@ -3328,10 +3576,13 @@ def _build_stats_view_sync(user_id: int, prefix_notice: str = "") -> Tuple[str, 
     stats = db.get_user_stats(user_id)
     token_ver = db.get_user_token_version(user_id)
     reminders_on = db.get_user_reminders_enabled(user_id)
+    exam_level = db.get_user_exam_level(user_id)
+    exam_label = "ОГЭ" if exam_level == "oge" else "ЕГЭ"
     student_web_url = build_student_webapp_url(user_id, token_ver)
 
     text = (
         f"{prefix_notice}"
+        f"🎯 *Экзамен: {exam_label}*\n"
         "📊 *Ваша статистика изучения*\n\n"
         "🔥 *Регулярность и серия занятий:*\n"
         f"• Текущая серия: *{stats['current_streak']} дн. подряд* (рекорд: *{stats['best_streak']} дн.*)\n"
@@ -3425,14 +3676,17 @@ async def handle_search_detail_button(message: Message, state: FSMContext):
         card = catalog.get_by_code(code)
         if not card:
             return
+        exam_level = await asyncio.to_thread(db.get_user_exam_level, uid)
         other_codes = data.get("search_other_codes") or []
         other_terms = [catalog.get_by_code(c) for c in other_codes if catalog.get_by_code(c)]
-        text = format_card_back(card, show_detail=True)
+        text = format_card_back(card, show_detail=True, exam_level=exam_level)
         kb = Keyboards.search_results_keyboard(other_terms, show_detail_btn=False)
         await render_single_screen(message, state, text, reply_markup=kb)
 
 
 async def _process_search_query_unlocked(message: Message, state: FSMContext):
+    uid = message.from_user.id if message.from_user else message.chat.id
+    exam_level = await asyncio.to_thread(db.get_user_exam_level, uid)
     raw_text = (message.text or "").strip()
 
     # Мгновенный O(1) переход при клике на кнопку быстрого выбора термина "📖 ..."
@@ -3455,7 +3709,7 @@ async def _process_search_query_unlocked(message: Message, state: FSMContext):
                 search_last_code=exact_term["code"],
                 search_other_codes=remaining_codes[:4]
             )
-            card_text = format_card_back(exact_term, show_detail=False)
+            card_text = format_card_back(exact_term, show_detail=False, exam_level=exam_level)
             if remaining_terms:
                 similar_names = ", ".join([f"_{strip_md_delimiters(t['term'])}_" for t in remaining_terms[:4]])
                 card_text += f"\n\n🔎 *Похожие понятия:* {similar_names}"
@@ -3500,7 +3754,7 @@ async def _process_search_query_unlocked(message: Message, state: FSMContext):
     if _normalize_search_str(raw_q) not in _normalize_search_str(top_term["term"]):
         typo_note = f"✨ _Найдено с учётом опечатки ({int(top_score * 100)}% совпадение):_\n\n"
 
-    card_text = typo_note + format_card_back(top_term, show_detail=False)
+    card_text = typo_note + format_card_back(top_term, show_detail=False, exam_level=exam_level)
     if other_terms:
         similar_names = ", ".join([f"_{strip_md_delimiters(t['term'])}_" for t in other_terms[:4]])
         card_text += f"\n\n🔎 *Похожие понятия:* {similar_names}"
@@ -3548,7 +3802,6 @@ def _build_errors_workout_screen_sync(user_id: int) -> Tuple[str, ReplyKeyboardM
     return text, Keyboards.error_workout_menu(count)
 
 
-@router.message(Command("work_errors"))
 @router.message(F.text == BTN_MAIN_ERRORS)
 async def handle_work_errors_command(message: Message, state: FSMContext):
     if not message.from_user:
@@ -3677,10 +3930,13 @@ async def send_next_flashcard_msg(message: Message, user_id: int, state: FSMCont
         await render_single_screen(message, state, "❌ В выбранном модуле пока нет терминов.", reply_markup=Keyboards.main_menu())
         return
 
+    exam_level = await asyncio.to_thread(db.get_user_exam_level, user_id)
     shown_at = time.time()
     await state.update_data(current_card_code=card["code"], shown_at=shown_at, revealed_elapsed=None)
 
     mod_title = strip_md_delimiters(card.get("module_title") or "Обществознание")
+    if exam_level == "oge":
+        mod_title = f"{mod_title} (ОГЭ)"
     term_title = strip_md_delimiters(str(card.get("term") or "").upper())
     workout_badge = "🛠 *Работа над ошибками*\n" if is_error_workout else ""
 
@@ -3712,7 +3968,8 @@ async def handle_card_reveal_reply(message: Message, state: FSMContext):
             revealed_elapsed = round(max(0.0, time.time() - shown_at), 1)
             await state.update_data(revealed_elapsed=revealed_elapsed)
 
-        text = format_card_back(card, show_detail=False)
+        exam_level = await asyncio.to_thread(db.get_user_exam_level, uid)
+        text = format_card_back(card, show_detail=False, exam_level=exam_level)
         await render_single_screen(message, state, text, reply_markup=Keyboards.flashcard_back(code, has_detail=False))
 
 
@@ -3728,7 +3985,8 @@ async def handle_card_detail_reply(message: Message, state: FSMContext):
         if not card:
             return
 
-        text = format_card_back(card, show_detail=True)
+        exam_level = await asyncio.to_thread(db.get_user_exam_level, uid)
+        text = format_card_back(card, show_detail=True, exam_level=exam_level)
         await render_single_screen(message, state, text, reply_markup=Keyboards.flashcard_back(code, has_detail=True))
 
 
@@ -3848,8 +4106,6 @@ async def handle_test_answer_reply(message: Message, state: FSMContext):
         shown_at = data.get("test_shown_at", time.time())
         elapsed = round(max(0.0, time.time() - shown_at), 1)
 
-        # Если ответ уже дан (пользователь на экране разбора ответа и случайно нажал 1-4 дважды),
-        # просто тихо удаляем лишнее сообщение, НЕ перескакивая через экран объяснения!
         if not test_data or option_idx < 0 or option_idx >= len(test_data.get("options", [])):
             await _safe_delete_message(message.bot, message.chat.id, message.message_id)
             return
@@ -4030,18 +4286,30 @@ async def handle_confirm_delete_data(message: Message, state: FSMContext):
         await asyncio.to_thread(db.delete_user_data, uid)
         session_tracker.clear_user(uid)
         await state.clear()
+        await state.set_state(UserFlow.awaiting_policy_accept)
         text = (
             "✅ *Все ваши данные успешно удалены из базы.*\n\n"
-            "История ответов, статистика и настройки полностью стёрты. "
-            "Если захотите начать заново — просто выберите режим в меню."
+            "История ответов, статистика и настройки полностью стёрты.\n\n"
+            + _build_policy_consent_text()
         )
-        await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
+        await render_single_screen(message, state, text, reply_markup=Keyboards.policy_consent_reply())
 
 
 @router.message(StateFilter(UserFlow.in_delete_me_confirm), F.text == BTN_CANCEL_DELETE_DATA)
 async def handle_cancel_delete_data(message: Message, state: FSMContext):
     uid = message.from_user.id if message.from_user else message.chat.id
     async with user_lock_manager.get_lock(uid):
+        policy_ok = await asyncio.to_thread(db.is_user_policy_accepted, uid)
+        if not policy_ok:
+            await state.set_state(UserFlow.awaiting_policy_accept)
+            await render_single_screen(
+                message,
+                state,
+                _build_policy_consent_text(),
+                reply_markup=Keyboards.policy_consent_reply(),
+            )
+            return
+
         await state.clear()
         text = "🏠 *Главное меню*\n\nУдаление отменено. Выберите формат тренировки:"
         await render_single_screen(message, state, text, reply_markup=Keyboards.main_menu())
@@ -4054,6 +4322,8 @@ SYSTEM_UI_BUTTONS_SET = {
     BTN_MAIN_ERRORS,
     BTN_MAIN_SEARCH,
     BTN_MAIN_STATS,
+    BTN_EXAM_OGE,
+    BTN_EXAM_EGE,
     BTN_BACK_MAIN,
     BTN_BACK_STATS,
     BTN_BACK_TEACHER,
@@ -4091,12 +4361,51 @@ async def handle_universal_text_fallback(message: Message, state: FSMContext):
     async with user_lock_manager.get_lock(uid):
         txt = (message.text or "").strip()
         cur_state = await state.get_state()
+
         if cur_state == UserFlow.awaiting_policy_accept.state:
             await render_single_screen(
                 message,
                 state,
                 _build_policy_consent_text(),
                 reply_markup=Keyboards.policy_consent_reply(),
+            )
+            return
+
+        if cur_state == UserFlow.selecting_exam_level.state:
+            await render_single_screen(
+                message,
+                state,
+                "К какому экзамену ты готовишься?",
+                reply_markup=Keyboards.exam_level_selection(),
+            )
+            return
+
+        policy_ok = await asyncio.to_thread(db.is_user_policy_accepted, uid)
+        if not policy_ok:
+            await state.set_state(UserFlow.awaiting_policy_accept)
+            await render_single_screen(
+                message,
+                state,
+                _build_policy_consent_text(),
+                reply_markup=Keyboards.policy_consent_reply(),
+            )
+            return
+
+        # Если после рестарта сервера пользователь нажал кнопку выбора экзамена (🎓 ОГЭ или 🏛 ЕГЭ)
+        if txt in {BTN_EXAM_OGE, BTN_EXAM_EGE} and message.from_user:
+            chosen_level = "oge" if txt == BTN_EXAM_OGE else "ege"
+            await asyncio.to_thread(db.set_user_exam_level, uid, chosen_level)
+            await state.clear()
+            level_badge = (
+                "🎓 *Выбран режим подготовки: ОГЭ*\n_Карточки адаптированы: базовое определение, 2 главных признака и пример из РФ._\n\n"
+                if chosen_level == "oge"
+                else "🏛 *Выбран режим подготовки: ЕГЭ*\n_Включены полные академические формулировки, классификации и разбор ловушек._\n\n"
+            )
+            await render_single_screen(
+                message,
+                state,
+                f"{level_badge}🏠 *Главное меню*\n\nВыберите формат тренировки:",
+                reply_markup=Keyboards.main_menu(),
             )
             return
 
@@ -4132,6 +4441,21 @@ async def handle_universal_text_fallback(message: Message, state: FSMContext):
 # 12. ФОНОВЫЕ ЗАДАЧИ С АРХИВАЦИЕЙ, РЕЖИМОМ СНА NEON И RENDER PORT
 # =====================================================================
 
+async def setup_bot_commands(bot_instance: Bot):
+    """Регистрирует системные команды бота в меню Telegram (без дублирования кнопок главной клавиатуры)."""
+    commands = [
+        BotCommand(command="start", description="🏠 Перезапуск / Главное меню"),
+        BotCommand(command="change", description="🎓 Сменить экзамен (ОГЭ / ЕГЭ)"),
+        BotCommand(command="teachers", description="👨‍🏫 Кабинет преподавателя"),
+        BotCommand(command="privacy", description="🛡 Политика конфиденциальности"),
+        BotCommand(command="delete_me", description="🗑 Удалить мои данные"),
+    ]
+    try:
+        await bot_instance.set_my_commands(commands)
+    except Exception as e:
+        logger.warning(f"Не удалось зарегистрировать системные команды Telegram: {e}")
+
+
 async def process_daily_reminders(bot_instance: Bot, reference_date: Optional[date] = None) -> int:
     today_dt = reference_date or get_local_today()
     today_iso = today_dt.isoformat()
@@ -4162,7 +4486,6 @@ async def process_daily_reminders(bot_instance: Bot, reference_date: Optional[da
             await asyncio.to_thread(db.mark_reminder_sent, uid, today_iso)
             sent_count += 1
         except TelegramForbiddenError:
-            # Пользователь заблокировал бота — помечаем, чтобы не пытаться снова сегодня
             await asyncio.to_thread(db.mark_reminder_sent, uid, today_iso)
         except Exception as e:
             logger.warning(f"Не удалось отправить напоминание пользователю {uid}: {e}")
@@ -4253,13 +4576,15 @@ async def main():
         logger.warning(f"Не удалось запустить фоновый веб-сервер на порту {port}: {e}")
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+    await setup_bot_commands(bot)
+
     dp = Dispatcher(storage=MemoryStorage())
     dp.message.outer_middleware(AntiFloodDDoSMiddleware())
     dp.include_router(router)
 
     bg_task = asyncio.create_task(periodic_background_task(bot))
 
-    logger.info("Бот версии 7.4 (Lossless Archive + Concurrency Guard) успешно запущен.")
+    logger.info("Бот версии 7.5 (ОГЭ/ЕГЭ + Lossless Archive + Concurrency Guard) успешно запущен.")
     try:
         await dp.start_polling(bot)
     except Exception as fatal_err:
