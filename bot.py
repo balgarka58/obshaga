@@ -254,7 +254,10 @@ class AntiFloodDDoSMiddleware(BaseMiddleware):
 
                 hits = self._user_hits.get(uid)
                 if hits is None:
-                    if len(self._user_hits) >= self._max_tracked:
+                    if (
+                        len(self._user_hits) >= self.max_per_10s
+                        and len(self._user_hits) >= self._max_tracked
+                    ):
                         oldest_k = next(iter(self._user_hits))
                         self._user_hits.pop(oldest_k, None)
                         self._cooldown_until.pop(oldest_k, None)
