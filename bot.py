@@ -87,7 +87,7 @@ from core.learning import (
     TestGenerator,
     format_card_back,
 )
-from core.autopost import generate_autopost_draft, render_post_card_png, FORMAT_TYPES
+from core.autopost import generate_autopost_draft, download_image_bytes, FORMAT_TYPES
 from core.keyboards import (
     UserFlow,
     Keyboards,
@@ -2330,18 +2330,7 @@ def _autopost_trigger_kb() -> InlineKeyboardMarkup:
 async def _send_autopost_preview_to_admin(bot_instance: Bot, draft: Dict[str, Any]) -> None:
     if not ADMIN_ID:
         return
-    term_obj = catalog.get_by_code(draft["term_code"]) or {
-        "code": draft["term_code"],
-        "term": draft.get("term_name", ""),
-        "module_title": draft.get("module_title", ""),
-    }
-    png_bytes = await asyncio.to_thread(
-        render_post_card_png,
-        draft["format_type"],
-        term_obj,
-        draft.get("card_data") or {},
-    )
-    photo = BufferedInputFile(png_bytes, filename=f"card_{draft['draft_id']}.png")
+    photo_bytes = await download_image_bytes(draft.get("image_url", ""))
     caption = draft["post_html"]
     if draft["format_type"] == "blitz_poll":
         cd = draft.get("card_data") or {}
@@ -2353,16 +2342,26 @@ async def _send_autopost_preview_to_admin(bot_instance: Bot, draft: Dict[str, An
         caption += f"\n\n<i>Источник повода: {draft['news_source']}</i>"
     elif draft.get("rss_fallback_note"):
         caption += f"\n\n<i>⚠️ {draft['rss_fallback_note']}</i>"
-    if len(caption) > 1000:
-        caption = caption[:997] + "..."
 
-    await bot_instance.send_photo(
-        chat_id=ADMIN_ID,
-        photo=photo,
-        caption=caption,
-        parse_mode="HTML",
-        reply_markup=_autopost_moderation_kb(draft["draft_id"]),
-    )
+    if photo_bytes:
+        if len(caption) > 1000:
+            caption = caption[:997] + "..."
+        photo = BufferedInputFile(photo_bytes, filename=f"photo_{draft['draft_id']}.jpg")
+        await bot_instance.send_photo(
+            chat_id=ADMIN_ID,
+            photo=photo,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=_autopost_moderation_kb(draft["draft_id"]),
+        )
+    else:
+        await bot_instance.send_message(
+            chat_id=ADMIN_ID,
+            text=caption + "\n\n<i>(Фото на Wikimedia не нашлось — пост пойдёт текстом)</i>",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=_autopost_moderation_kb(draft["draft_id"]),
+        )
 
 
 @router.message(Command("autopost"))
@@ -2420,18 +2419,7 @@ async def handle_autopost_approve(callback: CallbackQuery):
 
     await callback.answer("Публикую в канал...")
     try:
-        term_obj = catalog.get_by_code(draft["term_code"]) or {
-            "code": draft["term_code"],
-            "term": draft.get("term_name", ""),
-            "module_title": draft.get("module_title", ""),
-        }
-        png_bytes = await asyncio.to_thread(
-            render_post_card_png,
-            draft["format_type"],
-            term_obj,
-            draft.get("card_data") or {},
-        )
-        photo = BufferedInputFile(png_bytes, filename=f"post_{draft_id}.png")
+        photo_bytes = await download_image_bytes(draft.get("image_url", ""))
         me = await callback.bot.get_me()
         safe_code = str(draft["term_code"]).replace(".", "_")
         deeplink = f"https://t.me/{me.username}?start=term_{safe_code}"
@@ -2441,16 +2429,26 @@ async def handle_autopost_approve(callback: CallbackQuery):
             ]
         )
         caption = draft["post_html"]
-        if len(caption) > 1000:
-            caption = caption[:997] + "..."
 
-        await callback.bot.send_photo(
-            chat_id=CHANNEL_ID,
-            photo=photo,
-            caption=caption,
-            parse_mode="HTML",
-            reply_markup=post_kb,
-        )
+        if photo_bytes:
+            if len(caption) > 1000:
+                caption = caption[:997] + "..."
+            photo = BufferedInputFile(photo_bytes, filename=f"post_{draft_id}.jpg")
+            await callback.bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=photo,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=post_kb,
+            )
+        else:
+            await callback.bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=caption,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=post_kb,
+            )
 
         if draft["format_type"] == "blitz_poll":
             cd = draft.get("card_data") or {}
