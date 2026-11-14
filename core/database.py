@@ -4,6 +4,7 @@
 """
 import gc
 import time
+import json
 import random
 import sqlite3
 import asyncio
@@ -184,6 +185,21 @@ class Database:
                 );
                 ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS policy_accepted INTEGER NOT NULL DEFAULT 0;
                 ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS exam_level VARCHAR(8) NOT NULL DEFAULT 'ege';
+
+                CREATE TABLE IF NOT EXISTS autopost_history (
+                    id SERIAL PRIMARY KEY,
+                    term_code VARCHAR(32) NOT NULL,
+                    news_url TEXT,
+                    format_type VARCHAR(32) NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_autopost_history_created ON autopost_history(created_at);
+
+                CREATE TABLE IF NOT EXISTS autopost_drafts (
+                    draft_id VARCHAR(32) PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
                 """
                 )
             else:
@@ -246,6 +262,21 @@ class Database:
                     exam_level TEXT NOT NULL DEFAULT 'ege',
                     last_reminder_date TEXT,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS autopost_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    term_code TEXT NOT NULL,
+                    news_url TEXT,
+                    format_type TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_autopost_history_created ON autopost_history(created_at);
+
+                CREATE TABLE IF NOT EXISTS autopost_drafts (
+                    draft_id TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 """
                 )
@@ -2149,6 +2180,108 @@ class Database:
             conn.close()
         self.invalidate_user_cache(user_id)
 
+
+
+    def get_recent_autopost_history(
+        self, limit_terms: int = 30, limit_urls: int = 100
+    ) -> Tuple[Set[str], Set[str]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        recent_terms: Set[str] = set()
+        recent_urls: Set[str] = set()
+        try:
+            cursor.execute(
+                ("SELECT term_code, news_url FROM autopost_history ORDER BY id DESC LIMIT %s" if self.is_postgres else "SELECT term_code, news_url FROM autopost_history ORDER BY id DESC LIMIT ?"),
+                (max(limit_terms, limit_urls),),
+            )
+            rows = cursor.fetchall()
+            for idx, row in enumerate(rows):
+                t_code = (row[0] or "").strip()
+                n_url = (row[1] or "").strip()
+                if t_code and idx < limit_terms:
+                    recent_terms.add(t_code)
+                if n_url and idx < limit_urls:
+                    recent_urls.add(n_url)
+            return recent_terms, recent_urls
+        finally:
+            cursor.close()
+            conn.close()
+
+    def record_autopost_published(
+        self, term_code: str, news_url: str, format_type: str
+    ) -> None:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                ("INSERT INTO autopost_history (term_code, news_url, format_type) VALUES (%s, %s, %s)" if self.is_postgres else "INSERT INTO autopost_history (term_code, news_url, format_type) VALUES (?, ?, ?)"),
+                (term_code.strip(), (news_url or "").strip(), format_type.strip()),
+            )
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+    def save_autopost_draft(self, draft_id: str, payload: Dict[str, Any]) -> None:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        raw = json.dumps(payload, ensure_ascii=False)
+        try:
+            if self.is_postgres:
+                cursor.execute(
+                    """
+                    INSERT INTO autopost_drafts (draft_id, payload_json)
+                    VALUES (%s, %s)
+                    ON CONFLICT (draft_id) DO UPDATE SET
+                        payload_json = EXCLUDED.payload_json,
+                        created_at = CURRENT_TIMESTAMP
+                    """,
+                    (draft_id, raw),
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO autopost_drafts (draft_id, payload_json)
+                    VALUES (?, ?)
+                    ON CONFLICT (draft_id) DO UPDATE SET
+                        payload_json = excluded.payload_json,
+                        created_at = CURRENT_TIMESTAMP
+                    """,
+                    (draft_id, raw),
+                )
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_autopost_draft(self, draft_id: str) -> Optional[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                ("SELECT payload_json FROM autopost_drafts WHERE draft_id = %s" if self.is_postgres else "SELECT payload_json FROM autopost_drafts WHERE draft_id = ?"),
+                (draft_id,),
+            )
+            row = cursor.fetchone()
+            if not row or not row[0]:
+                return None
+            return json.loads(row[0])
+        finally:
+            cursor.close()
+            conn.close()
+
+    def delete_autopost_draft(self, draft_id: str) -> None:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                ("DELETE FROM autopost_drafts WHERE draft_id = %s" if self.is_postgres else "DELETE FROM autopost_drafts WHERE draft_id = ?"),
+                (draft_id,),
+            )
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
 
 db = Database()
 

@@ -35,6 +35,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     ErrorEvent,
     BotCommand,
+    BufferedInputFile,
 )
 from aiogram.client.default import DefaultBotProperties
 
@@ -51,6 +52,9 @@ from core.common import (
     SECRET_KEY,
     TIMEZONE_STR,
     LOG_CHAT_ID,
+    ADMIN_ID,
+    CHANNEL_ID,
+    GEMINI_API_KEY,
     PRIVACY_URL,
     TERMS_URL,
     TZ,
@@ -296,7 +300,7 @@ class PolicyConsentMiddleware(BaseMiddleware):
                 if txt.startswith("/")
                 else ""
             )
-            if cmd_token in {"/start", "/privacy", "/delete_me"} or txt == BTN_ACCEPT_POLICY:
+            if cmd_token in {"/start", "/privacy", "/delete_me"} or txt == BTN_ACCEPT_POLICY or (cmd_token == "/autopost" and ADMIN_ID and event.from_user.id == ADMIN_ID):
                 return await handler(event, data)
 
             state: Optional[FSMContext] = data.get("state")
@@ -740,8 +744,13 @@ async def handle_start(message: Message, state: FSMContext):
 
         parts = message.text.split(maxsplit=1) if message.text else []
         pending_t_code = None
-        if len(parts) > 1 and parts[1].strip().startswith("t_"):
-            pending_t_code = parts[1].strip()[2:].strip()
+        pending_term_code = None
+        if len(parts) > 1:
+            arg = parts[1].strip()
+            if arg.startswith("t_"):
+                pending_t_code = arg[2:].strip()
+            elif arg.startswith("term_"):
+                pending_term_code = arg[5:].strip().replace("_", ".")
 
         policy_ok = await asyncio.to_thread(db.is_user_policy_accepted, uid)
         if not policy_ok:
@@ -759,6 +768,16 @@ async def handle_start(message: Message, state: FSMContext):
         connect_notice = ""
         if pending_t_code:
             connect_notice = await _process_teacher_deeplink(message.bot, message.from_user, pending_t_code)
+
+        if pending_term_code:
+            card_obj = catalog.get_by_code(pending_term_code)
+            if card_obj:
+                exam_level = await asyncio.to_thread(db.get_user_exam_level, uid)
+                card_text = format_card_back(card_obj, show_detail=True, exam_level=exam_level)
+                await render_single_screen(
+                    message, state, card_text, reply_markup=Keyboards.main_menu()
+                )
+                return
 
         text = f"{connect_notice}🏠 *Главное меню*\n\nВыберите формат тренировки:"
         await render_single_screen(
@@ -2486,6 +2505,248 @@ async def start_dummy_web_server(port: int = 10000):
     return server
 
 
+
+# =====================================================================
+# АВТОПОСТИНГ В TELEGRAM-КАНАЛ (ПРЕМОДЕРАЦИЯ + РУЧНОЙ ЗАПУСК)
+# =====================================================================
+
+def _autopost_moderation_kb(draft_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Принять", callback_data=f"ap_approve:{draft_id}"),
+                InlineKeyboardButton(text="🔄 Переделать", callback_data=f"ap_regen:{draft_id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"ap_reject:{draft_id}"),
+            ]
+        ]
+    )
+
+
+def _autopost_trigger_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⚡ Сгенерировать пост сейчас", callback_data="ap_trigger_now")]
+        ]
+    )
+
+
+async def _send_autopost_preview_to_admin(bot_instance: Bot, draft: Dict[str, Any]) -> None:
+    if not ADMIN_ID:
+        return
+    term_obj = catalog.get_by_code(draft["term_code"]) or {
+        "code": draft["term_code"],
+        "term": draft.get("term_name", ""),
+        "module_title": draft.get("module_title", ""),
+    }
+    png_bytes = await asyncio.to_thread(
+        render_post_card_png,
+        draft["format_type"],
+        term_obj,
+        draft.get("card_data") or {},
+    )
+    photo = BufferedInputFile(png_bytes, filename=f"card_{draft['draft_id']}.png")
+    caption = draft["post_html"]
+    if draft["format_type"] == "blitz_poll":
+        cd = draft.get("card_data") or {}
+        q = cd.get("poll_question", "")
+        opts = cd.get("poll_options") or []
+        opts_preview = "\n".join([f"• {o}" for o in opts[:4]])
+        caption += f"\n\n<b>Опрос:</b> {q}\n{opts_preview}"
+    if draft.get("news_source"):
+        caption += f"\n\n<i>Источник повода: {draft['news_source']}</i>"
+    if len(caption) > 1000:
+        caption = caption[:997] + "..."
+
+    await bot_instance.send_photo(
+        chat_id=ADMIN_ID,
+        photo=photo,
+        caption=caption,
+        parse_mode="HTML",
+        reply_markup=_autopost_moderation_kb(draft["draft_id"]),
+    )
+
+
+@router.message(Command("autopost"))
+async def handle_autopost_command(message: Message):
+    if not message.from_user or not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    if not GEMINI_API_KEY:
+        await message.answer("❌ Не задан GEMINI_API_KEY в переменных окружения.", parse_mode=None)
+        return
+    wait_msg = await message.answer("⏳ Собираю новости и готовлю черновик поста...", parse_mode=None)
+    try:
+        draft = await generate_autopost_draft(catalog, db)
+        await _send_autopost_preview_to_admin(message.bot, draft)
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"Ошибка ручной генерации автопоста: {e}")
+        await wait_msg.edit_text(f"❌ Ошибка генерации поста: {e}", reply_markup=_autopost_trigger_kb(), parse_mode=None)
+
+
+@router.callback_query(F.data == "ap_trigger_now")
+async def handle_autopost_trigger_now(callback: CallbackQuery):
+    if not callback.from_user or not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await callback.answer("⏳ Генерирую новый пост...")
+    try:
+        draft = await generate_autopost_draft(catalog, db)
+        await _send_autopost_preview_to_admin(callback.bot, draft)
+    except Exception as e:
+        logger.error(f"Ошибка генерации автопоста по кнопке: {e}")
+        await callback.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"❌ Ошибка генерации поста: {e}",
+            reply_markup=_autopost_trigger_kb(),
+            parse_mode=None,
+        )
+
+
+@router.callback_query(F.data.startswith("ap_approve:"))
+async def handle_autopost_approve(callback: CallbackQuery):
+    if not callback.from_user or not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    if not CHANNEL_ID:
+        await callback.answer("Не задан CHANNEL_ID!", show_alert=True)
+        return
+    draft_id = callback.data.split(":", 1)[1].strip()
+    draft = await asyncio.to_thread(db.get_autopost_draft, draft_id)
+    if not draft:
+        await callback.answer("Черновик уже удалён или устарел.", show_alert=True)
+        return
+
+    await callback.answer("Публикую в канал...")
+    try:
+        term_obj = catalog.get_by_code(draft["term_code"]) or {
+            "code": draft["term_code"],
+            "term": draft.get("term_name", ""),
+            "module_title": draft.get("module_title", ""),
+        }
+        png_bytes = await asyncio.to_thread(
+            render_post_card_png,
+            draft["format_type"],
+            term_obj,
+            draft.get("card_data") or {},
+        )
+        photo = BufferedInputFile(png_bytes, filename=f"post_{draft_id}.png")
+        me = await callback.bot.get_me()
+        safe_code = str(draft["term_code"]).replace(".", "_")
+        deeplink = f"https://t.me/{me.username}?start=term_{safe_code}"
+        post_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Закрепить термин в боте →", url=deeplink)]
+            ]
+        )
+        caption = draft["post_html"]
+        if len(caption) > 1000:
+            caption = caption[:997] + "..."
+
+        await callback.bot.send_photo(
+            chat_id=CHANNEL_ID,
+            photo=photo,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=post_kb,
+        )
+
+        if draft["format_type"] == "blitz_poll":
+            cd = draft.get("card_data") or {}
+            opts = [str(o)[:95] for o in (cd.get("poll_options") or [])[:4]]
+            q = str(cd.get("poll_question") or "Проверь себя:")[:290]
+            if len(opts) >= 2:
+                correct_id = int(cd.get("correct_option_id", 0))
+                if not (0 <= correct_id < len(opts)):
+                    correct_id = 0
+                expl = str(cd.get("poll_explanation") or "")[:190] or None
+                await callback.bot.send_poll(
+                    chat_id=CHANNEL_ID,
+                    question=q,
+                    options=opts,
+                    type="quiz",
+                    correct_option_id=correct_id,
+                    explanation=expl,
+                    is_anonymous=True,
+                )
+
+        await asyncio.to_thread(
+            db.record_autopost_published,
+            draft["term_code"],
+            draft.get("news_url", ""),
+            draft["format_type"],
+        )
+        await asyncio.to_thread(db.delete_autopost_draft, draft_id)
+
+        try:
+            await callback.message.edit_reply_markup(reply_markup=_autopost_trigger_kb())
+        except Exception:
+            pass
+        await callback.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"✅ Пост по термину «{draft.get('term_name', '')}» опубликован в канал!",
+            reply_markup=_autopost_trigger_kb(),
+            parse_mode=None,
+        )
+    except Exception as e:
+        logger.error(f"Ошибка публикации автопоста: {e}")
+        await callback.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"❌ Не удалось опубликовать в канал: {e}",
+            parse_mode=None,
+        )
+
+
+@router.callback_query(F.data.startswith("ap_regen:"))
+async def handle_autopost_regen(callback: CallbackQuery):
+    if not callback.from_user or not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    draft_id = callback.data.split(":", 1)[1].strip()
+    old_draft = await asyncio.to_thread(db.get_autopost_draft, draft_id)
+    await asyncio.to_thread(db.delete_autopost_draft, draft_id)
+    await callback.answer("🔄 Переделываю пост...")
+    try:
+        old_fmt = old_draft.get("format_type") if old_draft else None
+        other_formats = [f for f in FORMAT_TYPES if f != old_fmt]
+        next_fmt = random.choice(other_formats) if other_formats else None
+        new_draft = await generate_autopost_draft(catalog, db, preferred_format=next_fmt)
+        await _send_autopost_preview_to_admin(callback.bot, new_draft)
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"Ошибка перегенерации автопоста: {e}")
+        await callback.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"❌ Ошибка перегенерации: {e}",
+            reply_markup=_autopost_trigger_kb(),
+            parse_mode=None,
+        )
+
+
+@router.callback_query(F.data.startswith("ap_reject:"))
+async def handle_autopost_reject(callback: CallbackQuery):
+    if not callback.from_user or not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    draft_id = callback.data.split(":", 1)[1].strip()
+    await asyncio.to_thread(db.delete_autopost_draft, draft_id)
+    await callback.answer("❌ Черновик отклонён.")
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.bot.send_message(
+        chat_id=ADMIN_ID,
+        text="❌ Черновик отклонён.",
+        reply_markup=_autopost_trigger_kb(),
+        parse_mode=None,
+    )
+
 async def periodic_background_task(bot_instance: Optional[Bot] = None):
     """
     Фоновый цикл (Scale-to-Zero Friendly для Neon):
@@ -2495,6 +2756,7 @@ async def periodic_background_task(bot_instance: Optional[Bot] = None):
     - Ночью и днём база Neon спит и бережёт бесплатные вычислительные часы.
     """
     last_db_maintenance_date: Optional[date] = None
+    last_autopost_date: Optional[date] = None
 
     while True:
         try:
@@ -2503,6 +2765,21 @@ async def periodic_background_task(bot_instance: Optional[Bot] = None):
 
             now_local = datetime.now(TZ)
             today_local = now_local.date()
+
+            if (
+                now_local.hour == 16
+                and last_autopost_date != today_local
+                and bot_instance is not None
+                and ADMIN_ID
+                and CHANNEL_ID
+                and GEMINI_API_KEY
+            ):
+                last_autopost_date = today_local
+                try:
+                    draft = await generate_autopost_draft(catalog, db)
+                    await _send_autopost_preview_to_admin(bot_instance, draft)
+                except Exception as ap_err:
+                    logger.warning(f"Ошибка плановой генерации автопоста: {ap_err}")
 
             if 18 <= now_local.hour <= 20 and last_db_maintenance_date != today_local:
                 last_db_maintenance_date = today_local
