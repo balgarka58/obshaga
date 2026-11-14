@@ -2351,6 +2351,8 @@ async def _send_autopost_preview_to_admin(bot_instance: Bot, draft: Dict[str, An
         caption += f"\n\n<b>Опрос:</b> {q}\n{opts_preview}"
     if draft.get("news_source"):
         caption += f"\n\n<i>Источник повода: {draft['news_source']}</i>"
+    elif draft.get("rss_fallback_note"):
+        caption += f"\n\n<i>⚠️ {draft['rss_fallback_note']}</i>"
     if len(caption) > 1000:
         caption = caption[:997] + "..."
 
@@ -2372,7 +2374,7 @@ async def handle_autopost_command(message: Message):
         return
     wait_msg = await message.answer("⏳ Собираю новости и готовлю черновик поста...", parse_mode=None)
     try:
-        draft = await generate_autopost_draft(catalog, db)
+        draft = await generate_autopost_draft(catalog, db, preferred_format="news_term")
         await _send_autopost_preview_to_admin(message.bot, draft)
         try:
             await wait_msg.delete()
@@ -2390,7 +2392,7 @@ async def handle_autopost_trigger_now(callback: CallbackQuery):
         return
     await callback.answer("⏳ Генерирую новый пост...")
     try:
-        draft = await generate_autopost_draft(catalog, db)
+        draft = await generate_autopost_draft(catalog, db, preferred_format="news_term")
         await _send_autopost_preview_to_admin(callback.bot, draft)
     except Exception as e:
         logger.error(f"Ошибка генерации автопоста по кнопке: {e}")
