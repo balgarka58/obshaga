@@ -87,6 +87,7 @@ from core.learning import (
     TestGenerator,
     format_card_back,
 )
+from core.autopost import generate_autopost_draft, render_post_card_png, FORMAT_TYPES
 from core.keyboards import (
     UserFlow,
     Keyboards,
