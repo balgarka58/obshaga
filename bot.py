@@ -2302,210 +2302,6 @@ async def handle_cancel_delete_data(message: Message, state: FSMContext):
         )
 
 
-@router.message(F.text)
-async def handle_universal_text_fallback(message: Message, state: FSMContext):
-    uid = message.from_user.id if message.from_user else message.chat.id
-    async with user_lock_manager.get_lock(uid):
-        txt = (message.text or "").strip()
-        cur_state = await state.get_state()
-
-        if cur_state == UserFlow.awaiting_policy_accept.state:
-            await render_single_screen(
-                message,
-                state,
-                _build_policy_consent_text(),
-                reply_markup=Keyboards.policy_consent_reply(),
-            )
-            return
-
-        if cur_state == UserFlow.selecting_exam_level.state:
-            await render_single_screen(
-                message,
-                state,
-                "К какому экзамену ты готовишься?",
-                reply_markup=Keyboards.exam_level_selection(),
-            )
-            return
-
-        policy_ok = await asyncio.to_thread(db.is_user_policy_accepted, uid)
-        if not policy_ok:
-            await state.set_state(UserFlow.awaiting_policy_accept)
-            await render_single_screen(
-                message,
-                state,
-                _build_policy_consent_text(),
-                reply_markup=Keyboards.policy_consent_reply(),
-            )
-            return
-
-        if txt in {BTN_EXAM_OGE, BTN_EXAM_EGE} and message.from_user:
-            chosen_level = "oge" if txt == BTN_EXAM_OGE else "ege"
-            await asyncio.to_thread(db.set_user_exam_level, uid, chosen_level)
-            await state.clear()
-            level_badge = (
-                "🎓 *Выбран режим подготовки: ОГЭ*\n_Карточки адаптированы: базовое определение, 2 главных признака и пример из РФ._\n\n"
-                if chosen_level == "oge"
-                else "🏛 *Выбран режим подготовки: ЕГЭ*\n_Включены полные академические формулировки, классификации и разбор ловушек._\n\n"
-            )
-            await render_single_screen(
-                message,
-                state,
-                f"{level_badge}🏠 *Главное меню*\n\nВыберите формат тренировки:",
-                reply_markup=Keyboards.main_menu(),
-            )
-            return
-
-        if (
-            txt
-            in {
-                BTN_CARD_FLIP,
-                BTN_CARD_KNOW,
-                BTN_CARD_UNSURE,
-                BTN_CARD_FORGOT,
-                BTN_CARD_DETAIL,
-            }
-            and message.from_user
-        ):
-            await state.set_state(UserFlow.in_flashcards)
-            await send_next_flashcard_msg(message, message.from_user.id, state)
-            return
-
-        if txt in TOPIC_BUTTONS_MAP and message.from_user:
-            topic_val = TOPIC_BUTTONS_MAP[txt]
-            mod_filter = None if topic_val == "all" else int(topic_val)
-            await state.update_data(
-                module_filter=mod_filter,
-                mode="cards",
-                custom_codes=None,
-                is_error_workout=False,
-            )
-            await state.set_state(UserFlow.in_flashcards)
-            await send_next_flashcard_msg(message, message.from_user.id, state)
-            return
-
-        if len(txt) >= 3 and not txt.startswith("/") and txt not in SYSTEM_UI_BUTTONS_SET:
-            await state.set_state(UserFlow.in_search)
-            await _process_search_query_unlocked(message, state)
-        else:
-            await state.clear()
-            await render_single_screen(
-                message,
-                state,
-                "🏠 *Главное меню*\n\nВыберите формат тренировки:",
-                reply_markup=Keyboards.main_menu(),
-            )
-
-
-# =====================================================================
-# 5. ФОНОВЫЕ ЗАДАЧИ С АРХИВАЦИЕЙ, СВОДКОЙ В ЛОГИ И RENDER PORT
-# =====================================================================
-
-async def setup_bot_commands(bot_instance: Bot):
-    """Регистрирует системные команды бота в меню Telegram."""
-    commands = [
-        BotCommand(command="start", description="🏠 Перезапуск / Главное меню"),
-        BotCommand(command="change", description="🎓 Сменить экзамен (ОГЭ / ЕГЭ)"),
-        BotCommand(command="teachers", description="👨‍🏫 Кабинет преподавателя"),
-        BotCommand(command="privacy", description="🛡 Политика конфиденциальности"),
-        BotCommand(command="delete_me", description="🗑 Удалить мои данные"),
-    ]
-    try:
-        await bot_instance.set_my_commands(commands)
-    except Exception as e:
-        logger.warning(f"Не удалось зарегистрировать системные команды Telegram: {e}")
-
-
-async def process_daily_reminders(
-    bot_instance: Bot, reference_date: Optional[date] = None
-) -> int:
-    """
-    Отправляет вечерние напоминания с безопасной паузой 0.08с и защитой от TelegramRetryAfter.
-    """
-    today_dt = reference_date or get_local_today()
-    today_iso = today_dt.isoformat()
-    candidates = await asyncio.to_thread(db.get_users_for_daily_reminder, today_dt)
-    sent_count = 0
-
-    for item in candidates:
-        uid = item["user_id"]
-        streak = item["current_streak"]
-        text = (
-            f"🔥 *Напоминание о вашей серии занятий!*\n\n"
-            f"Ваша текущая серия: *{streak} дн. подряд*.\n"
-            f"Сегодня вы ещё не решили ни одной карточки или теста. "
-            f"Уделите 2–3 минуты тренировке, чтобы сохранить темп подготовки!\n\n"
-            f"_Отключить уведомления можно в разделе «📊 Моя статистика»._"
-        )
-        try:
-            prev_id = screen_manager.get_last_id(uid)
-            try:
-                sent_msg = await bot_instance.send_message(
-                    chat_id=uid,
-                    text=text,
-                    reply_markup=Keyboards.main_menu(),
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-            except TelegramRetryAfter as retry_err:
-                await asyncio.sleep(min(float(retry_err.retry_after) + 0.5, 10.0))
-                sent_msg = await bot_instance.send_message(
-                    chat_id=uid,
-                    text=text,
-                    reply_markup=Keyboards.main_menu(),
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-            screen_manager.set_last_id(uid, sent_msg.message_id)
-            if prev_id and prev_id != sent_msg.message_id:
-                await _safe_delete_message(bot_instance, uid, prev_id)
-            await asyncio.to_thread(db.mark_reminder_sent, uid, today_iso)
-            sent_count += 1
-        except TelegramForbiddenError:
-            await asyncio.to_thread(db.mark_reminder_sent, uid, today_iso)
-        except Exception as e:
-            logger.warning(f"Не удалось отправить напоминание пользователю {uid}: {e}")
-        await asyncio.sleep(0.08)
-
-    return sent_count
-
-
-async def start_dummy_web_server(port: int = 10000):
-    """Защищённый от HTTP-флуда и Slowloris-атак health-check сервер для Render."""
-    conn_semaphore = asyncio.Semaphore(64)
-
-    async def handle_client(
-        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ):
-        if conn_semaphore.locked():
-            try:
-                writer.close()
-            except Exception:
-                pass
-            return
-        async with conn_semaphore:
-            try:
-                await asyncio.wait_for(reader.read(512), timeout=1.0)
-                response = (
-                    b"HTTP/1.1 200 OK\r\n"
-                    b"Content-Type: text/plain; charset=utf-8\r\n"
-                    b"Content-Length: 2\r\n"
-                    b"Connection: close\r\n\r\nOK"
-                )
-                writer.write(response)
-                await asyncio.wait_for(writer.drain(), timeout=1.0)
-            except Exception:
-                pass
-            finally:
-                try:
-                    writer.close()
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-
-    server = await asyncio.start_server(handle_client, "0.0.0.0", port, backlog=64)
-    logger.info(f"Фоновый веб-сервер запущен на порту {port} для Render.")
-    return server
-
-
-
 # =====================================================================
 # АВТОПОСТИНГ В TELEGRAM-КАНАЛ (ПРЕМОДЕРАЦИЯ + РУЧНОЙ ЗАПУСК)
 # =====================================================================
@@ -2746,6 +2542,210 @@ async def handle_autopost_reject(callback: CallbackQuery):
         reply_markup=_autopost_trigger_kb(),
         parse_mode=None,
     )
+
+@router.message(F.text)
+async def handle_universal_text_fallback(message: Message, state: FSMContext):
+    uid = message.from_user.id if message.from_user else message.chat.id
+    async with user_lock_manager.get_lock(uid):
+        txt = (message.text or "").strip()
+        cur_state = await state.get_state()
+
+        if cur_state == UserFlow.awaiting_policy_accept.state:
+            await render_single_screen(
+                message,
+                state,
+                _build_policy_consent_text(),
+                reply_markup=Keyboards.policy_consent_reply(),
+            )
+            return
+
+        if cur_state == UserFlow.selecting_exam_level.state:
+            await render_single_screen(
+                message,
+                state,
+                "К какому экзамену ты готовишься?",
+                reply_markup=Keyboards.exam_level_selection(),
+            )
+            return
+
+        policy_ok = await asyncio.to_thread(db.is_user_policy_accepted, uid)
+        if not policy_ok:
+            await state.set_state(UserFlow.awaiting_policy_accept)
+            await render_single_screen(
+                message,
+                state,
+                _build_policy_consent_text(),
+                reply_markup=Keyboards.policy_consent_reply(),
+            )
+            return
+
+        if txt in {BTN_EXAM_OGE, BTN_EXAM_EGE} and message.from_user:
+            chosen_level = "oge" if txt == BTN_EXAM_OGE else "ege"
+            await asyncio.to_thread(db.set_user_exam_level, uid, chosen_level)
+            await state.clear()
+            level_badge = (
+                "🎓 *Выбран режим подготовки: ОГЭ*\n_Карточки адаптированы: базовое определение, 2 главных признака и пример из РФ._\n\n"
+                if chosen_level == "oge"
+                else "🏛 *Выбран режим подготовки: ЕГЭ*\n_Включены полные академические формулировки, классификации и разбор ловушек._\n\n"
+            )
+            await render_single_screen(
+                message,
+                state,
+                f"{level_badge}🏠 *Главное меню*\n\nВыберите формат тренировки:",
+                reply_markup=Keyboards.main_menu(),
+            )
+            return
+
+        if (
+            txt
+            in {
+                BTN_CARD_FLIP,
+                BTN_CARD_KNOW,
+                BTN_CARD_UNSURE,
+                BTN_CARD_FORGOT,
+                BTN_CARD_DETAIL,
+            }
+            and message.from_user
+        ):
+            await state.set_state(UserFlow.in_flashcards)
+            await send_next_flashcard_msg(message, message.from_user.id, state)
+            return
+
+        if txt in TOPIC_BUTTONS_MAP and message.from_user:
+            topic_val = TOPIC_BUTTONS_MAP[txt]
+            mod_filter = None if topic_val == "all" else int(topic_val)
+            await state.update_data(
+                module_filter=mod_filter,
+                mode="cards",
+                custom_codes=None,
+                is_error_workout=False,
+            )
+            await state.set_state(UserFlow.in_flashcards)
+            await send_next_flashcard_msg(message, message.from_user.id, state)
+            return
+
+        if len(txt) >= 3 and not txt.startswith("/") and txt not in SYSTEM_UI_BUTTONS_SET:
+            await state.set_state(UserFlow.in_search)
+            await _process_search_query_unlocked(message, state)
+        else:
+            await state.clear()
+            await render_single_screen(
+                message,
+                state,
+                "🏠 *Главное меню*\n\nВыберите формат тренировки:",
+                reply_markup=Keyboards.main_menu(),
+            )
+
+
+# =====================================================================
+# 5. ФОНОВЫЕ ЗАДАЧИ С АРХИВАЦИЕЙ, СВОДКОЙ В ЛОГИ И RENDER PORT
+# =====================================================================
+
+async def setup_bot_commands(bot_instance: Bot):
+    """Регистрирует системные команды бота в меню Telegram."""
+    commands = [
+        BotCommand(command="start", description="🏠 Перезапуск / Главное меню"),
+        BotCommand(command="change", description="🎓 Сменить экзамен (ОГЭ / ЕГЭ)"),
+        BotCommand(command="teachers", description="👨‍🏫 Кабинет преподавателя"),
+        BotCommand(command="privacy", description="🛡 Политика конфиденциальности"),
+        BotCommand(command="delete_me", description="🗑 Удалить мои данные"),
+    ]
+    try:
+        await bot_instance.set_my_commands(commands)
+    except Exception as e:
+        logger.warning(f"Не удалось зарегистрировать системные команды Telegram: {e}")
+
+
+async def process_daily_reminders(
+    bot_instance: Bot, reference_date: Optional[date] = None
+) -> int:
+    """
+    Отправляет вечерние напоминания с безопасной паузой 0.08с и защитой от TelegramRetryAfter.
+    """
+    today_dt = reference_date or get_local_today()
+    today_iso = today_dt.isoformat()
+    candidates = await asyncio.to_thread(db.get_users_for_daily_reminder, today_dt)
+    sent_count = 0
+
+    for item in candidates:
+        uid = item["user_id"]
+        streak = item["current_streak"]
+        text = (
+            f"🔥 *Напоминание о вашей серии занятий!*\n\n"
+            f"Ваша текущая серия: *{streak} дн. подряд*.\n"
+            f"Сегодня вы ещё не решили ни одной карточки или теста. "
+            f"Уделите 2–3 минуты тренировке, чтобы сохранить темп подготовки!\n\n"
+            f"_Отключить уведомления можно в разделе «📊 Моя статистика»._"
+        )
+        try:
+            prev_id = screen_manager.get_last_id(uid)
+            try:
+                sent_msg = await bot_instance.send_message(
+                    chat_id=uid,
+                    text=text,
+                    reply_markup=Keyboards.main_menu(),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except TelegramRetryAfter as retry_err:
+                await asyncio.sleep(min(float(retry_err.retry_after) + 0.5, 10.0))
+                sent_msg = await bot_instance.send_message(
+                    chat_id=uid,
+                    text=text,
+                    reply_markup=Keyboards.main_menu(),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            screen_manager.set_last_id(uid, sent_msg.message_id)
+            if prev_id and prev_id != sent_msg.message_id:
+                await _safe_delete_message(bot_instance, uid, prev_id)
+            await asyncio.to_thread(db.mark_reminder_sent, uid, today_iso)
+            sent_count += 1
+        except TelegramForbiddenError:
+            await asyncio.to_thread(db.mark_reminder_sent, uid, today_iso)
+        except Exception as e:
+            logger.warning(f"Не удалось отправить напоминание пользователю {uid}: {e}")
+        await asyncio.sleep(0.08)
+
+    return sent_count
+
+
+async def start_dummy_web_server(port: int = 10000):
+    """Защищённый от HTTP-флуда и Slowloris-атак health-check сервер для Render."""
+    conn_semaphore = asyncio.Semaphore(64)
+
+    async def handle_client(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ):
+        if conn_semaphore.locked():
+            try:
+                writer.close()
+            except Exception:
+                pass
+            return
+        async with conn_semaphore:
+            try:
+                await asyncio.wait_for(reader.read(512), timeout=1.0)
+                response = (
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/plain; charset=utf-8\r\n"
+                    b"Content-Length: 2\r\n"
+                    b"Connection: close\r\n\r\nOK"
+                )
+                writer.write(response)
+                await asyncio.wait_for(writer.drain(), timeout=1.0)
+            except Exception:
+                pass
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+    server = await asyncio.start_server(handle_client, "0.0.0.0", port, backlog=64)
+    logger.info(f"Фоновый веб-сервер запущен на порту {port} для Render.")
+    return server
+
+
 
 async def periodic_background_task(bot_instance: Optional[Bot] = None):
     """
