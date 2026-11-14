@@ -1,4 +1,5 @@
 import os
+import html
 import re
 import time
 import random
@@ -87,7 +88,7 @@ from core.learning import (
     TestGenerator,
     format_card_back,
 )
-from core.autopost import generate_autopost_draft, download_image_bytes, FORMAT_TYPES
+from core.autopost import generate_autopost_draft, download_image_bytes, sanitize_telegram_html, FORMAT_TYPES
 from core.keyboards import (
     UserFlow,
     Keyboards,
@@ -758,6 +759,8 @@ async def handle_start(message: Message, state: FSMContext):
             await state.set_state(UserFlow.awaiting_policy_accept)
             if pending_t_code:
                 await state.update_data(pending_teacher_code=pending_t_code)
+            if pending_term_code:
+                await state.update_data(pending_term_code=pending_term_code)
             await render_single_screen(
                 message,
                 state,
@@ -794,6 +797,7 @@ async def handle_accept_policy_reply(message: Message, state: FSMContext):
     async with user_lock_manager.get_lock(uid):
         data = await state.get_data()
         pending_t_code = data.get("pending_teacher_code")
+        pending_term_code = data.get("pending_term_code")
         prev_bot_id = data.get("last_bot_msg_id")
         await asyncio.to_thread(db.accept_user_policy, uid)
         await state.clear()
@@ -801,6 +805,8 @@ async def handle_accept_policy_reply(message: Message, state: FSMContext):
             await state.update_data(last_bot_msg_id=prev_bot_id)
         if pending_t_code:
             await state.update_data(pending_teacher_code=pending_t_code)
+        if pending_term_code:
+            await state.update_data(pending_term_code=pending_term_code)
 
         await state.set_state(UserFlow.selecting_exam_level)
         await render_single_screen(
@@ -825,6 +831,7 @@ async def handle_select_exam_level_reply(message: Message, state: FSMContext):
 
         data = await state.get_data()
         pending_t_code = data.get("pending_teacher_code")
+        pending_term_code = data.get("pending_term_code")
         prev_bot_id = data.get("last_bot_msg_id")
         await state.clear()
         if prev_bot_id:
@@ -833,6 +840,15 @@ async def handle_select_exam_level_reply(message: Message, state: FSMContext):
         connect_notice = ""
         if pending_t_code:
             connect_notice = await _process_teacher_deeplink(message.bot, message.from_user, str(pending_t_code))
+
+        if pending_term_code:
+            card_obj = catalog.get_by_code(str(pending_term_code))
+            if card_obj:
+                card_text = format_card_back(card_obj, show_detail=True, exam_level=chosen_level)
+                await render_single_screen(
+                    message, state, card_text, reply_markup=Keyboards.main_menu()
+                )
+                return
 
         level_badge = (
             "🎓 *Выбран режим подготовки: ОГЭ*\n_Карточки адаптированы: базовое определение, 2 главных признака и пример из РФ._\n\n"
@@ -2331,21 +2347,20 @@ async def _send_autopost_preview_to_admin(bot_instance: Bot, draft: Dict[str, An
     if not ADMIN_ID:
         return
     photo_bytes = await download_image_bytes(draft.get("image_url", ""))
-    caption = draft["post_html"]
+    caption = sanitize_telegram_html(draft["post_html"], max_len=820)
     if draft["format_type"] == "blitz_poll":
         cd = draft.get("card_data") or {}
-        q = cd.get("poll_question", "")
+        q = html.escape(str(cd.get("poll_question", "")))
         opts = cd.get("poll_options") or []
-        opts_preview = "\n".join([f"• {o}" for o in opts[:4]])
+        opts_preview = "\n".join([f"• {html.escape(str(o))}" for o in opts[:4]])
         caption += f"\n\n<b>Опрос:</b> {q}\n{opts_preview}"
     if draft.get("news_source"):
-        caption += f"\n\n<i>Источник повода: {draft['news_source']}</i>"
+        caption += f"\n\n<i>Источник повода: {html.escape(str(draft['news_source']))}</i>"
     elif draft.get("rss_fallback_note"):
-        caption += f"\n\n<i>⚠️ {draft['rss_fallback_note']}</i>"
+        caption += f"\n\n<i>⚠️ {html.escape(str(draft['rss_fallback_note']))}</i>"
 
     if photo_bytes:
-        if len(caption) > 1000:
-            caption = caption[:997] + "..."
+        caption = sanitize_telegram_html(caption, max_len=980)
         photo = BufferedInputFile(photo_bytes, filename=f"photo_{draft['draft_id']}.jpg")
         await bot_instance.send_photo(
             chat_id=ADMIN_ID,
@@ -2428,7 +2443,7 @@ async def handle_autopost_approve(callback: CallbackQuery):
                 [InlineKeyboardButton(text="Закрепить термин в боте →", url=deeplink)]
             ]
         )
-        caption = draft["post_html"]
+        caption = sanitize_telegram_html(draft["post_html"], max_len=980)
 
         if photo_bytes:
             if len(caption) > 1000:

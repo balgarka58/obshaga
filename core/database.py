@@ -2249,6 +2249,14 @@ class Database:
                     """,
                     (draft_id, raw),
                 )
+            if self.is_postgres:
+                cursor.execute(
+                    "DELETE FROM autopost_drafts WHERE created_at < NOW() - INTERVAL '7 days'"
+                )
+            else:
+                cursor.execute(
+                    "DELETE FROM autopost_drafts WHERE created_at < datetime('now', '-7 days')"
+                )
             conn.commit()
         finally:
             cursor.close()

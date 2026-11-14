@@ -1,9 +1,9 @@
 """
-Модуль автономного ИИ-постинга для Telegram-канала «ОБЩАГА | ТЕРМИНЫ» (v3).
+Модуль автономного ИИ-постинга для Telegram-канала «ОБЩАГА | ТЕРМИНЫ» (v4).
 - Сбор свежих новостей через Google News RSS + прямые RSS-ленты.
 - Сопоставление новостей с базой terms.json и генерация постов через Gemini API (gemini-4-hydrogen).
-- Поиск реальных фотографий без вотермарок через бесплатный Wikimedia Commons API.
-- Нативная вёрстка Telegram HTML с <blockquote> и жёстким анти-клише промптом.
+- Поиск современных фото через Wikimedia Commons API с фильтром от старых сканов, марок и гравюр.
+- Безопасная санитизация Telegram HTML (<b>, <i>, <blockquote>) с защитой от обрыва тегов.
 """
 import os
 import re
@@ -64,18 +64,41 @@ WIKIMEDIA_HEADERS: Dict[str, str] = {
     "Api-User-Agent": "ObshagaEduBot/1.0 (https://t.me/obshaga; educational exam prep)",
 }
 
+WIKIMEDIA_BAD_TOKENS: Tuple[str, ...] = (
+    "stamp", "coin", "banknote", "engraving", "scan", "coat_of_arms", "coat of arms",
+    "medal", "seal", "herb", "monogram", "signature", "grave", "tomb", "portrait_18",
+    "18th", "19th", "17th", "180", "181", "182", "183", "184", "185", "186", "187",
+    "188", "189", "190", "191", "192", "193", "194", "map_of", "diagram", "chart",
+)
+
 ANTI_CLICHE_RULES = (
     "СТРОГИЕ ПРАВИЛА СТИЛЯ И ВЁРСТКИ:\n"
-    "1. Пиши чётко, живо и по делу — как сильный репетитор для 9–11 классов, без канцелярита и пафоса.\n"
-    "2. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНЫ нейросетевые штампы и лирика: 'это не просто X, а/это Y', "
-    "'живёт в оболочке', 'в современном мире', 'давайте разберёмся', 'давайте посмотрим', "
-    "'не секрет, что', 'таким образом', 'подводя итог', 'важно отметить', 'стоит подчеркнуть', 'каждый из нас'.\n"
-    "3. Опирайся ТОЛЬКО на реальные факты из переданной новости и поля термина (определение, признаки, ловушки). "
-    "Никаких выдуманных цифр, дат, статей законов и несуществующих критериев ФИПИ.\n"
-    "4. Используй только разрешённые HTML-теги Telegram: <b>, <i>, <blockquote>. "
-    "Блок <blockquote> используй ровно 1 раз в конце поста — для готового примера во 2-ю часть или главного правила для экзамена.\n"
-    "5. Не ставь лишних эмодзи — максимум 2–3 на весь пост. Списки оформляй через '— '.\n"
-    "6. Длина поста — строго 450–780 символов (должен влезать в подпись к фото и читаться за 20 секунд)."
+    "1. Начинай сразу с жирного цепляющего вопроса или острого тезиса в 1 строку. "
+    "ЗАПРЕЩЕНО использовать шаблонные подзаголовки вроде 'Что случилось:', 'Как это работает в теории:', 'Главные признаки:'.\n"
+    "2. Пиши живым, ясным языком без канцелярита и газетной воды. Если упоминаешь новость — сразу объясняй, "
+    "как именно это работает на практике (кто, что и почему делает), а не ограничивайся туманным пересказом.\n"
+    "3. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНЫ нейросетевые штампы: 'это не просто X, а/это Y', 'живёт в оболочке', "
+    "'в современном мире', 'давайте разберёмся', 'давайте посмотрим', 'не секрет, что', 'таким образом', "
+    "'подводя итог', 'важно отметить', 'стоит подчеркнуть', 'каждый из нас'.\n"
+    "4. В примерах для 2-й части ЗАПРЕЩЁН шаблонный 'Гражданин РФ Иванов' — используй современные живые роли "
+    "(репетитор, дизайнер на фрилансе, владелец кофейни, студент, программист и т. п.).\n"
+    "5. Опирайся ТОЛЬКО на реальные факты из переданной новости и поля термина. Не выдумывай цифры и статьи законов.\n"
+    "6. Разрешённые HTML-теги Telegram: <b>, <i>, <blockquote>. Тег <blockquote> используй ровно 1 раз в конце "
+    "для примера во 2-ю часть или главного правила. Максимум 2–3 эмодзи на пост. Списки — через '— '.\n"
+    "7. Длина поста — строго 450–780 символов."
+)
+
+FEW_SHOT_NEWS_EXAMPLE = (
+    "ПРИМЕР ХОРОШЕГО ПОСТА (ориентируйся на этот живой тон, НЕ копируй тему):\n"
+    "<b>Когда перевод на карту становится поводом для штрафа?</b> 💳\n\n"
+    "В новостях обсуждают усиление контроля ФНС за регулярными поступлениями на карты. "
+    "Обычный перевод от друга или родителей налогом не облагается — под прицел попадают те, кто систематически "
+    "принимает оплату за услуги или продажи (например, уроки или дизайн), но не оформляет самозанятость.\n\n"
+    "Для экзамена важно не путать <b>налог</b> (обязательный безвозмездный платёж с дохода по закону) "
+    "и обычный бытовой перевод, где экономической выгоды нет.\n\n"
+    "<blockquote><b>Пример для 2-й части:</b> Репетитор Анна год принимала оплату за занятия на карту без "
+    "регистрации самозанятости. ФНС выявила регулярный доход, доначислила налог и выписала штраф — это "
+    "иллюстрирует ответственность за нарушение обязанности платить законно установленные налоги.</blockquote>"
 )
 
 
@@ -86,6 +109,56 @@ def _strip_html(raw: str) -> str:
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def sanitize_telegram_html(raw_html: str, max_len: int = 980) -> str:
+    """
+    Приводит текст к валидному подмножеству Telegram HTML (<b>, <i>, <blockquote>):
+    экранирует случайные < > &, закрывает незакрытые теги и не рвёт теги при обрезке.
+    """
+    allowed = ("b", "i", "blockquote")
+    tokens = re.split(r"(</?(?:b|i|blockquote)>)", raw_html or "", flags=re.IGNORECASE)
+    out_parts: List[str] = []
+    open_stack: List[str] = []
+    visible_len = 0
+    truncated = False
+
+    for tok in tokens:
+        if not tok:
+            continue
+        low = tok.lower()
+        if low in ("<b>", "<i>", "<blockquote>"):
+            tag = low[1:-1]
+            if tag not in open_stack:
+                out_parts.append(f"<{tag}>")
+                open_stack.append(tag)
+        elif low in ("</b>", "</i>", "</blockquote>"):
+            tag = low[2:-1]
+            if tag in open_stack:
+                # Закрываем до нужного тега в стеке
+                while open_stack:
+                    top = open_stack.pop()
+                    out_parts.append(f"</{top}>")
+                    if top == tag:
+                        break
+        else:
+            clean = html.escape(html.unescape(tok), quote=False)
+            if visible_len + len(clean) > max_len:
+                room = max(0, max_len - visible_len - 3)
+                out_parts.append(clean[:room].rstrip() + "...")
+                truncated = True
+                break
+            out_parts.append(clean)
+            visible_len += len(clean)
+
+    while open_stack:
+        top = open_stack.pop()
+        out_parts.append(f"</{top}>")
+
+    res = "".join(out_parts).strip()
+    if truncated and len(res) > max_len + 40:
+        res = res[:max_len + 40]
+    return res
 
 
 async def _fetch_single_rss(
@@ -165,8 +238,8 @@ async def fetch_rss_news(
 
 async def find_wikimedia_image_url(queries: List[str]) -> Optional[str]:
     """
-    Ищет реальное растровое фото (JPEG/PNG) без вотермарок через Wikimedia Commons API.
-    Пробует список запросов по очереди и возвращает прямую ссылку на превью ~1200px.
+    Ищет современное растровое фото (JPEG/PNG) через Wikimedia Commons API,
+    отсекая старые сканы, монеты, марки и гравюры.
     """
     clean_queries = [str(q).strip() for q in (queries or []) if str(q).strip()]
     if not clean_queries:
@@ -176,12 +249,13 @@ async def find_wikimedia_image_url(queries: List[str]) -> Optional[str]:
     timeout = aiohttp.ClientTimeout(total=8)
     async with aiohttp.ClientSession(timeout=timeout, headers=WIKIMEDIA_HEADERS) as session:
         for q in clean_queries[:3]:
+            search_str = f"{q} filetype:bitmap -stamp -coin -banknote -engraving -18th -19th -archive"
             params = {
                 "action": "query",
                 "generator": "search",
                 "gsrnamespace": "6",
-                "gsrsearch": f"{q} filetype:bitmap",
-                "gsrlimit": "6",
+                "gsrsearch": search_str,
+                "gsrlimit": "10",
                 "prop": "imageinfo",
                 "iiprop": "url|mime|size",
                 "iiurlwidth": "1200",
@@ -198,7 +272,11 @@ async def find_wikimedia_image_url(queries: List[str]) -> Optional[str]:
 
             pages = list((data.get("query") or {}).get("pages", {}).values())
             pages.sort(key=lambda p: p.get("index", 9999))
+            candidates: List[str] = []
             for p in pages:
+                fname = (p.get("title") or "").lower()
+                if any(bad in fname for bad in WIKIMEDIA_BAD_TOKENS):
+                    continue
                 infos = p.get("imageinfo") or []
                 if not infos:
                     continue
@@ -208,15 +286,16 @@ async def find_wikimedia_image_url(queries: List[str]) -> Optional[str]:
                     continue
                 w = int(info.get("width") or 0)
                 h = int(info.get("height") or 0)
-                if w < 500 or h < 350:
+                if w < 600 or h < 400:
                     continue
-                # Слишком вытянутые баннеры/схемы отсекаем
                 ratio = w / max(1, h)
-                if ratio > 2.6 or ratio < 0.45:
+                if ratio > 2.4 or ratio < 0.5:
                     continue
                 thumb_url = info.get("thumburl") or info.get("url")
                 if thumb_url:
-                    return str(thumb_url)
+                    candidates.append(str(thumb_url))
+            if candidates:
+                return random.choice(candidates[:3])
     return None
 
 
@@ -258,13 +337,14 @@ async def _call_gemini_json(
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
         "generationConfig": {
-            "temperature": 0.6,
+            "temperature": 0.65,
             "responseMimeType": "application/json",
             "thinkingConfig": {"thinkingLevel": thinking_level},
         },
     }
 
     last_err: Optional[Exception] = None
+    data: Dict[str, Any] = {}
     for attempt in range(2):
         timeout = aiohttp.ClientTimeout(total=80, connect=15)
         try:
@@ -308,7 +388,7 @@ async def _call_gemini_json(
     raw_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
     if raw_text.startswith("```"):
         raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.DOTALL).strip()
-    return json.loads(raw_text)
+    return json.loads(raw_text, strict=False)
 
 
 def _pick_fresh_term(
@@ -325,8 +405,8 @@ async def generate_autopost_draft(
     preferred_format: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Собирает новости, сопоставляет с базой terms.json, генерирует пост с <blockquote>
-    через Gemini и подбирает реальное фото по теме на Wikimedia Commons.
+    Собирает новости, сопоставляет с базой terms.json, генерирует пост в живом стиле
+    и подбирает современное фото на Wikimedia Commons.
     """
     if not catalog.all_terms:
         raise RuntimeError("Каталог терминов пуст.")
@@ -372,7 +452,7 @@ async def generate_autopost_draft(
                 for idx, n in enumerate(news_list)
             ]
             match_sys = (
-                "Ты методист ОГЭ и ЕГЭ по обществознанию. Выбери из списка ОДНУ самую наглядную и свежую новость, "
+                "Ты методист ОГЭ и ЕГЭ по обществознанию. Выбери из списка ОДНУ самую понятную и свежую новость, "
                 "которую можно чётко объяснить через один термин из базы учеников. "
                 "Верни строго JSON: {\"news_index\": int, \"term_code\": str, \"bridge\": str}."
             )
@@ -402,18 +482,22 @@ async def generate_autopost_draft(
     }
 
     img_query_hint = (
-        '"image_queries": ["конкретный запрос на английском 2-3 слова для фото на Wikimedia Commons '
-        '(например: Bank of Russia building, Russian ruble banknotes, State Duma Moscow, '
-        'justice scales, university lecture, stock exchange)", "более общий запрос на английском 1-2 слова"]'
+        '"image_queries": ["современная визуальная сцена на английском 2-3 слова для Wikimedia Commons '
+        '(например: Moscow tax service building, Central Bank of Russia building, State Duma Moscow, '
+        'modern university lecture hall, Moscow City business center, Supreme Court Russia)", '
+        '"более широкий современный запрос на английском 2 слова"]'
     )
 
     if format_type == "news_term" and chosen_news:
         gen_sys = (
-            "Ты автор Telegram-канала «ОБЩАГА | ТЕРМИНЫ». Напиши пост строго по 3 блокам:\n"
-            "1) <b>Что случилось:</b> 1–2 предложения про реальный факт из новости.\n"
-            "2) <b>Как это работает в теории:</b> короткий разбор через выбранный термин из базы и 1–2 его признака.\n"
-            "3) <blockquote><b>Пример для 2-й части:</b> готовая формулировка для заданий 19 или 25 ЕГЭ.</blockquote>\n"
+            "Ты автор Telegram-канала «ОБЩАГА | ТЕРМИНЫ». Напиши пост в живом авторском стиле:\n"
+            "1) Жирный цепляющий заголовок-вопрос или острый факт (без ярлыков 'Что случилось:').\n"
+            "2) 2–3 предложения с понятным объяснением реальной сути новости (кто, что, почему — без тумана и общих фраз).\n"
+            "3) Короткая связка с выбранным термином и его главным экзаменационным различением (не переписывай сухое определение из словаря!).\n"
+            "4) <blockquote><b>Пример для 2-й части:</b> живая жизненная ситуация (без 'гражданина Иванова').</blockquote>\n"
             + ANTI_CLICHE_RULES
+            + "\n\n"
+            + FEW_SHOT_NEWS_EXAMPLE
             + "\nВерни строго JSON:\n"
             '{"post_html": "текст поста (450-780 символов)", ' + img_query_hint + "}"
         )
@@ -424,8 +508,7 @@ async def generate_autopost_draft(
     elif format_type == "traits_cheat":
         gen_sys = (
             "Ты автор Telegram-канала «ОБЩАГА | ТЕРМИНЫ». Формат: «3 признака для 18-го задания».\n"
-            "Структура:\n"
-            "1) Жирный заголовок термина и 1–2 предложения простым языком (без клише!).\n"
+            "1) Цепляющий жирный заголовок + 1–2 живых предложения сути (без словарной зубрёжки и ярлыков).\n"
             "2) Список из 3 точных признаков (— ...) на основе поля traits.\n"
             "3) <blockquote><b>На чём ловят на экзамене:</b> 1–2 предложения из pitfalls.</blockquote>\n"
             + ANTI_CLICHE_RULES
@@ -436,10 +519,9 @@ async def generate_autopost_draft(
     elif format_type == "pitfall_compare":
         gen_sys = (
             "Ты автор Telegram-канала «ОБЩАГА | ТЕРМИНЫ». Формат: «Главная ловушка экзамена».\n"
-            "Структура:\n"
-            "1) Название термина и суть частой ошибки выпускников.\n"
+            "1) Жирный заголовок с интригой + суть частой ошибки выпускников.\n"
             "2) Чёткое сравнение:\n— <b>Как ошибаются:</b> ...\n— <b>Как нужно по критериям:</b> ...\n"
-            "3) <blockquote><b>Правило для ЕГЭ/ОГЭ:</b> 1 короткий вывод, который спасёт балл.</blockquote>\n"
+            "3) <blockquote><b>Правило для ЕГЭ/ОГЭ:</b> 1 точный вывод, который спасёт балл.</blockquote>\n"
             + ANTI_CLICHE_RULES
             + "\nВерни строго JSON:\n"
             '{"post_html": "текст поста (450-750 символов)", ' + img_query_hint + "}"
@@ -449,9 +531,7 @@ async def generate_autopost_draft(
         format_type = "blitz_poll"
         gen_sys = (
             "Ты автор Telegram-канала «ОБЩАГА | ТЕРМИНЫ». Формат: «Мини-шпаргалка + блиц-опрос».\n"
-            "Структура поста:\n"
-            "1) Сразу дай короткую шпаргалку со списками/различением, по которой идёт опрос ниже "
-            "(никаких общих фраз про важность темы!).\n"
+            "1) Жирный заголовок + короткая шпаргалка со списками/различением, по которой идёт опрос ниже.\n"
             "2) <blockquote><b>Подсказка перед опросом:</b> 1 точный критерий разграничения.</blockquote>\n"
             + ANTI_CLICHE_RULES
             + "\nВерни строго JSON:\n"
@@ -465,7 +545,7 @@ async def generate_autopost_draft(
         gen_user = f"ТЕРМИН ИЗ БАЗЫ:\n{json.dumps(term_context, ensure_ascii=False)}"
 
     gen_res = await _call_gemini_json(gen_sys, gen_user, thinking_level="LOW")
-    post_html = str(gen_res.get("post_html") or "").strip()
+    post_html = sanitize_telegram_html(str(gen_res.get("post_html") or "").strip(), max_len=900)
     if not post_html:
         raise RuntimeError("Gemini вернула пустой текст поста.")
 
