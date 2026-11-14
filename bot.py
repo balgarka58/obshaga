@@ -2380,7 +2380,7 @@ async def handle_autopost_command(message: Message):
             pass
     except Exception as e:
         logger.error(f"Ошибка ручной генерации автопоста: {e}")
-        await wait_msg.edit_text(f"❌ Ошибка генерации поста: {e}", reply_markup=_autopost_trigger_kb(), parse_mode=None)
+        await wait_msg.edit_text(f"❌ Ошибка генерации поста ({type(e).__name__}): {e or repr(e)}", reply_markup=_autopost_trigger_kb(), parse_mode=None)
 
 
 @router.callback_query(F.data == "ap_trigger_now")
@@ -2396,7 +2396,7 @@ async def handle_autopost_trigger_now(callback: CallbackQuery):
         logger.error(f"Ошибка генерации автопоста по кнопке: {e}")
         await callback.bot.send_message(
             chat_id=ADMIN_ID,
-            text=f"❌ Ошибка генерации поста: {e}",
+            text=f"❌ Ошибка генерации поста ({type(e).__name__}): {e or repr(e)}",
             reply_markup=_autopost_trigger_kb(),
             parse_mode=None,
         )
@@ -2519,7 +2519,7 @@ async def handle_autopost_regen(callback: CallbackQuery):
         logger.error(f"Ошибка перегенерации автопоста: {e}")
         await callback.bot.send_message(
             chat_id=ADMIN_ID,
-            text=f"❌ Ошибка перегенерации: {e}",
+            text=f"❌ Ошибка перегенерации ({type(e).__name__}): {e or repr(e)}",
             reply_markup=_autopost_trigger_kb(),
             parse_mode=None,
         )

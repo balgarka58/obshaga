@@ -329,48 +329,64 @@ def render_post_card_png(
     return buf.getvalue()
 
 
+async def _fetch_single_rss(
+    session: aiohttp.ClientSession, source_name: str, url: str
+) -> List[Dict[str, str]]:
+    try:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                return []
+            xml_bytes = await resp.read()
+        root = ET.fromstring(xml_bytes)
+    except Exception as e:
+        logger.debug(f"RSS {source_name} недоступен: {e}")
+        return []
+
+    out: List[Dict[str, str]] = []
+    for item in root.findall(".//item")[:20]:
+        title = _strip_html(item.findtext("title") or "")
+        link = (item.findtext("link") or "").strip()
+        desc = _strip_html(item.findtext("description") or "")
+        if not title or not link:
+            continue
+        low_blob = f"{title} {desc}".lower()
+        if any(bad in low_blob for bad in RSS_STOP_KEYWORDS):
+            continue
+        out.append(
+            {
+                "source": source_name,
+                "title": title[:220],
+                "summary": desc[:320],
+                "url": link,
+            }
+        )
+    return out
+
+
 async def fetch_rss_news(
     exclude_urls: Set[str], max_items: int = 15
 ) -> List[Dict[str, str]]:
-    """Собирает свежие новости по экономике, обществу и праву из RSS."""
+    """Параллельно собирает свежие новости по экономике, обществу и праву из RSS."""
     collected: List[Dict[str, str]] = []
     seen_urls = set(exclude_urls)
     headers = {"User-Agent": "Mozilla/5.0 (compatible; ObshagaBot/1.0)"}
-    timeout = aiohttp.ClientTimeout(total=10)
+    timeout = aiohttp.ClientTimeout(total=8)
 
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        for source_name, url in RSS_FEEDS:
-            try:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        continue
-                    xml_bytes = await resp.read()
-                root = ET.fromstring(xml_bytes)
-            except Exception as e:
-                logger.debug(f"RSS {source_name} недоступен: {e}")
+        batches = await asyncio.gather(
+            *[_fetch_single_rss(session, name, url) for name, url in RSS_FEEDS],
+            return_exceptions=True,
+        )
+    for batch in batches:
+        if not isinstance(batch, list):
+            continue
+        for item in batch:
+            if item["url"] in seen_urls:
                 continue
-
-            items = root.findall(".//item")
-            for item in items[:20]:
-                title = _strip_html(item.findtext("title") or "")
-                link = (item.findtext("link") or "").strip()
-                desc = _strip_html(item.findtext("description") or "")
-                if not title or not link or link in seen_urls:
-                    continue
-                low_blob = f"{title} {desc}".lower()
-                if any(bad in low_blob for bad in RSS_STOP_KEYWORDS):
-                    continue
-                seen_urls.add(link)
-                collected.append(
-                    {
-                        "source": source_name,
-                        "title": title[:220],
-                        "summary": desc[:320],
-                        "url": link,
-                    }
-                )
-                if len(collected) >= max_items:
-                    return collected
+            seen_urls.add(item["url"])
+            collected.append(item)
+            if len(collected) >= max_items:
+                return collected
     return collected
 
 
@@ -400,7 +416,7 @@ async def _call_gemini_json(
         },
     }
 
-    timeout = aiohttp.ClientTimeout(total=45)
+    timeout = aiohttp.ClientTimeout(total=90, connect=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url, headers=headers, json=base_payload) as resp:
             if resp.status == 400:
