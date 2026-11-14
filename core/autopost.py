@@ -85,7 +85,10 @@ ANTI_CLICHE_RULES = (
     "5. Опирайся ТОЛЬКО на реальные факты из переданной новости и поля термина. Не выдумывай цифры и статьи законов.\n"
     "6. Разрешённые HTML-теги Telegram: <b>, <i>, <blockquote>. Тег <blockquote> используй ровно 1 раз в конце "
     "для примера во 2-ю часть или главного правила. Максимум 2–3 эмодзи на пост. Списки — через '— '.\n"
-    "7. Длина поста — строго 450–780 символов."
+    "7. ПРАВИЛО ОДНОЙ НИТИ: заголовок, разбор, теория и пример в <blockquote> обязаны раскрывать "
+    "СТРОГО ОДИН И ТОТ ЖЕ механизм (например, если новость про ключевую ставку ЦБ и торможение спроса — "
+    "и теория, и пример должны быть про спрос и кредиты, а НЕ про инфляцию издержек или пекарню).\n"
+    "8. Длина поста — строго 450–780 символов."
 )
 
 FEW_SHOT_NEWS_EXAMPLE = (
@@ -295,7 +298,7 @@ async def find_wikimedia_image_url(queries: List[str]) -> Optional[str]:
                 if thumb_url:
                     candidates.append(str(thumb_url))
             if candidates:
-                return random.choice(candidates[:3])
+                return candidates[0]
     return None
 
 
@@ -545,9 +548,37 @@ async def generate_autopost_draft(
         gen_user = f"ТЕРМИН ИЗ БАЗЫ:\n{json.dumps(term_context, ensure_ascii=False)}"
 
     gen_res = await _call_gemini_json(gen_sys, gen_user, thinking_level="LOW")
-    post_html = sanitize_telegram_html(str(gen_res.get("post_html") or "").strip(), max_len=900)
-    if not post_html:
+    draft_html = str(gen_res.get("post_html") or "").strip()
+    if not draft_html:
         raise RuntimeError("Gemini вернула пустой текст поста.")
+
+    # Этап 3: Редактор-критик проверяет логическую связку всех абзацев и чистит воду
+    critic_sys = (
+        "Ты строгий главный редактор образовательного канала по обществознанию ОГЭ/ЕГЭ. "
+        "Проверь черновик поста по 4 критериям:\n"
+        "1) Сквозная логика: заголовок, основной текст и пример в <blockquote> раскрывают ОДНУ И ТУ ЖЕ мысль и один и тот же механизм? "
+        "(Например, нельзя в тексте писать про ставку ЦБ и спрос, а в примере — про рост цен на зерно и издержки!)\n"
+        "2) Заголовок и начало — без тумана, сразу ясно, кто/что/почему.\n"
+        "3) Нет шаблонных ярлыков ('Что случилось:', 'Как это работает в теории:'), нет 'Гражданина Иванова' и нет ИИ-клише.\n"
+        "4) Факты строго соответствуют переданному термину и новости, длина 450–780 символов, HTML-теги только <b>, <i>, <blockquote>.\n"
+        "Если черновик идеален — верни его без изменений. Если есть хоть малейший логический разрыв или вода — "
+        "перепиши и верни исправленный, идеально связный вариант.\n"
+        'Верни строго JSON: {"edited": bool, "post_html": "финальный текст поста"}'
+    )
+    critic_user = (
+        f"ИСХОДНЫЙ ТЕРМИН И ФАКТЫ:\n{json.dumps(term_context, ensure_ascii=False)}\n\n"
+        + (f"ИСХОДНАЯ НОВОСТЬ: {chosen_news['title']} — {chosen_news['summary']}\n\n" if chosen_news else "")
+        + f"ЧЕРНОВИК ПОСТА:\n{draft_html}"
+    )
+    try:
+        critic_res = await _call_gemini_json(critic_sys, critic_user, thinking_level="LOW")
+        edited_html = str(critic_res.get("post_html") or "").strip()
+        if edited_html:
+            draft_html = edited_html
+    except Exception as critic_err:
+        logger.debug(f"Редактор-критик пропущен: {critic_err}")
+
+    post_html = sanitize_telegram_html(draft_html, max_len=900)
 
     image_queries = gen_res.get("image_queries") or []
     if not isinstance(image_queries, list):
