@@ -22,6 +22,7 @@ class UserFlow(StatesGroup):
     in_teacher_reset_confirm = State()
     in_delete_me_confirm = State()
     awaiting_policy_accept = State()
+    awaiting_broadcast_content = State()
 
 
 BTN_MAIN_CARDS = "🗂 Карточки"

@@ -2150,6 +2150,20 @@ class Database:
         self.invalidate_user_cache(user_id)
 
 
+
+    def get_broadcast_user_ids(self) -> List[int]:
+        """Возвращает список user_id пользователей, принявших политику (для рассылки)."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT user_id FROM user_settings WHERE policy_accepted = 1 ORDER BY user_id ASC"
+            )
+            return [int(r[0]) for r in cursor.fetchall() if r and r[0] is not None]
+        finally:
+            cursor.close()
+            conn.close()
+
 db = Database()
 
 

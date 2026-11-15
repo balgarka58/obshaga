@@ -51,6 +51,7 @@ from core.common import (
     SECRET_KEY,
     TIMEZONE_STR,
     LOG_CHAT_ID,
+    ADMIN_ID,
     PRIVACY_URL,
     TERMS_URL,
     TZ,
@@ -229,7 +230,15 @@ class AntiFloodDDoSMiddleware(BaseMiddleware):
         self.cooldown_sec = cooldown_sec
         self._user_hits: Dict[int, deque] = {}
         self._cooldown_until: Dict[int, float] = {}
+        self._global_hits: deque = deque(maxlen=600)
         self._max_tracked = 10000
+
+    def get_recent_rps(self, window_sec: float = 5.0) -> float:
+        now = time.monotonic()
+        cutoff = now - window_sec
+        while self._global_hits and self._global_hits[0] < cutoff:
+            self._global_hits.popleft()
+        return len(self._global_hits) / max(1.0, window_sec)
 
     async def __call__(self, handler, event: Any, data: Dict[str, Any]) -> Any:
         if isinstance(event, Message):
@@ -237,7 +246,19 @@ class AntiFloodDDoSMiddleware(BaseMiddleware):
             msg_id = event.message_id
             bot_inst = event.bot
 
-            if chat_id and msg_id and bot_inst:
+            now_hit = time.monotonic()
+            self._global_hits.append(now_hit)
+
+            skip_del = False
+            st_ctx: Optional[FSMContext] = data.get("state")
+            if st_ctx is not None and ADMIN_ID and event.from_user and event.from_user.id == ADMIN_ID:
+                try:
+                    if await st_ctx.get_state() == UserFlow.awaiting_broadcast_content.state:
+                        skip_del = True
+                except Exception:
+                    pass
+
+            if chat_id and msg_id and bot_inst and not skip_del:
                 asyncio.create_task(_safe_delete_message(bot_inst, chat_id, msg_id))
                 try:
                     setattr(event, "_user_msg_deleted", True)
@@ -296,10 +317,13 @@ class PolicyConsentMiddleware(BaseMiddleware):
                 if txt.startswith("/")
                 else ""
             )
-            if cmd_token in {"/start", "/privacy", "/delete_me"} or txt == BTN_ACCEPT_POLICY:
+            if cmd_token in {"/start", "/privacy", "/delete_me"} or txt == BTN_ACCEPT_POLICY or (ADMIN_ID and event.from_user.id == ADMIN_ID and cmd_token in {"/broadcast", "/cancel"}):
                 return await handler(event, data)
 
             state: Optional[FSMContext] = data.get("state")
+            if state is not None and ADMIN_ID and event.from_user.id == ADMIN_ID:
+                if await state.get_state() == UserFlow.awaiting_broadcast_content.state:
+                    return await handler(event, data)
             if state is not None and txt in {BTN_CONFIRM_DELETE_DATA, BTN_CANCEL_DELETE_DATA}:
                 cur_state = await state.get_state()
                 if cur_state == UserFlow.in_delete_me_confirm.state:
@@ -2283,6 +2307,190 @@ async def handle_cancel_delete_data(message: Message, state: FSMContext):
         )
 
 
+
+# =====================================================================
+# АДАПТИВНАЯ АДМИН-РАССЫЛКА (/broadcast)
+# =====================================================================
+
+antiflood_mw = AntiFloodDDoSMiddleware()
+_broadcast_lock = asyncio.Lock()
+_broadcast_status: Dict[str, Any] = {"running": False, "sent": 0, "total": 0}
+_broadcast_task: Optional[asyncio.Task] = None
+
+
+async def _run_adaptive_broadcast(bot_instance: Bot, src_msg_id: int) -> None:
+    if not ADMIN_ID:
+        return
+    try:
+        user_ids = await asyncio.to_thread(db.get_broadcast_user_ids)
+        total = len(user_ids)
+        _broadcast_status.update({"running": True, "sent": 0, "total": total})
+        sent = 0
+        blocked = 0
+        errors = 0
+
+        for idx, target_uid in enumerate(user_ids, 1):
+            live_rps = antiflood_mw.get_recent_rps(5.0)
+            if live_rps > 10.0:
+                delay = 0.40   # ~2.5 msg/s в пик нагрузки
+            elif live_rps >= 3.0:
+                delay = 0.12   # ~8 msg/s при средней активности
+            else:
+                delay = 0.05 if total < 1000 else 0.07
+
+            try:
+                await bot_instance.copy_message(
+                    chat_id=target_uid,
+                    from_chat_id=ADMIN_ID,
+                    message_id=src_msg_id,
+                )
+                sent += 1
+            except TelegramRetryAfter as ra:
+                wait_sec = float(getattr(ra, "retry_after", 3)) + 0.5
+                await asyncio.sleep(wait_sec)
+                try:
+                    await bot_instance.copy_message(
+                        chat_id=target_uid,
+                        from_chat_id=ADMIN_ID,
+                        message_id=src_msg_id,
+                    )
+                    sent += 1
+                except Exception:
+                    errors += 1
+            except (TelegramForbiddenError, TelegramBadRequest):
+                blocked += 1
+            except Exception as e:
+                logger.debug(f"Ошибка рассылки для {target_uid}: {e}")
+                errors += 1
+
+            _broadcast_status["sent"] = idx
+            await asyncio.sleep(delay)
+
+        await bot_instance.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"✅ *Рассылка завершена!*\n\n"
+                f"• Получателей в базе: {total}\n"
+                f"• Доставлено: {sent}\n"
+                f"• Заблокировали бота / недоступны: {blocked}\n"
+                f"• Прочие ошибки: {errors}"
+            ),
+        )
+    except asyncio.CancelledError:
+        logger.info("Фоновая рассылка остановлена при выключении бота.")
+    finally:
+        _broadcast_status["running"] = False
+
+
+@router.message(Command("broadcast"))
+async def handle_broadcast_command(message: Message, state: FSMContext):
+    if not message.from_user or not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    if _broadcast_status.get("running"):
+        await message.answer(
+            f"⏳ Рассылка уже идёт: {_broadcast_status['sent']}/{_broadcast_status['total']}.",
+            parse_mode=None,
+        )
+        return
+    await state.set_state(UserFlow.awaiting_broadcast_content)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="bc_abort_input")]]
+    )
+    await message.answer(
+        "📣 Отправь или перешли сюда сообщение для рассылки (текст, фото, видео — с любым форматированием).",
+        reply_markup=kb,
+        parse_mode=None,
+    )
+
+
+@router.callback_query(F.data == "bc_abort_input")
+async def handle_broadcast_abort_input(callback: CallbackQuery, state: FSMContext):
+    if not callback.from_user or not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await state.clear()
+    await callback.answer("Отменено")
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+
+@router.message(StateFilter(UserFlow.awaiting_broadcast_content))
+async def handle_broadcast_content(message: Message, state: FSMContext):
+    if not message.from_user or not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    if (message.text or "").strip().lower() in {"/cancel", "отмена"}:
+        await state.clear()
+        await message.answer("❌ Рассылка отменена.", parse_mode=None)
+        return
+
+    await state.clear()
+    user_ids = await asyncio.to_thread(db.get_broadcast_user_ids)
+    total = len(user_ids)
+    if total == 0:
+        await message.answer("Пока нет пользователей, принявших политику.", parse_mode=None)
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"✅ Отправить ({total})",
+                    callback_data=f"bc_confirm:{message.message_id}",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data=f"bc_cancel:{message.message_id}",
+                ),
+            ]
+        ]
+    )
+    await message.reply(
+        f"📣 Готово к адаптивной рассылке на *{total}* чел.\n"
+        f"Скорость автоматически подстроится под онлайн учеников.\n\n"
+        f"Запускаем?",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("bc_confirm:"))
+async def handle_broadcast_confirm(callback: CallbackQuery):
+    global _broadcast_task
+    if not callback.from_user or not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    async with _broadcast_lock:
+        if _broadcast_status.get("running"):
+            await callback.answer("Рассылка уже запущена!", show_alert=True)
+            return
+        try:
+            src_msg_id = int(callback.data.split(":", 1)[1])
+        except ValueError:
+            await callback.answer("Некорректный ID сообщения.", show_alert=True)
+            return
+        _broadcast_status["running"] = True
+        _broadcast_task = asyncio.create_task(
+            _run_adaptive_broadcast(callback.bot, src_msg_id)
+        )
+    await callback.answer("🚀 Рассылка запущена!")
+    try:
+        await callback.message.edit_text("🚀 Адаптивная рассылка запущена в фоне. Итоговый отчёт придёт сюда.", parse_mode=None)
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("bc_cancel:"))
+async def handle_broadcast_cancel(callback: CallbackQuery):
+    if not callback.from_user or not ADMIN_ID or callback.from_user.id != ADMIN_ID:
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    await callback.answer("Отменено")
+    try:
+        await callback.message.edit_text("❌ Рассылка отменена.", parse_mode=None)
+    except Exception:
+        pass
+
 @router.message(F.text)
 async def handle_universal_text_fallback(message: Message, state: FSMContext):
     uid = message.from_user.id if message.from_user else message.chat.id
@@ -2561,7 +2769,7 @@ async def main():
     await setup_bot_commands(bot)
 
     dp = Dispatcher(storage=MemoryStorage())
-    dp.message.outer_middleware(AntiFloodDDoSMiddleware())
+    dp.message.outer_middleware(antiflood_mw)
     dp.message.outer_middleware(PolicyConsentMiddleware())
     dp.shutdown.register(_on_bot_shutdown)
     dp.include_router(router)
@@ -2578,6 +2786,8 @@ async def main():
         raise
     finally:
         await asyncio.to_thread(db.flush_pending_writes_sync)
+        if _broadcast_task is not None and not _broadcast_task.done():
+            _broadcast_task.cancel()
         bg_task.cancel()
         try:
             await bg_task

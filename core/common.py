@@ -34,6 +34,8 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 TIMEZONE_STR = os.getenv("TIMEZONE", "Europe/Moscow")
 LOG_CHAT_ID = os.getenv("LOG_CHAT_ID") or os.getenv("LIVE_LOG_CHAT_ID")
+_ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
+ADMIN_ID: Optional[int] = int(_ADMIN_ID_RAW) if _ADMIN_ID_RAW.lstrip("-").isdigit() else None
 PRIVACY_URL = os.getenv(
     "PRIVACY_URL",
     "https://telegra.ph/Politika-konfidencialnosti-i-pravila-trenazhyora-11-03",
